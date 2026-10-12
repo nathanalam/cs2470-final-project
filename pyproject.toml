@@ -1,0 +1,67 @@
+[project]
+name = "cs2470-final-project"
+version = "0.1.0"
+description = "s1: SLURM + tmux helper CLI for profiling System One decision models"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "questionary>=2.0",
+    "rich>=13.7",
+    "typer>=0.12",
+]
+
+[project.scripts]
+s1 = "s1cli.app:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/s1cli"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.17.0",
+    "ty>=0.0.86",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "B",        # bugbear
+    "UP",       # pyupgrade
+    "SIM",      # simplify
+    "C4",       # comprehensions
+    "RUF",      # ruff-specific
+    "PTH",      # pathlib
+    "ANN",      # annotations required everywhere
+    "PL",       # pylint
+    "TRY",      # exception hygiene
+]
+ignore = [
+    "PLR0911", "PLR0912", "PLR0913", "PLR0915",  # complexity counts: interactive flows are branchy
+    "PLR2004",  # magic numbers
+    "TRY003",   # long messages in exceptions are fine for a CLI
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ANN", "PLR2004"]
+"src/s1cli/fake.py" = ["E501"]  # verbatim fixture output
+
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.ty.rules]
+all = "error"
+
+[tool.ty.terminal]
+error-on-warning = true
