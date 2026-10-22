@@ -1,0 +1,19 @@
+# OpenJev on the full JEVal test set, on one gpu-parallel node (4x A10G, 24 GB each; Slurm labels them l4):
+#   uv run s1 submit configs/openjev_jeval.toml -p gpu-parallel -g 4 -c 32 --mem 160G -t 08:00:00
+benchmarks = ["jeval"]
+
+[invariants]
+gpu = "auto"                # filled in from nvidia-smi at run time
+tensor_parallel_size = 4    # 54 GB of bf16 weights sharded over 4 GPUs
+quantization = "none"      # bf16: A10G (sm86) has no FP8 kernels; the card's fp8 recipe needs sm89+
+max_model_len = 16384
+# model shape, from config.json (Qwen3.5 27B)
+num_layers = 64
+num_heads = 24
+num_kv_heads = 4
+num_heads_per_kv = 6
+
+[params]
+model = "openjev"
+jeval_limit = 0             # 0 = all 11,257 questions
+jeval_concurrency = 16

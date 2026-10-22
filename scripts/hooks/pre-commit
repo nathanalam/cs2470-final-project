@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Regenerate the results report so it never drifts from results/*.json, and stage it.
+# Enable once per clone:  git config core.hooksPath scripts/hooks
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+uv run --quiet s1 report >/dev/null
+git add results/REPORT.md results/report.html

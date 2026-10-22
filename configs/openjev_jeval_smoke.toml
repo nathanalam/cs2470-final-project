@@ -1,0 +1,14 @@
+# Quick end-to-end check: 200 random JEVal questions. Run this before the full config.
+#   uv run s1 submit configs/openjev_jeval_smoke.toml -p gpu-parallel -g 4 -c 32 --mem 160G -t 01:00:00
+benchmarks = ["jeval"]
+
+[invariants]
+gpu = "auto"
+tensor_parallel_size = 4
+quantization = "none"      # bf16: A10G (sm86) has no FP8 kernels; the card's fp8 recipe needs sm89+
+max_model_len = 16384
+
+[params]
+model = "openjev"
+jeval_limit = 200
+jeval_seed = 0
