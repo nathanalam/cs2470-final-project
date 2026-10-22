@@ -1,0 +1,61 @@
+{
+    "20261021-233308-d6173a57": {
+        "invariants": {
+            "gpu": "NVIDIA A10G",
+            "tensor_parallel_size": 4,
+            "quantization": "none",
+            "max_model_len": 16384
+        },
+        "params": {
+            "model": "openjev",
+            "jeval_limit": 2000,
+            "jeval_seed": 0
+        },
+        "results": {
+            "jeval": {
+                "jeval_accuracy": 0.7684754521963825,
+                "jeval_ece": 0.040843796394485724,
+                "jeval_brier": 0.28225616727995756,
+                "jeval_choice_accuracy": 0.7613972764949675,
+                "jeval_noul_accuracy": 0.8170731707317073,
+                "jeval_score_accuracy": 0.49230769230769234,
+                "jeval_score_mae": 0.8491738461538462,
+                "jeval_n": 2000.0,
+                "jeval_invalid": 49.0,
+                "jeval_questions_per_s": 0.6633814803687869,
+                "jeval_latency_ms": 12347.468093822657,
+                "jeval_latency_ms_std": 12624.14285229353,
+                "jeval_latency_ms_p90": 25038.283683999907,
+                "jeval_latency_ms_p95": 34834.20653949997,
+                "jeval_latency_ms_p99": 70627.72779999978
+            },
+            "jeval/nvidia_smi": {
+                "gpu_util_pct": 99.9180905773059,
+                "gpu_util_pct_std": 2.6426554085336758,
+                "gpu_util_pct_p90": 100.0,
+                "gpu_util_pct_p95": 100.0,
+                "gpu_util_pct_p99": 100.0,
+                "gpu_count": 4.0,
+                "gpu_mem_used_mb_max": 20567.0,
+                "gpu_mem_used_mb_mean": 20566.4698075647,
+                "gpu_mem_total_mb": 23028.0,
+                "gpu_power_w_total_mean": 453.2576575978766,
+                "gpu_power_w_max": 135.21,
+                "gpu_energy_wh": 379.76862600521343,
+                "gpu_temp_c_max": 39.0,
+                "gpu_samples": 24112.0,
+                "gpu_sampled_s": 3016.313195599
+            }
+        },
+        "meta": {
+            "started": "2026-10-21T23:33:08",
+            "git_commit": "f5d41d1-dirty",
+            "host": "gpu-parallel-dy-gpu-parallel-cr-2",
+            "config": "configs/openjev_jeval_2k.toml",
+            "slurm_job_id": "3241",
+            "load_s": 464.313,
+            "jeval_s": 3016.477,
+            "duration_s": 3489.043
+        }
+    }
+}
