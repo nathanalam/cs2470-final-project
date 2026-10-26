@@ -1,4 +1,5 @@
 import time
+from typing import override
 
 import pytest
 
@@ -25,6 +26,7 @@ class WaitingSampler(GpuSampler):
     printed anything yet, so the record had no nvidia_smi entry.
     """
 
+    @override
     def __enter__(self):
         super().__enter__()
         deadline = time.monotonic() + 10
