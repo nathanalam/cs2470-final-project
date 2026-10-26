@@ -5,7 +5,7 @@ from typing import ClassVar
 
 import pytest
 
-from s1 import registry
+from s1 import models, registry
 from s1.config import RunSpec
 from s1.models import make_factory, resolve_settings
 from s1.models.answers import choice_answer, noul_answer, noul_from_logits, score_answer, softmax
@@ -211,3 +211,25 @@ def test_score_answer():
     assert a["score"] == pytest.approx(1.0)
     assert a["probabilities"] == pytest.approx({"0": 1 / 3, "1": 1 / 3, "2": 1 / 3})
     assert score_answer([50.0, 0.0])["score"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_runner_records_resolved_spec_values(tmp_path, monkeypatch):
+    spec = ModelSpec(
+        name="fake.rec", group="control", backend="fake", repo="r", revision="rev1", base_revision="b1",
+        license="mit", weights_gb=1, options={"temperature": 0.5, "mode": "x"},
+    )  # fmt: skip
+    monkeypatch.setitem(BACKENDS, "fake", f"{__name__}:FakeBackend")
+    monkeypatch.setitem(registry.MODELS, spec.name, make_factory(spec))
+    monkeypatch.setattr(models, "CATALOG", [*CATALOG, spec])
+    rs = RunSpec(invariants={"gpu": "cpu"}, params={"model": "fake.rec", "temperature": 0.9}, benchmarks=[])
+    rec = run(rs, results_dir=tmp_path, log=lambda _: None)
+    assert rec.params["spec_revision"] == "rev1"
+    assert rec.params["spec_base_revision"] == "b1"
+    assert rec.params["mode"] == "x"
+    assert rec.params["temperature"] == 0.9  # config value is not overwritten
+    assert "spec_revision" not in rec.invariants
+
+
+def test_runner_leaves_uncataloged_models_alone(tmp_path, echo_model):
+    rs = RunSpec(invariants={"gpu": "cpu"}, params={"model": "echo"}, benchmarks=[])
+    assert run(rs, results_dir=tmp_path, log=lambda _: None).params == {"model": "echo"}

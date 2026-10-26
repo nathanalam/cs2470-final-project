@@ -14,6 +14,11 @@ def resolve_settings(spec: ModelSpec, settings: Settings) -> dict[str, Scalar]:
     return spec.settings() | settings
 
 
+def spec_params(name: str) -> dict[str, Scalar]:
+    """The catalog spec's scalars for a model name ({} for models registered some other way)."""
+    return next((s.settings() for s in CATALOG if s.name == name), {})
+
+
 def make_factory(spec: ModelSpec) -> ModelFactory:
     def build(settings: Settings) -> object:
         return load_backend(spec.backend).build(spec, resolve_settings(spec, settings))
