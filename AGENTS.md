@@ -61,7 +61,7 @@ The script runs `sha256sum -c SHA256SUMS` when the repo ships one. For openjev/o
 
 ### 2. Write a config
 
-Copy `configs/openjev_jeval_smoke.toml`. Put the hardware/serving setup in `[invariants]`, and what
+Copy `configs/openjev_jeval_smoke.toml` (or `configs/openjev_shape_sweep_smoke.toml` for a request-shape sweep). Put the hardware/serving setup in `[invariants]`, and what
 you're testing (model, sample size, seed) in `[params]` or `[sweep]`. **Always run a ~200-question
 smoke config first.** The 2k sample gives ±2-point accuracy CIs, and the full JEVal run takes ~5 h
 on A10G.
@@ -185,6 +185,13 @@ A benchmark is `@benchmark("name") def run(model, settings) -> dict[str, float]`
   any of `<name>_{accuracy,ece,brier,invalid,n,latency_ms,latency_ms_p99,questions_per_s}`, so
   following the naming above is what makes a benchmark show up properly. Any other metric still
   appears under "Run details".
+
+- **`[grid]` vs `[sweep]`**: `[sweep]` axes become separate runs (the model reloads); `[grid]` axes stay
+  in one run and arrive in `settings` as `grid_<axis>` = comma-joined values. Use a grid when the
+  benchmark itself walks the axis (see `benchmarks/shape_sweep.py`); the run record stores it as `grid`.
+- For per-point GPU numbers use `gpu_stats.sample_point(prefix)`. It samples every 500 ms and pools all
+  GPUs, so a point needs several seconds to be meaningful (check `gpu_samples`).
+- A headline whose key contains `latency` is lower-is-better in the report.
 
 If the dataset is decision-shaped (state + typed questions + label), **reuse `jeval`'s machinery**:
 convert rows to `jeval.Row` and call `jeval.evaluate(model, rows, concurrency)`. That gives

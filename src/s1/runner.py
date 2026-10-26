@@ -45,6 +45,11 @@ def _git_commit() -> str:
     return sha + ("-dirty" if dirty else "")
 
 
+def grid_settings(grid: dict[str, list[Scalar]]) -> dict[str, Scalar]:
+    """Expose each grid axis to benchmarks as `grid_<axis>` = comma-joined values ("32,128,512")."""
+    return {f"grid_{k}": ",".join(str(v) for v in vals) for k, vals in grid.items()}
+
+
 def run(
     spec: RunSpec,
     *,
@@ -67,10 +72,16 @@ def run(
     if (job := os.environ.get("SLURM_JOB_ID")) is not None:
         meta["slurm_job_id"] = job
 
-    rec = RunRecord(run_id=new_run_id(), invariants=invariants, params=dict(spec.params), meta=meta)
+    rec = RunRecord(
+        run_id=new_run_id(),
+        invariants=invariants,
+        params=dict(spec.params),
+        meta=meta,
+        grid={k: list(v) for k, v in spec.grid.items()},
+    )
     log(f"[{rec.run_id}] params={rec.params}")
 
-    settings = rec.invariants | rec.params
+    settings = rec.invariants | rec.params | grid_settings(rec.grid)
     t0 = time.perf_counter()
     model = registry.get_model(str(spec.params["model"]))(settings)
     meta["load_s"] = round(time.perf_counter() - t0, 3)

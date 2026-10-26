@@ -58,3 +58,30 @@ def test_end_to_end_writes_records_and_gpu_stats(tmp_path, echo_model, count_ben
     smi = recs[0].results["count_answers/nvidia_smi"]
     assert smi["gpu_count"] == 2 and smi["gpu_mem_used_mb_max"] == 4000
     assert echo_model.closed  # runner closes models that define close()
+
+
+def test_grid_is_carried_not_expanded(tmp_path):
+    p = tmp_path / "c.toml"
+    p.write_text(CFG + "[grid]\nstate_tokens = [32, 64]\nquestions_per_request = [1, 2, 4]\n")
+    specs = config.load(p)
+    assert len(specs) == 3  # only [sweep] expands
+    assert all(s.grid == {"state_tokens": [32, 64], "questions_per_request": [1, 2, 4]} for s in specs)
+    assert config.load(tmp_path / "c.toml")[0].params["model"] == "echo"
+
+
+def test_configs_without_grid_have_empty_grid(tmp_path):
+    p = tmp_path / "c.toml"
+    p.write_text(CFG)
+    assert all(s.grid == {} for s in config.load(p))
+
+
+@pytest.mark.parametrize("grid", ["x = []", "x = 3", "x = [[1]]", "x = [1, { a = 2 }]"])
+def test_bad_grid_is_an_error(tmp_path, grid):
+    p = tmp_path / "c.toml"
+    p.write_text(CFG + f"[grid]\n{grid}\n")
+    with pytest.raises((ValueError, TypeError)):
+        config.load(p)
+
+
+def test_grid_settings_are_comma_joined():
+    assert runner.grid_settings({"a": [1, 2], "b": ["x"]}) == {"grid_a": "1,2", "grid_b": "x"}
