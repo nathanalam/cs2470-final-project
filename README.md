@@ -106,10 +106,11 @@ src/s1/
   config.py       TOML -> list of RunSpec (sweep expansion, grid)
   runner.py       build model -> each benchmark under GpuSampler -> close -> write record
   record.py       RunRecord, results/ I/O, summarize() (mean/std/p90/p95/p99)
-  registry.py     @model / @benchmark registries, typed settings getters
+  registry.py     model / benchmark registries (duplicate names raise), typed settings getters
   gpu_stats.py    nvidia-smi sampler
   report.py       results/REPORT.md + report.html (run by the pre-commit hook)
-  models/         openjev.py
+  models/         spec.py (ModelSpec), catalog.py (the list of specs), answers.py (System One answer
+                  assembly), backends/ (lazy table + vllm_shim.py, the OpenJev serving code)
   benchmarks/     jeval.py, shape_sweep.py
 configs/          experiment configs
 results/          run records (committed)

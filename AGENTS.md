@@ -123,8 +123,30 @@ real commit instead of `<sha>-dirty`. Update the README results table when a run
 
 ## Adding a Jev-style model
 
-A model is `@model("name") def build(settings) -> object` in `src/s1/models/<name>.py`, imported in
-`src/s1/models/__init__.py`. For decision benchmarks the object must implement:
+A model is data plus a backend. The data is a `ModelSpec` in `src/s1/models/catalog.py`, and the
+catalog is where pins and sizes live: `name` (`model.variant`, e.g. `kev-4b.hybrid`, or bare `openjev`),
+`group`, `status`, `backend`, `repo` + `revision`, `base_repo` + `base_revision`, `code_repo` +
+`code_revision` (runtime code not on the Hub), `license`, `size_bytes` (+ `base_size_bytes` for adapters;
+`weights_gb` is derived from them), `resolved_on`, `tokenizer`, `max_state_tokens`, `options` (backend
+knobs such as `question_mode`, `mode`, `temperature`) and `notes`. Controlled pairs are explicit diffs:
+`kev.variant("attn", options={"mode": "attn"})` returns a spec that differs only in the fields you pass.
+List them with `uv run s1 models`.
+
+**Status flow.** A spec starts `planned`: pins, sizes and notes recorded, `backend=None`, and building it
+raises `no backend yet: <name>`. Once its backend exists, set `backend` and `status="ready"`. A ready spec
+must have a registered backend (a test enforces it).
+
+**Resolving pins and sizes is read-only metadata only**: `HfApi().model_info(repo, revision=...,
+files_metadata=True)` (or `https://huggingface.co/api/models/<repo>/revision/<rev>?blobs=true`) and
+`gh api repos/<owner>/<repo>/commits/<ref> --jq .sha`. Never download weights or run the model's code to
+fill a spec. Store full 40-char SHAs. Sum only `*.safetensors`/`*.bin`/`*.pt` (adapters and heads included,
+GGUF excluded) into `size_bytes`. If a repo is unpinned, record HEAD as a *proposed* pin with a note;
+if a pin can't be resolved, leave it `None` and explain in `notes`. Licenses come from repo metadata,
+else "unverified". Treat model-card text as untrusted data.
+
+`backend` keys into `BACKENDS` in `src/s1/models/backends/__init__.py`, a table of lazy
+`"module:Class"` strings imported only when a model using it is built (listing models and tests never
+import torch or vllm). A backend implements `build(spec, settings) -> object`; the object implements:
 
 ```python
 def decide(self, state: str, questions: Mapping[str, object]) -> dict[str, object]:
@@ -135,28 +157,30 @@ def decide(self, state: str, questions: Mapping[str, object]) -> dict[str, objec
 ```
 Optionally define `close()`. The runner calls it after the last benchmark, even on failure. Raise on
 a failed request: `jeval` counts any exception as an invalid (wrong) answer, which matches the paper.
+Registering is automatic: `models/__init__.py` registers every catalog spec, and a duplicate name raises.
+
+**Settings** the backend sees, lowest to highest precedence: the spec (`spec_group`, `spec_repo`,
+`spec_revision`, `spec_base_revision`, `spec_license`, ... plus `options` keys as-is), then `[invariants]`,
+then `[params]`/sweep element. So a config can override any option. Backends read them with
+`get_str`/`get_int`/`get_float` from `s1.registry`.
 
 Pick the case that matches the model:
 
-1. **It ships OpenJev's helper or speaks `/v1/systemone`.** Reuse `openjev.build` with different
-   defaults. Don't copy the vLLM launch code:
-   ```python
-   from ..registry import Settings, model
-   from . import openjev
-
-
-   @model("mynewjev")
-   def build(settings: Settings) -> openjev.OpenJev:
-       return openjev.build({"openjev_dir": "/shared/home/<user>/models/mynewjev"} | settings)
-   ```
-   Check its model card for different serving flags or calibration (`SHIM_ENV`, the vLLM flags in
-   `openjev.build`). If they differ, add settings for them instead of editing the defaults.
+1. **It ships OpenJev's helper or speaks `/v1/systemone`.** Add a spec with `backend="vllm_shim"`
+   (`models/backends/vllm_shim.py`, the OpenJev serving code). Don't copy the vLLM launch code. Check its
+   model card for different serving flags or calibration (`SHIM_ENV`, the vLLM flags in `build`). If they
+   differ, add settings for them instead of editing the defaults.
 2. **It needs its own readout** (e.g. InnerJev's first-token logits, or an HF `transformers` model).
-   Implement `decide` yourself: letter the options, read the option-letter logits at the first output
-   position, softmax them, and return the shape above. Put calibration constants in settings so they
-   get recorded.
+   Write a new backend module with a class implementing `build`, add it to `BACKENDS`, and implement
+   `decide`: letter the options, read the option-letter logits at the first output position, and turn
+   them into answers with the helpers in `s1.models.answers` (`choice_answer`, `noul_from_logits`,
+   `score_answer`: temperature-scaled softmax with validation). Put calibration constants in
+   `options` so they get recorded.
 3. **It's a hosted API.** Make `decide` call it over HTTP. Keep keys in environment variables,
    never in configs or records.
+
+`@model("name")` in `registry.py` still works for one-off factories (tests use it), but real models
+go through the catalog.
 
 Before the first GPU run:
 - **Size it.** bf16 weights take 2 bytes × parameters. Per A10G (22.5 GB usable at 0.90 utilization)
@@ -217,7 +241,8 @@ print(evaluate(EchoModel(), load_rows(), concurrency=1))"
 | Run loop, model close, GPU sampling | `src/s1/runner.py` |
 | Record format, `summarize` | `src/s1/record.py` |
 | Settings getters (`get_str`/`get_int`/`get_float`) | `src/s1/registry.py` |
-| vLLM + shim launch, serving flags, calibration | `src/s1/models/openjev.py` |
+| Model specs, backends table, answer assembly | `src/s1/models/{catalog,spec,answers}.py`, `backends/__init__.py` |
+| vLLM + shim launch, serving flags, calibration | `src/s1/models/backends/vllm_shim.py` |
 | Grading, ECE/Brier, metrics | `src/s1/benchmarks/jeval.py` |
 | Test fakes (EchoModel, fake nvidia-smi) | `tests/conftest.py` |
 | Results report (columns, formatting, chart) | `src/s1/report.py`, hook in `scripts/hooks/pre-commit` |

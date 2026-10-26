@@ -9,7 +9,7 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
-from . import registry
+from . import models, registry
 from .config import RunSpec
 from .gpu_stats import GpuSampler
 from .record import RESULTS_DIR, RunRecord, Scalar, new_run_id
@@ -84,6 +84,8 @@ def run(
     settings = rec.invariants | rec.params | grid_settings(rec.grid)
     t0 = time.perf_counter()
     model = registry.get_model(str(spec.params["model"]))(settings)
+    for key, val in models.spec_params(str(spec.params["model"])).items():
+        rec.params.setdefault(key, val)  # resolved spec values (revision, options); config wins
     meta["load_s"] = round(time.perf_counter() - t0, 3)
     try:
         for name in spec.benchmarks:
