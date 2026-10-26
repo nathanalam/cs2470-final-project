@@ -18,10 +18,24 @@ seed = [0, 1, 2]
 """
 
 
+class WaitingSampler(GpuSampler):
+    """Holds the benchmark back until the fake nvidia-smi has printed its 4 valid rows.
+
+    A fixed sleep inside the benchmark raced with process start-up: on a loaded machine the fake had not
+    printed anything yet, so the record had no nvidia_smi entry.
+    """
+
+    def __enter__(self):
+        super().__enter__()
+        deadline = time.monotonic() + 10
+        while len(self.samples) < 4 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return self
+
+
 @pytest.fixture
 def count_bench():
     def run(model, settings):
-        time.sleep(0.3)  # let the sampler read the fake nvidia-smi output
         answers = model.decide("state", {"q": {"type": "noul", "instructions": "?"}})
         return {"p_true": answers["q"]["noul"], "seed": float(settings["seed"])}
 
@@ -45,7 +59,7 @@ def test_missing_model_is_an_error(tmp_path):
 
 
 def test_end_to_end_writes_records_and_gpu_stats(tmp_path, echo_model, count_bench, fake_nvidia_smi):
-    sampler = lambda: GpuSampler(cmd=fake_nvidia_smi)  # noqa: E731
+    sampler = lambda: WaitingSampler(cmd=fake_nvidia_smi)  # noqa: E731
     p = tmp_path / "c.toml"
     p.write_text(CFG)
     for spec in config.load(p):
