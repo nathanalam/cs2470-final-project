@@ -89,6 +89,13 @@ def get_int(settings: Settings, key: str, default: int) -> int:
     return val
 
 
+def get_bool(settings: Settings, key: str, default: bool) -> bool:
+    val = settings.get(key, default)
+    if not isinstance(val, bool):
+        raise TypeError(f"setting {key!r} must be true or false, got {val!r}")
+    return val
+
+
 def get_float(settings: Settings, key: str, default: float) -> float:
     val = settings.get(key, default)
     if not isinstance(val, int | float) or isinstance(val, bool):

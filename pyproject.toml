@@ -34,6 +34,7 @@ packages = ["src/s1"]
 [dependency-groups]
 dev = [
     "pytest>=8",
+    "tokenizers>=0.20",  # tests build a toy tokenizer for the shape_sweep token counter
     "ruff>=0.17.0",
     "ty>=0.0.86",
 ]

@@ -12,6 +12,10 @@ Settings (all optional):
     quantization            vLLM --quantization       default "fp8" (the card's measured recipe; needs
                                                       compute capability >= 8.9). "none" serves bf16.
     max_model_len           context limit (tokens)    default 16384
+    prefix_caching          vLLM prefix caching       default true. false passes --no-enable-prefix-caching
+                                                      (vLLM V1 would otherwise turn it on by default).
+                                                      For this hybrid model the cache works in blocks of 784
+                                                      tokens (see the vLLM log), so shorter prompts never hit.
     openjev_startup_s       readiness timeout         default 1800 (loading 54 GB from /shared is slow)
 """
 
@@ -31,7 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ...record import Scalar
-from ...registry import get_float, get_int, get_str
+from ...registry import get_bool, get_float, get_int, get_str
 from ..spec import ModelSpec
 
 # The model card's calibration; its accuracy numbers only hold with exactly these.
@@ -117,6 +121,27 @@ def _wait_ready(url: str, proc: subprocess.Popen[bytes], log: Path, deadline: fl
         time.sleep(2)
 
 
+def serve_args(settings: dict[str, Scalar], model_dir: Path, port: int) -> list[str]:
+    """The `vllm serve` command line for these settings."""
+    quant = get_str(settings, "quantization", "fp8")
+    prefix_caching = get_bool(settings, "prefix_caching", True)
+    return [
+        str(Path(sys.executable).parent / "vllm"), "serve", str(model_dir),
+        "--host", "127.0.0.1", "--port", str(port),
+        "--served-model-name", "qwen",
+        "--enable-prefix-caching" if prefix_caching else "--no-enable-prefix-caching",
+        "--max-model-len", str(get_int(settings, "max_model_len", 16384)),
+        "--gpu-memory-utilization", "0.90",
+        "--limit-mm-per-prompt", '{"image":1}',
+        "--trust-remote-code",
+        "--max-num-seqs", "256",
+        "--max-logprobs", "64",
+        "--gdn-prefill-backend", "triton",
+        "--tensor-parallel-size", str(get_int(settings, "tensor_parallel_size", 1)),
+        *(["--quantization", quant] if quant != "none" else []),
+    ]  # fmt: skip
+
+
 def build(settings: dict[str, Scalar]) -> OpenJev:
     if endpoint := get_str(settings, "openjev_endpoint", ""):
         return OpenJev(endpoint.rstrip("/"))
@@ -126,27 +151,9 @@ def build(settings: dict[str, Scalar]) -> OpenJev:
     if not shim.exists():
         raise FileNotFoundError(f"{shim} missing: sbatch scripts/download_model.sh openjev/openjev")
     vllm_port, shim_port = _free_port(), _free_port()
-    quant = get_str(settings, "quantization", "fp8")
     tag = f"{os.environ.get('SLURM_JOB_ID', 'local')}-{vllm_port}"
 
-    vllm = _spawn(
-        [
-            str(Path(sys.executable).parent / "vllm"), "serve", str(model_dir),
-            "--host", "127.0.0.1", "--port", str(vllm_port),
-            "--served-model-name", "qwen",
-            "--enable-prefix-caching",
-            "--max-model-len", str(get_int(settings, "max_model_len", 16384)),
-            "--gpu-memory-utilization", "0.90",
-            "--limit-mm-per-prompt", '{"image":1}',
-            "--trust-remote-code",
-            "--max-num-seqs", "256",
-            "--max-logprobs", "64",
-            "--gdn-prefill-backend", "triton",
-            "--tensor-parallel-size", str(get_int(settings, "tensor_parallel_size", 1)),
-            *(["--quantization", quant] if quant != "none" else []),
-        ],
-        LOG_DIR / f"vllm-{tag}.log",
-    )  # fmt: skip
+    vllm = _spawn(serve_args(settings, model_dir, vllm_port), LOG_DIR / f"vllm-{tag}.log")
     jev = OpenJev(f"http://127.0.0.1:{shim_port}", procs=[vllm])
     try:
         deadline = time.monotonic() + get_float(settings, "openjev_startup_s", 1800)

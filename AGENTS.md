@@ -39,6 +39,8 @@ and current results.
   compute capability 8.6. **No FP8**: `--quantization fp8` crashes with
   `cutlass_scaled_mm_sm80_epilogue`. Serve bf16 (`quantization = "none"`). Always confirm with
   `srun --jobid=$JOB --overlap -n 1 nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv`.
+- **Check the GPU you actually got.** On 2026-10-26 job 4059 on `gpu-parallel` landed on 4x **L4** (sm89), not
+  A10G, so results from different days may not be comparable. `invariants.gpu` records it.
 - Nodes are powered-down cloud instances (`idle~`), so expect 5–10 min to boot.
   `NODE_FAIL` / `sinfo -R` showing `InsufficientInstanceCapacity` means AWS is out of that
   instance type. Just resubmit; the second try worked within minutes.
@@ -216,6 +218,14 @@ A benchmark is `@benchmark("name") def run(model, settings) -> dict[str, float]`
 - For per-point GPU numbers use `gpu_stats.sample_point(prefix)`. It samples every 500 ms and pools all
   GPUs, so a point needs several seconds to be meaningful (check `gpu_samples`).
 - A headline whose key contains `latency` is lower-is-better in the report.
+- **Beware prefix caches when you repeat a request.** `shape_sweep` gives every repetition a fresh state
+  (`shape_unique_states`, default true); with identical repeats only the first pays for the state and
+  the rest measure the cache. For OpenJev, vLLM caches this hybrid model in blocks of 784 tokens (the
+  vLLM log says "Setting attention block size to 784 tokens"), so a prompt below 784 tokens never hits and a
+  longer one hits only whole blocks. `vllm_shim` takes `prefix_caching = false` to turn the cache off.
+- **Count state length with a real tokenizer.** `state_tokenizer = "file"` plus `state_tokenizer_file`
+  (a `tokenizer.json`) counts with one reference tokenizer for every model. The default `approx_words`
+  counts one token per word and is only for tests (pseudo-words were ~5 tokens each).
 
 If the dataset is decision-shaped (state + typed questions + label), **reuse `jeval`'s machinery**:
 convert rows to `jeval.Row` and call `jeval.evaluate(model, rows, concurrency)`. That gives
