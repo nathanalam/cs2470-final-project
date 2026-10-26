@@ -1,5 +1,7 @@
 import math
+import re
 import sys
+from datetime import date
 from pathlib import Path
 from typing import ClassVar
 
@@ -24,12 +26,57 @@ def test_catalog_names_unique_and_registered():
         assert registry.get_model(s.name)  # populates registries on first call
 
 
-def test_every_spec_backend_resolvable_without_heavy_import():
+def test_ready_specs_have_resolvable_backend_without_heavy_import():
     for s in CATALOG:
-        assert s.backend in BACKENDS, s.name
-        assert s.weights_gb > 0, s.name
+        if s.status == "ready":
+            assert s.backend in BACKENDS, s.name
+        else:
+            assert s.backend is None, s.name
+        if s.size_bytes is not None:
+            assert s.weights_gb is not None
+            assert s.weights_gb > 0, s.name
     assert "torch" not in sys.modules
     assert "vllm" not in sys.modules
+
+
+def test_every_spec_is_pinned_or_explains_why_not():
+    for s in CATALOG:
+        assert s.repo, s.name
+        date.fromisoformat(s.resolved_on)
+        for rev in (s.revision, s.base_revision, s.code_revision):
+            assert rev is None or re.fullmatch(r"[0-9a-f]{40}", rev), (s.name, rev)
+        if s.revision is None:
+            assert s.notes, f"{s.name}: unpinned without a note"
+
+
+def test_planned_model_build_raises_clear_error():
+    planned = [s for s in CATALOG if s.status == "planned"]
+    assert planned
+    for s in planned:
+        with pytest.raises(NotImplementedError, match=f"no backend yet: {re.escape(s.name)}"):
+            registry.get_model(s.name)({"model": s.name})
+
+
+def test_status_backend_consistency():
+    base = {"name": "m", "group": "control", "repo": "r", "license": "mit", "resolved_on": "2026-10-25"}
+    with pytest.raises(ValueError, match="needs a backend"):
+        ModelSpec(**base, status="ready")  # ty: ignore[invalid-argument-type]
+    with pytest.raises(ValueError, match="planned"):
+        ModelSpec(**base, backend="vllm_shim")  # ty: ignore[invalid-argument-type]
+
+
+def test_kev_pair_differs_only_in_declared_fields():
+    hybrid = next(s for s in CATALOG if s.name == "kev-4b.hybrid")
+    qwen3 = next(s for s in CATALOG if s.name == "kev-4b.qwen3")
+    diff = {k for k in vars(hybrid) if getattr(hybrid, k) != getattr(qwen3, k)}
+    assert diff == {
+        "name", "group", "revision", "base_repo", "base_revision", "size_bytes", "base_size_bytes", "notes"
+    }  # fmt: skip
+
+
+def test_laya_english_caps_state_tokens():
+    english = next(s for s in CATALOG if s.name == "laya.english")
+    assert english.max_state_tokens == 512
 
 
 def test_load_backend_unknown():
@@ -39,9 +86,16 @@ def test_load_backend_unknown():
 
 def test_variant_diff_is_exactly_the_changes():
     base = ModelSpec(
-        name="kev-4b.hybrid", group="D-hybrid", backend="b", repo="r", license="mit", weights_gb=8,
+        name="kev-4b.hybrid",
+        group="D-hybrid",
+        backend="b",
+        repo="r",
+        license="mit",
+        size_bytes=8_000_000_000,
+        status="ready",
+        resolved_on="2026-10-25",
         options={"mode": "hybrid", "temperature": 1.0},
-    )  # fmt: skip
+    )
     v = base.variant("attn", group="D-attn", options={"mode": "attn"})
     assert v.name == "kev-4b.attn"
     diff = {k for k in vars(base) if getattr(base, k) != getattr(v, k)}
@@ -66,9 +120,17 @@ def test_duplicate_registration_raises():
 
 def test_resolve_settings_precedence():
     spec = ModelSpec(
-        name="m", group="control", backend="b", repo="r", revision="abc", license="mit", weights_gb=1,
+        name="m",
+        group="control",
+        backend="b",
+        repo="r",
+        revision="abc",
+        license="mit",
+        size_bytes=1_000_000_000,
+        status="ready",
+        resolved_on="2026-10-25",
         options={"temperature": 0.5, "mode": "x"},
-    )  # fmt: skip
+    )
     out = resolve_settings(spec, {"temperature": 2.0, "n": 3})
     assert out["temperature"] == 2.0  # run settings beat spec options
     assert out["mode"] == "x"
@@ -88,9 +150,17 @@ class FakeBackend:
 def test_fake_backend_end_to_end_through_runner(tmp_path, monkeypatch):
     monkeypatch.setitem(BACKENDS, "fake", f"{__name__}:FakeBackend")
     spec = ModelSpec(
-        name="fake.v1", group="control", backend="fake", repo="r", revision="rev1", license="mit",
-        weights_gb=1, options={"temperature": 0.5},
-    )  # fmt: skip
+        name="fake.v1",
+        group="control",
+        backend="fake",
+        repo="r",
+        revision="rev1",
+        license="mit",
+        size_bytes=1_000_000_000,
+        status="ready",
+        resolved_on="2026-10-25",
+        options={"temperature": 0.5},
+    )
     monkeypatch.setitem(registry.MODELS, spec.name, make_factory(spec))
 
     @registry.benchmark("probe_bench")
@@ -215,9 +285,18 @@ def test_score_answer():
 
 def test_runner_records_resolved_spec_values(tmp_path, monkeypatch):
     spec = ModelSpec(
-        name="fake.rec", group="control", backend="fake", repo="r", revision="rev1", base_revision="b1",
-        license="mit", weights_gb=1, options={"temperature": 0.5, "mode": "x"},
-    )  # fmt: skip
+        name="fake.rec",
+        group="control",
+        backend="fake",
+        repo="r",
+        revision="rev1",
+        base_revision="b1",
+        license="mit",
+        size_bytes=1_000_000_000,
+        status="ready",
+        resolved_on="2026-10-25",
+        options={"temperature": 0.5, "mode": "x"},
+    )
     monkeypatch.setitem(BACKENDS, "fake", f"{__name__}:FakeBackend")
     monkeypatch.setitem(registry.MODELS, spec.name, make_factory(spec))
     monkeypatch.setattr(models, "CATALOG", [*CATALOG, spec])

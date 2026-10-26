@@ -21,6 +21,8 @@ def spec_params(name: str) -> dict[str, Scalar]:
 
 def make_factory(spec: ModelSpec) -> ModelFactory:
     def build(settings: Settings) -> object:
+        if spec.backend is None:
+            raise NotImplementedError(f"no backend yet: {spec.name}")
         return load_backend(spec.backend).build(spec, resolve_settings(spec, settings))
 
     return build

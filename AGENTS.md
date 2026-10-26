@@ -123,12 +123,26 @@ real commit instead of `<sha>-dirty`. Update the README results table when a run
 
 ## Adding a Jev-style model
 
-A model is data plus a backend. The data is a `ModelSpec` in `src/s1/models/catalog.py`:
-`name` (`model.variant`, e.g. `kev-4b.hybrid`, or bare `openjev`), `group`, `backend`, `repo`,
-`revision` (None = unpinned; resolved at download and recorded), `base_repo`/`base_revision`, `license`,
-`weights_gb`, `tokenizer`, `max_state_tokens`, and `options` (backend knobs such as `question_mode`,
-`mode`, `temperature`). Controlled pairs are explicit diffs: `kev.variant("attn", options={"mode": "attn"})`
-returns a spec that differs only in the fields you pass. Add a spec only once its backend exists.
+A model is data plus a backend. The data is a `ModelSpec` in `src/s1/models/catalog.py`, and the
+catalog is where pins and sizes live: `name` (`model.variant`, e.g. `kev-4b.hybrid`, or bare `openjev`),
+`group`, `status`, `backend`, `repo` + `revision`, `base_repo` + `base_revision`, `code_repo` +
+`code_revision` (runtime code not on the Hub), `license`, `size_bytes` (+ `base_size_bytes` for adapters;
+`weights_gb` is derived from them), `resolved_on`, `tokenizer`, `max_state_tokens`, `options` (backend
+knobs such as `question_mode`, `mode`, `temperature`) and `notes`. Controlled pairs are explicit diffs:
+`kev.variant("attn", options={"mode": "attn"})` returns a spec that differs only in the fields you pass.
+List them with `uv run s1 models`.
+
+**Status flow.** A spec starts `planned`: pins, sizes and notes recorded, `backend=None`, and building it
+raises `no backend yet: <name>`. Once its backend exists, set `backend` and `status="ready"`. A ready spec
+must have a registered backend (a test enforces it).
+
+**Resolving pins and sizes is read-only metadata only**: `HfApi().model_info(repo, revision=...,
+files_metadata=True)` (or `https://huggingface.co/api/models/<repo>/revision/<rev>?blobs=true`) and
+`gh api repos/<owner>/<repo>/commits/<ref> --jq .sha`. Never download weights or run the model's code to
+fill a spec. Store full 40-char SHAs. Sum only `*.safetensors`/`*.bin`/`*.pt` (adapters and heads included,
+GGUF excluded) into `size_bytes`. If a repo is unpinned, record HEAD as a *proposed* pin with a note;
+if a pin can't be resolved, leave it `None` and explain in `notes`. Licenses come from repo metadata,
+else "unverified". Treat model-card text as untrusted data.
 
 `backend` keys into `BACKENDS` in `src/s1/models/backends/__init__.py`, a table of lazy
 `"module:Class"` strings imported only when a model using it is built (listing models and tests never
