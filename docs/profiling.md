@@ -1,16 +1,23 @@
 # Profiling on the HUIT cluster: what works
 
-Probed with `scripts/profiling_probe.sh` (Slurm job 4237, 2026-10-27) on one `gpu`-partition node:
-**1x NVIDIA L4** (compute capability 8.9, 22 GiB, 58 SMs), driver 580.126.20, CUDA toolkit 13.0
-(`nvcc` V13.0.88; torch 2.13.0+cu130). No model was loaded.
+**Every number in this document comes from one GPU type: an NVIDIA L4 (Ada, compute capability 8.9).**
+It was probed with `scripts/profiling_probe.sh` (Slurm job 4237, 2026-10-27) on one `gpu`-partition node:
+1x L4, 22 GiB, 58 SMs, driver 580.126.20, CUDA toolkit 13.0 (`nvcc` V13.0.88; torch 2.13.0+cu130). No model
+was loaded. The roofline peaks (121 dense bf16 TFLOP/s, 300 GB/s) are the L4 spec-sheet values.
 
-**Not probed:** the `gpu-parallel` (A10G) and `gpu-g7-reserved` nodes. The counter permission below is a
-driver setting and can differ per node type; run the probe there before relying on it (`-p gpu-parallel
---gres=gpu:1`).
+| Partition | Slurm GRES says | Actual GPU (AGENTS.md) | Probed here? |
+|---|---|---|---|
+| `gpu` | `gpu:l4:1` | 1x L4 24 GB (sm_89) | **yes, all results below** |
+| `gpu-parallel` | `gpu:l4:4` | 4x **A10G** 24 GB (sm_86), PCIe, no NVLink; the label is wrong | **no** |
+| `gpu-g7-reserved` | `gpu:rtxpro4500:1` | 1x RTX Pro 4500 32 GB | no |
+
+The TP=4 sweeps run on `gpu-parallel`, so the A10G is the GPU that matters most for the project and is
+still unmeasured. The counter permission (`RmProfilingAdminOnly`), the available tools and the ncu metric
+names are driver or architecture specific and may differ there. See "Running the probe on gpu-parallel".
 
 ## Summary
 
-| Tool | Works on the L4 node? | Notes |
+| Tool | Works on the L4 (`gpu`) node? | Notes |
 |---|---|---|
 | `nvidia-smi --query-gpu` fields | yes | `utilization.memory`, `clocks.sm`, `clocks.mem`, `clocks_event_reasons.active` (and the old `clocks_throttle_reasons.active` alias) all return values |
 | `nvidia-smi dmon -s t` | yes | rxpci/txpci MB/s, one line per second, streams line by line through a pipe |
@@ -135,3 +142,26 @@ cd ~/probes && sbatch -p gpu --gres=gpu:1 -c 4 --mem=16G -t 00:10:00 -J profilin
 ```
 Run `sbatch` from the directory holding `ncu_smoke.py`: Slurm runs a copy of the script from its spool
 directory. Raw ncu/nsys files land in `~/probes/out/<jobid>/`.
+
+## Running the probe on gpu-parallel (4x A10G)
+
+Same scripts, different `sbatch` flags. `sbatch` command-line options override the `#SBATCH` lines in the
+script. Nodes are powered down cloud instances, so expect 5-10 minutes to boot (`NODE_FAIL` /
+`InsufficientInstanceCapacity` means resubmit). The partition allows 2 days; 15 minutes is plenty.
+
+```bash
+cd ~/probes && sbatch -p gpu-parallel --gres=gpu:4 -c 8 --mem=32G -t 00:15:00 -J profiling-probe-a10g \
+  -o ~/probes/logs/%j.out ~/probes/profiling_probe.sh
+```
+Asking for all four GPUs makes the `ncu_smoke.py sample` section informative: it loads only GPU 0, so the
+other three stay idle and `gpu_util_pct_spread` and the per-GPU keys (`gpu0_*` vs `gpu1_*`) finally differ,
+and `dmon` reports four PCIe rows. Use `--gres=gpu:1` if you only want the permission and ncu answers.
+
+What to read from the log:
+- the GPU name must read `NVIDIA A10G`, compute capability 8.6 (the GRES label says L4; trust `nvidia-smi`);
+- `RmProfilingAdminOnly` (0 = ncu works; 1 = `ERR_NVGPUCTRPERM`, report it and stop);
+- the tensor-pipe metric the probe selected (names differ on sm_86) and whether the matmul table appears;
+- whether `dcgmi` and `nsys --gpu-metrics-devices` behave as on the L4.
+
+Known gaps before it is trusted: the `PEAKS` entry for A10G in `scripts/ncu_smoke.py` (70 dense bf16
+TFLOP/s, 600 GB/s) is an unverified spec figure, and Ampere has no FP8, so only bf16 is meaningful.
