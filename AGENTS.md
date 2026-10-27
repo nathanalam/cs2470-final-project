@@ -80,6 +80,12 @@ you're testing (model, sample size, seed) in `[params]` or `[sweep]`. **Always r
 smoke config first.** The 2k sample gives ±2-point accuracy CIs, and the full JEVal run takes ~5 h
 on A10G.
 
+**GPU-efficiency questions need `gpu_metrics = "detailed"`** (see "GPU metrics"): request-shape sweeps and
+anything asking whether the GPU is used well. A run without it cannot separate shapes (pooled utilization
+saturates), so treat it as inconclusive for that question. Accuracy-only runs stay `basic`.
+**On a GPU type nobody has profiled yet**, run `scripts/profiling_probe.sh` once and read its
+`RmProfilingAdminOnly` line before relying on ncu there (`docs/profiling.md`).
+
 ### 3a. Batch (preferred when nobody is watching)
 
 ```bash
