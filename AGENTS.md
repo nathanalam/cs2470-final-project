@@ -86,6 +86,11 @@ uv run s1 submit configs/<cfg>.toml -p gpu-parallel -g 4 -c 32 --mem 160G -t 02:
 `submit` wraps `uv run --extra openjev s1 run <cfg>`, so the first job on a fresh `.venv` also
 installs vLLM and torch (several GB, ~7 min). Its log is `logs/<jobid>.out`.
 
+SemIf control (`semif.direct`, Qwen3.5-4B, `letter_logits` backend): fetch the pinned weights with
+`sbatch scripts/download_model.sh Qwen/Qwen3.5-4B 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`, then
+`uv run s1 submit configs/semif_jeval_smoke.toml -p gpu -g 1 -c 8 --mem 48G -t 01:00:00` (1x L4, no TP).
+It needs an explicit `temperature` in the config (no default) and runs under the existing `openjev` extra.
+
 ### 3b. Interactive allocation (what produced the committed results)
 
 ```bash

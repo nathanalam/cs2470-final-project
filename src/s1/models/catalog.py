@@ -109,6 +109,8 @@ DECIDER = ModelSpec(
 SEMIF_DIRECT = ModelSpec(
     name="semif.direct",
     group="control",
+    status="ready",
+    backend="letter_logits",
     repo="Qwen/Qwen3.5-4B",
     revision="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
     code_repo="TheoLeeCJ/SemIf",
@@ -116,11 +118,22 @@ SEMIF_DIRECT = ModelSpec(
     license="MIT (SemIf code); apache-2.0 (Qwen3.5-4B weights)",
     resolved_on=RESOLVED,
     size_bytes=9_319_828_096,
-    options={"mode": "direct", "question_mode": "row"},
-    notes="code_revision is a proposed pin (SemIf master HEAD).",
+    tokenizer="Qwen/Qwen3.5-4B",
+    max_state_tokens=4096,  # SemIf's default `max_tokens` in direct.score, applied to the whole prompt
+    options={
+        "mode": "direct",
+        "question_mode": "row",
+        "prompt_version": "direct-options-v1",
+        "dtype": "bfloat16",
+        "noul_bias": 0.0,
+    },
+    notes="code_revision is a proposed pin (SemIf master HEAD). No `temperature` option on purpose: the "
+    "backend requires it in the run config (SemIf fits 1.23 authored, 2.50 WANLI, 1.71 Every).",
 )
 SEMIF_RERANKER = SEMIF_DIRECT.variant(
     "reranker",
+    status="planned",
+    backend=None,
     repo="Qwen/Qwen3-Reranker-4B",
     revision="22e683669bc0f0bd69640a1354a6d0aebcfeede5",
     size_bytes=8_043_614_960,
