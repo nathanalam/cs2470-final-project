@@ -86,7 +86,7 @@ hr "b. DCGM"
 "$PY" - >/dev/null 2>&1 <<'EOF' &
 import time, torch
 a = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
-end = time.time() + 25
+end = time.time() + 40
 while time.time() < end:
     torch.matmul(a, a)
 torch.cuda.synchronize()
@@ -95,8 +95,31 @@ LOAD_PID=$!
 sleep 4
 if command -v dcgmi >/dev/null; then
     run dcgmi --version
+    echo "--- as installed: is a host engine already running? (expected: no)"
     run dcgmi discovery -l
-    T=30 run dcgmi dmon -e 1002,1003,1004,1005,1009,1010 -c 5 -d 500
+    DM="-e 1002,1003,1004,1005,1009,1010 -c 5 -d 500"
+    if command -v nv-hostengine >/dev/null; then
+        echo "--- our own user-space host engine on a private port (no daemon, no root, killed at the end)"
+        run nv-hostengine --help | head -40
+        PORT=$((20000 + SLURM_JOB_ID % 20000))
+        HE_PID=""
+        for flags in "-n -b 127.0.0.1 -p $PORT" "-n -p $PORT"; do
+            env -u CUDA_VISIBLE_DEVICES nv-hostengine $flags >"$OUT/hostengine.log" 2>&1 &
+            HE_PID=$!
+            sleep 4
+            if kill -0 "$HE_PID" 2>/dev/null; then echo "nv-hostengine started with: $flags (pid $HE_PID)"; break; fi
+            echo "nv-hostengine failed with: $flags"; cat "$OUT/hostengine.log"; HE_PID=""
+        done
+        if [ -n "$HE_PID" ]; then
+            T=30 run env -u CUDA_VISIBLE_DEVICES dcgmi discovery -l --host 127.0.0.1:$PORT
+            # shellcheck disable=SC2086
+            T=40 run env -u CUDA_VISIBLE_DEVICES dcgmi dmon --host 127.0.0.1:$PORT $DM
+            kill "$HE_PID" 2>/dev/null; wait "$HE_PID" 2>/dev/null
+            echo "--- host engine log"; tail -20 "$OUT/hostengine.log"
+        fi
+    else
+        echo "nv-hostengine: MISSING"
+    fi
 else
     echo "dcgmi: MISSING (not on PATH on this node)"
 fi
