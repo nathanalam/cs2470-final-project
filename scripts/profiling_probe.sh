@@ -29,6 +29,8 @@ PY="${PYBIN:-$HOME/cs2470-final-project/.venv/bin/python}"   # read-only use of 
 SIZES="${SIZES:-512,1024,2048,4096}"
 mkdir -p "$OUT"
 export PYTHONPATH="$HERE/pkg:${PYTHONPATH:-}"
+# ncu / nsys / nvcc live in /usr/local/cuda/bin on the compute nodes but are not on PATH
+export PATH="/usr/local/cuda/bin:$PATH"
 
 hr() { printf '\n==== %s ====\n' "$*"; }
 run() { echo "\$ $*"; timeout "${T:-60}" "$@" 2>&1; echo "[exit $?]"; }
@@ -79,7 +81,7 @@ timeout 20 nvidia-smi dmon -s t -d 1 -c 5 2>&1 | while IFS= read -r l; do printf
 # ---------------------------------------------------------------- b. DCGM (under load so values are not all 0)
 hr "b. DCGM"
 "$PY" "$HERE/ncu_smoke.py" time --sizes 4096 >/dev/null 2>&1   # CUDA/cuBLAS warm so the load below starts fast
-( "$PY" - <<'EOF' >/dev/null 2>&1 &
+"$PY" - >/dev/null 2>&1 <<'EOF' &
 import time, torch
 a = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
 end = time.time() + 25
@@ -87,7 +89,6 @@ while time.time() < end:
     torch.matmul(a, a)
 torch.cuda.synchronize()
 EOF
-)
 LOAD_PID=$!
 sleep 4
 if command -v dcgmi >/dev/null; then
