@@ -30,7 +30,16 @@ from pathlib import Path
 PEAKS = {"L4": (121e12, 300e9), "A10G": (70e12, 600e9), "A100": (312e12, 1555e9)}
 GEMM = re.compile(r"gemm|cutlass|xmma|nvjet|cublas|sm\d\d_", re.IGNORECASE)
 MARKER = re.compile(r"spin", re.IGNORECASE)
-UNIT_TO_S = {"second": 1.0, "msecond": 1e-3, "usecond": 1e-6, "nsecond": 1e-9}
+UNIT_TO_S = {
+    "s": 1.0,
+    "ms": 1e-3,
+    "us": 1e-6,
+    "ns": 1e-9,
+    "second": 1.0,
+    "msecond": 1e-3,
+    "usecond": 1e-6,
+    "nsecond": 1e-9,
+}
 UNIT_TO_B = {"byte": 1.0, "Kbyte": 1e3, "Mbyte": 1e6, "Gbyte": 1e9, "KiByte": 1024.0}
 TENSOR_HINT = "tensor"
 
@@ -130,12 +139,12 @@ def measured_kernels(kernels: list[Kernel], n_sizes: int) -> list[list[Kernel]]:
     return groups[:n_sizes]
 
 
-def cmd_parse(path: str, sizes: list[int]) -> None:
+def cmd_parse(path: str, sizes: list[int], gpu: str = "") -> None:
     kernels = read_ncu_csv(path)
     if not kernels:
         print("no kernel rows in the ncu output (profiling failed? see the ncu log)")
         sys.exit(1)
-    device = kernels[0].device
+    device = gpu or kernels[0].device  # the CSV's Device column is only an index; pass --gpu "NVIDIA L4"
     peak = peak_for(device)
     groups = measured_kernels(kernels, len(sizes))
     print(f"device: {device}; {len(kernels)} kernels profiled, {len(groups)}/{len(sizes)} sizes found")
@@ -209,6 +218,7 @@ def main() -> None:
     ap.add_argument("mode", choices=["run", "time", "parse", "sample"])
     ap.add_argument("csv", nargs="?")
     ap.add_argument("--sizes", default="512,1024,2048,4096")
+    ap.add_argument("--gpu", default="", help="GPU name for the spec-peak lookup (parse mode)")
     args = ap.parse_args()
     sizes = parse_sizes(args.sizes)
     if args.mode == "run":
@@ -220,7 +230,7 @@ def main() -> None:
     else:
         if not args.csv:
             ap.error("parse needs the ncu csv path")
-        cmd_parse(args.csv, sizes)
+        cmd_parse(args.csv, sizes, args.gpu)
 
 
 if __name__ == "__main__":
