@@ -223,6 +223,16 @@ A benchmark is `@benchmark("name") def run(model, settings) -> dict[str, float]`
   the rest measure the cache. For OpenJev, vLLM caches this hybrid model in blocks of 784 tokens (the
   vLLM log says "Setting attention block size to 784 tokens"), so a prompt below 784 tokens never hits and a
   longer one hits only whole blocks. `vllm_shim` takes `prefix_caching = false` to turn the cache off.
+- **Real text instead of random words:** `shape_state_source = "jeval"` (default `"synthetic"`) builds each
+  state from real JEVal rows (`benchmarks/jeval_states.py`, the dataset is loaded in the job by
+  `jeval.load_rows()`, never on the login node) and draws the Q questions from real JEVal rows. Pitfalls
+  measured on the pinned revision (Qwen3.5 tokenizer): (1) JEVal rows have ONE question each and no two share a
+  `source_item_id`, so the Q questions are real but unrelated to the state: a cost sweep, not an
+  accuracy measurement. (2) Only 17.5% of rows have a state of at least 2048 tokens (median 116), so most
+  states are cut; the closest-above rows are used first. (3) 206 ARC rows have an EMPTY state, they are skipped
+  as states. (4) JEVal states from one source can share a long prefix (HELMET: thousands of tokens), so a
+  prefix cache can hit although every state differs; read `..._shared_prefix_tokens`, and compare against
+  the synthetic run under the same settings (`configs/openjev_shape_sweep_jeval.toml` vs `..._cache.toml`).
 - **Count state length with a real tokenizer.** `state_tokenizer = "file"` plus `state_tokenizer_file`
   (a `tokenizer.json`) counts with one reference tokenizer for every model. The default `approx_words`
   counts one token per word and is only for tests (pseudo-words were ~5 tokens each).

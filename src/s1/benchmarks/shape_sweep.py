@@ -25,6 +25,8 @@ Settings (all optional):
     state_tokenizer    name of the token counter (see TOKENIZERS)                default "approx_words"
     state_tokenizer_file  tokenizer.json for state_tokenizer = "file"; ~ and $VARS are expanded
     state_seed         seed of the synthetic state text                          default 0
+    shape_state_source "synthetic" (random common words) or "jeval" (real JEVal      default "synthetic"
+                       text and questions, see jeval_states.py; loaded in the job)
 
 The state length is measured by a `TokenCounter`, and the ACTUAL count of every point is recorded
 (`..._state_tokens_actual`, of the first request). `approx_words` (one token per word) is dependency-free
@@ -33,6 +35,11 @@ and only for tests: the first run used it and a "2048-token" state was really ~1
 same thing across models. The question text and chat template are added on top of the state.
 Models may define `max_state_tokens`; points above it are skipped (`shape_sweep_skipped`), not
 counted as wrong answers.
+
+With `shape_state_source = "jeval"` the state is real JEVal text cut to the target length and the
+Q questions are Q real JEVal questions drawn per request (unrelated to the state: a cost sweep, not
+an accuracy measurement). The states are different but not unrelated: JEVal states from one source can
+share a long prefix, which a prefix cache reuses, so `..._shared_prefix_tokens` is recorded per point.
 
 Results: one flat dict. Headline `shape_sweep_latency_ms` (lower is better) is the mean over points
 of the per-question latency; then `shape_sweep_{n,invalid,skipped}` and per point
@@ -57,11 +64,15 @@ from typing import Protocol
 from ..gpu_stats import GpuSampler, sample_point
 from ..record import Metrics
 from ..registry import Settings, benchmark, get_bool, get_float, get_int, get_str
+from .jeval_states import shared_prefix
 
 NAME = "shape_sweep"
+SYNTHETIC, JEVAL = "synthetic", "jeval"
+STATE_SOURCES = (SYNTHETIC, JEVAL)
 OPTIONS = ("a", "b", "c", "d")
 GPU_KEYS = ("gpu_util_pct", "gpu_mem_used_mb_max", "gpu_power_w_total_mean", "gpu_count", "gpu_samples")
 MAX_FIT_ROUNDS = 8
+SHARED_PREFIX_SAMPLE = 16  # repetitions compared for the shared-prefix metric
 # Very common words: almost all are a single token (with a leading space) in common BPE vocabularies, so a
 # state of N words is about N tokens and the length fit below converges. Pseudo-words like "w4821" were
 # ~5 tokens each (digits are split one by one).
@@ -151,6 +162,12 @@ class StateSource(Protocol):
         ...
 
 
+class QuestionSource(Protocol):
+    def questions(self, n: int, salt: int = 0) -> Mapping[str, object]:
+        """`n` questions in the JEVal shape; the same (n, salt) always gives the same questions."""
+        ...
+
+
 class WordCounter:
     """Deterministic approximation: one token per whitespace-separated word."""
 
@@ -179,6 +196,14 @@ class FileTokenCounter:
 
     def count(self, text: str) -> int:
         return len(self._tokenizer.encode(text, add_special_tokens=False).ids)
+
+    def count_many(self, texts: Sequence[str]) -> list[int]:
+        return [len(e.ids) for e in self._tokenizer.encode_batch(list(texts), add_special_tokens=False)]
+
+    def cut(self, text: str, tokens: int) -> str:
+        """The text up to the end of its first `tokens` tokens (all of it if it is shorter)."""
+        offsets = self._tokenizer.encode(text, add_special_tokens=False).offsets
+        return text if len(offsets) <= tokens else text[: offsets[tokens - 1][1]] if tokens > 0 else ""
 
 
 def _file_counter(settings: Settings) -> TokenCounter:
@@ -246,13 +271,19 @@ def make_questions(n: int) -> dict[str, object]:
 
 
 def check_answers(questions: Mapping[str, object], answers: Mapping[str, object]) -> int:
-    """Number of invalid answers among `questions` (missing, malformed, or not one of the options)."""
+    """Number of invalid answers among `questions` (missing, malformed, or not one of the options).
+
+    A `noul` question needs a probability; any other type is a choice question and needs one of its options.
+    """
     bad = 0
     for key, q in questions.items():
         a = answers.get(key)
-        criteria = q.get("criteria") if isinstance(q, dict) else None
-        if not (isinstance(a, dict) and isinstance(criteria, dict) and a.get("choice") in criteria):
-            bad += 1
+        if isinstance(q, dict) and q.get("type") == "noul":
+            ok = isinstance(a, dict) and isinstance(a.get("noul"), int | float)
+        else:
+            criteria = q.get("criteria") if isinstance(q, dict) else None
+            ok = isinstance(a, dict) and isinstance(criteria, dict) and a.get("choice") in criteria
+        bad += not ok
     return bad
 
 
@@ -263,25 +294,27 @@ def point_key(tokens: int, questions: int) -> str:
 def measure_point(
     model: DecisionModel,
     state: str | Callable[[int], str],
-    questions: Mapping[str, object],
+    questions: Mapping[str, object] | Callable[[int], Mapping[str, object]],
     min_s: float,
     clock: Callable[[], float],
 ) -> tuple[list[float], int, int, float]:
     """(latency in ms of each fully valid request, requests made, invalid question count, wall s).
 
-    `state` is the request's state text, or a function of the repetition number (0, 1, ...) that
-    returns it. It is built before the request's clock starts, so building it is not measured.
+    `state` is the request's state text, `questions` its questions; either may instead be a function of
+    the repetition number (0, 1, ...) that returns it. They are built before the request's clock
+    starts, so building them is not measured.
     """
     latencies: list[float] = []
     reps = invalid = 0
     t0 = clock()
     while True:
         text = state if isinstance(state, str) else state(reps)
+        asked = questions if isinstance(questions, Mapping) else questions(reps)
         t = clock()
         try:
-            bad = check_answers(questions, model.decide(text, questions))
+            bad = check_answers(asked, model.decide(text, asked))
         except Exception:  # any failure is an invalid response, as in jeval
-            bad = len(questions)
+            bad = len(asked)
         ms = (clock() - t) * 1000
         reps += 1
         invalid += bad
@@ -298,6 +331,8 @@ def sweep(
     *,
     counter: TokenCounter | None = None,
     states: StateSource | None = None,
+    question_source: QuestionSource | None = None,
+    report_shared_prefix: bool = False,
     warmup: int = 1,
     min_point_s: float = 2.0,
     unique_states: bool = True,
@@ -319,7 +354,11 @@ def sweep(
             skipped += 1
             m[f"{pre}skipped"] = 1.0
             continue
-        questions = make_questions(q)
+
+        def questions_for(rep: int, q: int = q) -> Mapping[str, object]:
+            if question_source is None:
+                return make_questions(q)
+            return question_source.questions(q, salt=rep + 1 if unique_states else 0)
 
         def state_for(rep: int, tokens: int = tokens) -> str:
             # salt 0 = the identical request every time; otherwise rep + 1, so warm-up (-1) and every
@@ -330,14 +369,19 @@ def sweep(
             warm = False
             for _ in range(warmup):
                 with contextlib.suppress(Exception):  # a failing model shows up as invalid in the point
-                    model.decide(state_for(-2 if unique_states else 0), questions)
+                    model.decide(
+                        state_for(-2 if unique_states else 0), questions_for(-2 if unique_states else 0)
+                    )
         with sample_point(pre, GPU_KEYS, gpu_sampler) as gpu:
-            latencies, reps, bad, wall_s = measure_point(model, state_for, questions, min_point_s, clock)
+            latencies, reps, bad, wall_s = measure_point(model, state_for, questions_for, min_point_s, clock)
         asked = reps * q
         n += asked
         invalid += bad
         m[f"{pre}state_tokens_actual"] = float(counter.count(state_for(0)))
         m[f"{pre}reps"] = float(reps)
+        if report_shared_prefix:
+            sample = [state_for(i) for i in range(min(reps, SHARED_PREFIX_SAMPLE))]
+            m[f"{pre}shared_prefix_tokens"] = shared_prefix(sample, counter)
         m[f"{pre}invalid"] = float(bad)
         m[f"{pre}questions_per_s"] = asked / wall_s if wall_s > 0 else math.nan
         if latencies:
@@ -370,12 +414,31 @@ def run(model: object, settings: Settings) -> Metrics:
     if tokenizer not in TOKENIZERS:
         raise KeyError(f"unknown state_tokenizer {tokenizer!r}; known: {', '.join(sorted(TOKENIZERS))}")
     counter = TOKENIZERS[tokenizer](settings)
-    return sweep(
+    seed = get_int(settings, "state_seed", 0)
+    source = get_str(settings, "shape_state_source", SYNTHETIC)
+    if source not in STATE_SOURCES:
+        raise KeyError(f"unknown shape_state_source {source!r}; known: {', '.join(STATE_SOURCES)}")
+    states: StateSource = SyntheticStates(seed)
+    question_source: QuestionSource | None = None
+    extra: Metrics = {}
+    if source == JEVAL:
+        from .jeval import load_rows  # noqa: PLC0415 — downloads the dataset, only for this source
+        from .jeval_states import JevalStates  # noqa: PLC0415
+
+        jeval_states = JevalStates(load_rows(), seed)
+        states, question_source = jeval_states, jeval_states
+        extra = {
+            f"{NAME}_jeval_pool_states": float(jeval_states.n_states),
+            f"{NAME}_jeval_pool_questions": float(jeval_states.n_questions),
+        }
+    return extra | sweep(
         model,  # ty: ignore[invalid-argument-type]
         parse_int_list(settings, "state_tokens"),
         parse_int_list(settings, "questions_per_request"),
         counter=counter,
-        states=SyntheticStates(get_int(settings, "state_seed", 0)),
+        states=states,
+        question_source=question_source,
+        report_shared_prefix=source == JEVAL,
         warmup=get_int(settings, "shape_warmup", 1),
         min_point_s=get_float(settings, "shape_min_point_s", 2.0),
         unique_states=get_bool(settings, "shape_unique_states", True),
