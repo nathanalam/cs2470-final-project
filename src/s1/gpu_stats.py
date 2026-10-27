@@ -173,8 +173,7 @@ def parse_dmon_line(line: str) -> PcieSample | None:
 
 def parse_help_query_fields(text: str) -> frozenset[str]:
     """Field names listed by `nvidia-smi --help-query-gpu` (each appears double-quoted)."""
-    names: list[str] = re.findall(r'"([a-z0-9_.]+)"', text)
-    return frozenset(names)
+    return frozenset(str(n) for n in re.findall(r'"([a-z0-9_.]+)"', text))
 
 
 @functools.cache
