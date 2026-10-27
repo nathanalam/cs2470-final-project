@@ -1,0 +1,28 @@
+# SemIf direct (stock Qwen3.5-4B read through option-letter logits): 200 random JEVal questions.
+#   uv run s1 submit configs/semif_jeval_smoke.toml -p gpu -g 1 -c 8 --mem 48G -t 01:00:00
+# Weights first: sbatch scripts/download_model.sh Qwen/Qwen3.5-4B 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
+#
+# What this experiment varies is HARDWARE USE, not calibration. Everything that could change the
+# workload or the confidence numbers is pinned below and recorded in the run's invariants.
+benchmarks = ["jeval"]
+
+[invariants]
+gpu = "auto"
+device = "cuda"            # one L4 24 GB (gpu partition); no tensor parallelism in this backend
+dtype = "bfloat16"
+# Raw logits, NO calibration. Temperature is applied after the forward pass, so it cannot change
+# latency, memory or GPU use, and it never changes accuracy; it only moves ECE/Brier. SemIf's fitted
+# values (1.23 authored, 2.50 WANLI, 1.71 Every) are for other workloads, none for JEVal. So SemIf's
+# ECE/Brier here are uncalibrated and NOT comparable to models that ship their own calibration.
+temperature = 1.0
+# Whole-prompt limit; longer prompts are invalid. Same as OpenJev's max_model_len, so both models see
+# the same questions. SemIf's own default is 4096; do not change without making it a new experiment.
+max_input_tokens = 16384
+# Batch-size-1 forwards on one GPU (the backend serializes them). OpenJev's default is 8, so a
+# throughput or GPU-utilization gap vs OpenJev partly reflects this, not only model size.
+jeval_concurrency = 1
+
+[params]
+model = "semif.direct"
+jeval_limit = 200
+jeval_seed = 0             # same sample as the OpenJev smoke config
