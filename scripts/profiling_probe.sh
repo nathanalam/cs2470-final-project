@@ -22,7 +22,9 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
     exit 2
 fi
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Slurm runs a COPY of this script from its spool dir, so look for ncu_smoke.py where sbatch was invoked
+HERE="${PROBE_DIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}}"
+[ -f "$HERE/ncu_smoke.py" ] || { echo "ncu_smoke.py not found in $HERE (sbatch from the directory holding it)" >&2; exit 2; }
 OUT="${OUT:-$HOME/probes/out/$SLURM_JOB_ID}"
 PY="${PYBIN:-$HOME/cs2470-final-project/.venv/bin/python}"   # read-only use of the shared venv's torch
 [ -x "$PY" ] || PY="$(command -v python3)"
@@ -150,7 +152,7 @@ else
         "$PY" "$HERE/ncu_smoke.py" run --sizes "$SIZES" | tail -60
     ls -la "$OUT"/nsys_basic* 2>&1
     echo "--- GPU metrics sampling (SM active, tensor active, DRAM bandwidth, PCIe) -- may need counter permission"
-    T=150 run nsys profile --trace=cuda --gpu-metrics-device=all -f true -o "$OUT/nsys_gpumetrics" \
+    T=150 run nsys profile --trace=cuda --gpu-metrics-devices=cuda-visible -f true -o "$OUT/nsys_gpumetrics" \
         "$PY" "$HERE/ncu_smoke.py" run --sizes "$SIZES" | tail -25
     ls -la "$OUT"/nsys_gpumetrics* 2>&1
     if [ -f "$OUT/nsys_gpumetrics.nsys-rep" ]; then
