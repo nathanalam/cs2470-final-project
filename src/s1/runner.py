@@ -11,8 +11,9 @@ from pathlib import Path
 
 from . import models, registry
 from .config import RunSpec
-from .gpu_stats import GpuSampler
+from .gpu_stats import SCHEMA, GpuSampler, metrics_mode, resolve_mode
 from .record import RESULTS_DIR, RunRecord, Scalar, new_run_id
+from .registry import get_int, get_str
 
 
 def detect_gpu() -> str:
@@ -61,6 +62,12 @@ def run(
     invariants = dict(spec.invariants)
     if invariants.get("gpu", "auto") == "auto":
         invariants["gpu"] = detect_gpu()
+    settings0 = invariants | spec.params
+    gpu_mode = resolve_mode(
+        get_str(settings0, "gpu_metrics", "basic"), get_int(settings0, "gpu_metrics_schema", SCHEMA)
+    )
+    if gpu_mode == "detailed":  # basic records stay byte-identical; detailed ones state their key set
+        invariants.setdefault("gpu_metrics_schema", SCHEMA)
 
     meta: dict[str, Scalar] = {
         "started": datetime.now().isoformat(timespec="seconds"),
@@ -88,14 +95,15 @@ def run(
         rec.params.setdefault(key, val)  # resolved spec values (revision, options); config wins
     meta["load_s"] = round(time.perf_counter() - t0, 3)
     try:
-        for name in spec.benchmarks:
-            t = time.perf_counter()
-            with gpu_sampler() as smi:
-                rec.results[name] = registry.get_benchmark(name)(model, settings)
-            meta[f"{name}_s"] = round(time.perf_counter() - t, 3)
-            if gpu := smi.metrics():
-                rec.results[f"{name}/nvidia_smi"] = gpu
-            log(f"[{rec.run_id}] {name}: {rec.results[name]}")
+        with metrics_mode(gpu_mode):
+            for name in spec.benchmarks:
+                t = time.perf_counter()
+                with gpu_sampler() as smi:
+                    rec.results[name] = registry.get_benchmark(name)(model, settings)
+                meta[f"{name}_s"] = round(time.perf_counter() - t, 3)
+                if gpu := smi.metrics():
+                    rec.results[f"{name}/nvidia_smi"] = gpu
+                log(f"[{rec.run_id}] {name}: {rec.results[name]}")
     finally:
         if isinstance(model, registry.Closeable):
             model.close()

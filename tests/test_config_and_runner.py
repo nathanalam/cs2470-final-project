@@ -101,3 +101,31 @@ def test_bad_grid_is_an_error(tmp_path, grid):
 
 def test_grid_settings_are_comma_joined():
     assert runner.grid_settings({"a": [1, 2], "b": ["x"]}) == {"grid_a": "1,2", "grid_b": "x"}
+
+
+def test_runner_basic_has_no_schema_and_detailed_records_it(tmp_path, echo_model, count_bench):
+    p = tmp_path / "c.toml"
+    p.write_text(CFG)
+    (spec, *_) = config.load(p)
+    basic = runner.run(
+        spec, results_dir=tmp_path / "b", log=lambda _: None, gpu_sampler=lambda: GpuSampler(cmd=["/x"])
+    )
+    assert "gpu_metrics" not in basic.invariants and "gpu_metrics_schema" not in basic.invariants
+
+    p.write_text(CFG.replace('gpu = "test"', 'gpu = "test"\ngpu_metrics = "detailed"'))
+    (spec, *_) = config.load(p)
+    seen: list[bool] = []
+
+    def factory():
+        s = GpuSampler(cmd=["/x"])
+        seen.append(s.detailed)
+        return s
+
+    rec = runner.run(spec, results_dir=tmp_path / "d", log=lambda _: None, gpu_sampler=factory)
+    assert rec.invariants["gpu_metrics"] == "detailed" and rec.invariants["gpu_metrics_schema"] == 1
+    assert seen == [True]
+
+    p.write_text(CFG.replace('gpu = "test"', 'gpu = "test"\ngpu_metrics = "bogus"'))
+    (spec, *_) = config.load(p)
+    with pytest.raises(ValueError, match="gpu_metrics"):
+        runner.run(spec, results_dir=tmp_path / "e", log=lambda _: None)
