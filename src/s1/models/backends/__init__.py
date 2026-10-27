@@ -23,6 +23,7 @@ class Backend(Protocol):
 
 BACKENDS: dict[str, str] = {
     "vllm_shim": "s1.models.backends.vllm_shim:VllmShim",
+    "letter_logits": "s1.models.backends.letter_logits:LetterLogitsBackend",
 }
 
 

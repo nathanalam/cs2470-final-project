@@ -1,0 +1,18 @@
+# SemIf direct (stock Qwen3.5-4B read through option-letter logits): 200 random JEVal questions.
+#   uv run s1 submit configs/semif_jeval_smoke.toml -p gpu -g 1 -c 8 --mem 48G -t 01:00:00
+# Weights first: sbatch scripts/download_model.sh Qwen/Qwen3.5-4B 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
+benchmarks = ["jeval"]
+
+[invariants]
+gpu = "auto"
+device = "cuda"            # one L4 24 GB (gpu partition); no tensor parallelism in this backend
+dtype = "bfloat16"
+max_input_tokens = 16384   # whole-prompt limit; longer prompts are invalid. SemIf's own default is 4096,
+                           # 16384 matches OpenJev's max_model_len so invalid counts are comparable
+
+[params]
+model = "semif.direct"
+temperature = 1.23         # OPEN DECISION, required (no default): SemIf fits 1.23 authored, 2.50 WANLI, 1.71 Every
+jeval_limit = 200
+jeval_seed = 0
+jeval_concurrency = 1      # batch-size-1 forwards on one GPU; the backend serializes them anyway
