@@ -135,7 +135,8 @@ else
         grep -m3 -i -B1 -A2 'ERR_NVGPUCTRPERM' "$OUT/ncu.csv"
         echo "STOPPING ncu attempts (no workaround tried, nothing changed on the node)."
     else
-        "$PY" "$HERE/ncu_smoke.py" parse "$OUT/ncu.csv" --sizes "$SIZES"
+        "$PY" "$HERE/ncu_smoke.py" parse "$OUT/ncu.csv" --sizes "$SIZES" \
+            --gpu "$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
         echo "--- unprofiled reference (CUDA events)"
         "$PY" "$HERE/ncu_smoke.py" time --sizes "$SIZES"
     fi
