@@ -10,6 +10,18 @@ and current results.
 1. **Never run models, downloads or big installs on the login node.** Each process is capped at 2 GB
    of virtual memory and each user at 100 processes. `hf download`, pyarrow's thread pool and vLLM all
    die there. Use `sbatch`, or `srun` into an allocation.
+
+   **If you are an agent (Claude Code or otherwise) running directly on the login node**: this is a
+   hard stop, not a suggestion. Before running any command, check whether it is one of these:
+   `uv run s1 run`, `hf download`, `pip install`, `uv sync` (with or without `--extra openjev`: a plain
+   `uv sync` removes the GPU extras that are already installed in the shared `.venv`, and the extra
+   itself is installed only inside an allocation), `vllm serve`, loading a model with
+   `transformers`/`torch`, or anything else that allocates meaningful memory, downloads weights, or
+   touches a GPU. If it is, **do not run it**: stop and tell the user it needs to go through
+   `sbatch scripts/download_model.sh ...` or `uv run s1 submit ...` / `srun --jobid=$JOB ...` instead,
+   and ask them how they'd like to proceed. `uv run s1 submit` itself is fine on the login node, because
+   it only queues an `sbatch` job. Lightweight commands (`git`, editing configs, `uv run s1 ls`,
+   `cat`/`grep` on logs, `squeue`, `sinfo`) are fine to run directly.
 2. **Commit `results/*.json` and nothing from `logs/`** (gitignored). One run = one record file;
    never edit a record by hand. Re-run instead.
 3. **Pin everything that affects numbers**: dataset revision (`REVISION` constant in the benchmark),
