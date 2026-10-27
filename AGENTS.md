@@ -80,6 +80,12 @@ you're testing (model, sample size, seed) in `[params]` or `[sweep]`. **Always r
 smoke config first.** The 2k sample gives ±2-point accuracy CIs, and the full JEVal run takes ~5 h
 on A10G.
 
+**GPU-efficiency questions need `gpu_metrics = "detailed"`** (see "GPU metrics"): request-shape sweeps and
+anything asking whether the GPU is used well. A run without it cannot separate shapes (pooled utilization
+saturates), so treat it as inconclusive for that question. Accuracy-only runs stay `basic`.
+**On a GPU type nobody has profiled yet**, run `scripts/profiling_probe.sh` once and read its
+`RmProfilingAdminOnly` line before relying on ncu there (`docs/profiling.md`).
+
 ### 3a. Batch (preferred when nobody is watching)
 
 ```bash
@@ -134,6 +140,37 @@ Look at the regenerated `results/REPORT.md` diff before pushing: the new run sho
 "All runs", and in the leaderboard if it's that model's largest run.
 Commit the code a run used **before** launching it when you can. `meta.git_commit` then names a
 real commit instead of `<sha>-dirty`. Update the README results table when a run is worth citing.
+
+## GPU metrics (`gpu_metrics`)
+
+Every benchmark is wrapped in a `GpuSampler`; its stats land in `results["<bench>/nvidia_smi"]`. Which keys
+exist is a per-run setting, recorded in the run record (`invariants`):
+
+| Setting | Meaning |
+|---|---|
+| `gpu_metrics = "basic"` (default) | The pooled keys only (`gpu_util_pct`, `gpu_power_w_total_mean`, ...). Output is unchanged, so existing records and reports are unaffected. |
+| `gpu_metrics = "detailed"` | Basic keys plus the schema-1 keys below. The runner records `gpu_metrics_schema = 1` in `invariants`. |
+| `gpu_metrics_schema = 1` | Version of the detailed key set. A config that names a schema this code does not write is an error; changing the key set bumps it. |
+
+**Old records do not have the detailed keys. That is intentional** (opt-in, versioned): compare detailed
+runs only with detailed runs. Example config: `configs/openjev_shape_sweep_cache_detailed.toml`.
+
+Schema 1 (`g` = GPU index; a key is absent when its source is missing or `[N/A]`, never zero-filled):
+
+- per GPU, `nvidia-smi --query-gpu` every 500 ms: `gpu{g}_util_pct`, `_util_pct_max`, `gpu{g}_mem_util_pct`
+  (memory-controller busy %), `gpu{g}_mem_used_mb_max`, `gpu{g}_power_w`, `_power_w_max`,
+  `gpu{g}_clock_sm_mhz`, `gpu{g}_clock_mem_mhz`, `gpu{g}_throttle_frac` (share of samples with a
+  power/thermal/slowdown throttle reason; idle does not count);
+- per GPU, `nvidia-smi dmon -s t` every 1 s: `gpu{g}_pcie_rx_mb_s`, `_rx_mb_s_max`, `_tx_mb_s`, `_tx_mb_s_max`;
+- pooled: `gpu_mem_util_pct`, `gpu_clock_sm_mhz`, `gpu_clock_sm_mhz_min`, `gpu_clock_mem_mhz`,
+  `gpu_throttle_frac`, `gpu_throttle_mask_seen`, `gpu_util_pct_spread` (max - min of per-GPU mean util),
+  `gpu_pcie_rx_mb_s_total_mean`, `gpu_pcie_tx_mb_s_total_mean`, `gpu_pcie_samples`.
+
+In a sweep, `sample_point` keeps the detailed keys automatically; `GPU_KEYS` only selects basic ones.
+
+**Pooled `gpu_util_pct` only says "some kernel was running": it sits at 85-98% for prefill-bound workloads
+at every request shape, so it cannot separate them.** Use the per-GPU, memory-controller, clock and PCIe
+keys, and see `docs/profiling.md` for which profilers (DCGM, nsys, ncu) work on this cluster.
 
 ## Adding a Jev-style model
 
