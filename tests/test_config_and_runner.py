@@ -101,3 +101,42 @@ def test_bad_grid_is_an_error(tmp_path, grid):
 
 def test_grid_settings_are_comma_joined():
     assert runner.grid_settings({"a": [1, 2], "b": ["x"]}) == {"grid_a": "1,2", "grid_b": "x"}
+
+
+def test_warmup_runs_before_sampling_and_is_recorded(tmp_path, echo_model):
+    events = []
+
+    class Sampler:
+        def __enter__(self):
+            events.append("sample")
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def metrics(self):
+            return {}
+
+    @registry.benchmark("warm_bench")
+    def bench(model, settings):
+        events.append("bench")
+        return {"warm_bench_x": 1.0}
+
+    @registry.warmup("warm_bench")
+    def warm(model, settings):
+        events.append("warm")
+        return bool(settings.get("do_warm"))
+
+    try:
+        for do_warm in (True, False):
+            spec = config.RunSpec(
+                invariants={"gpu": "cpu"},
+                params={"model": "echo", "do_warm": do_warm},
+                benchmarks=["warm_bench"],
+            )
+            rec = runner.run(spec, results_dir=tmp_path, log=lambda _: None, gpu_sampler=Sampler)
+            assert ("warm_bench_warmup_s" in rec.meta) is do_warm
+    finally:
+        registry.BENCHMARKS.pop("warm_bench", None)
+        registry.WARMUPS.pop("warm_bench", None)
+    assert events == ["warm", "sample", "bench"] * 2

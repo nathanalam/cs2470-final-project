@@ -5,6 +5,7 @@ import json
 import math
 import subprocess
 import sys
+import threading
 
 import pytest
 
@@ -111,47 +112,67 @@ def test_backend_modules_do_not_import_torch():
 # --- kev ----------------------------------------------------------------------------------------
 
 
-def test_kev_rows_follow_upstream_to_record():
-    c = kev.to_row(CHOICE)
-    assert c.keys == ["opt_1", "opt_2", "opt_3"]
-    assert c.options == ["opt_1: red", "opt_2: blue", "opt_3"]  # empty description -> bare key
-    n = kev.to_row(NOUL)
-    assert (n.keys, n.options) == (["false", "true"], ["no: it does not", "yes: it holds"])
-    assert kev.to_row({"type": "noul", "instructions": "x"}).options == ["no", "yes"]
-    s = kev.to_row(SCORE)
-    assert (s.keys, s.options) == (["0", "1", "2"], ["none", "some", "lots"])  # level text only
-    assert kev.render({"a": 1, "b": [1, {"c": 2}]}) == "a: 1\nb:\n  - 1\n  - c: 2"
-    with pytest.raises(ValueError, match="unknown"):
-        kev.to_row({"type": "rank"})
+class FakeServe:
+    """Stands in for upstream's kev.serve module: a record is the state, an answer its probabilities."""
+
+    class SystemOneRequest:
+        def __init__(self, state, questions):
+            self.state, self.questions = state, questions
+
+    @staticmethod
+    def prepare(req):
+        return req
+
+    @staticmethod
+    def to_record(req):
+        return {"state": req.state}, list(req.questions)
+
+    @staticmethod
+    def to_answers(probs, meta):
+        return {key: {"type": "noul", "noul": p[1]} for key, p in zip(meta, probs, strict=True)}
 
 
-def test_kev_escape_keeps_delimiters_unforgeable():
-    assert kev.escape("a <|fim_suffix|> b") == "a <¦fim_suffix¦> b"
+class FakeServer:
+    def __init__(self):
+        self.encoded, self.lock, self.cleared, self.closed = [], threading.Lock(), False, False
+        self.model, self.tok = self, "tok"
+        self.prefix_cache = self
+        self.queue = self
+
+    def encode(self, tok, rec, **limits):
+        self.encoded.append(limits)
+        return rec
+
+    def put(self, item):  # the model thread, answered at once
+        _, done = item
+        done.set_result(([[0.25, 0.75]], {}))
+
+    def wait_idle(self):
+        pass
+
+    def clear(self):
+        self.cleared = True
+
+    def close(self):
+        self.closed = True
 
 
-def test_kev_encode_row_layout():
-    special = (100, 101, 102, 103, 104)  # state, q, opt, /opt, decide
-
-    def tokenize(text):
-        return [ord(ch) for ch in text]
-
-    row = kev.Row("choice", ["a", "b"], "Q", ["a", "bb"])
-    enc = kev.encode_row(tokenize, special, [100, 1, 2], row)
-    assert enc.ids == [100, 1, 2, 101, ord("Q"), 102, ord("a"), 103, 102, ord("b"), ord("b"), 103, 104]
-    assert [enc.ids[i] for i in enc.opts] == [103, 103]
-    assert enc.opts == [7, 11]
-    assert enc.decide == len(enc.ids) - 1
-    with pytest.raises(ValueError, match="<state>"):
-        kev.encode_row(tokenize, special, [1, 2], row)
+def test_kev_encodes_at_our_limit_and_answers_through_upstream():
+    server = FakeServer()
+    k = kev.Kev(server, FakeServe, max_tokens=16384)
+    assert k.decide("s", {"q": NOUL}) == {"q": {"type": "noul", "noul": 0.75}}
+    assert server.encoded == [{"max_state": 16384, "max_branch": 16384, "strict": True}]
+    k.after_warmup()
+    assert server.cleared  # no state survives warm-up
+    k.close()
+    assert server.closed
 
 
-def test_kev_answers_divide_by_temperature():
-    n = kev.answer(kev.to_row(NOUL), [0.0, math.log(3) * 2], temperature=2.0)
-    assert n["noul"] == pytest.approx(0.75)  # options are [no, yes]
-    c = kev.answer(kev.to_row(CHOICE), [0.0, 1.0, 0.5], 1.0)
-    assert c["choice"] == "opt_2"
-    s = kev.answer(kev.to_row(SCORE), [0.0, 0.0, 0.0], 1.0)
-    assert s["score"] == pytest.approx(1.0)
+def test_kev_variants_pin_their_upstream_code():
+    for name in ("kev-4b.hybrid", "kev-4b.qwen3"):
+        s = spec(name)
+        assert s.code_repo == "jaredpalmer/kev"
+        assert s.code_revision == "2074cc44256200bb37540103fa4572901faa10f3"
 
 
 # --- semif --------------------------------------------------------------------------------------

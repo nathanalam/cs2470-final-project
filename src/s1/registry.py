@@ -5,6 +5,8 @@ Both receive `settings`: the run's invariants merged with its params (params win
 Add a model:      add a ModelSpec to s1/models/catalog.py (see AGENTS.md), or for a one-off
                   @model("name")      def build(settings) -> object   (may define close())
 Add a benchmark:  @benchmark("name")  def run(model, settings) -> Metrics
+Warm one up:      @warmup("name")     def warm(model, settings) -> bool   (optional; runs before GPU sampling;
+                                                                          True if it did anything)
 
 Implementations live in s1/models/ and s1/benchmarks/ and are imported by those packages'
 __init__.py so registering is just "write the function, add the import".
@@ -33,8 +35,13 @@ class Closeable(Protocol):
     def close(self) -> None: ...
 
 
+class WarmupFn(Protocol):
+    def __call__(self, model: object, settings: Settings, /) -> bool: ...
+
+
 MODELS: dict[str, ModelFactory] = {}
 BENCHMARKS: dict[str, BenchmarkFn] = {}
+WARMUPS: dict[str, WarmupFn] = {}
 
 
 def register_model(name: str, fn: ModelFactory) -> ModelFactory:
@@ -59,6 +66,17 @@ def benchmark(name: str) -> Callable[[BenchmarkFn], BenchmarkFn]:
     return register
 
 
+def warmup(name: str) -> Callable[[WarmupFn], WarmupFn]:
+    """Untimed work the runner does before a benchmark's GPU sampling and timing start (kernel compilation,
+    graph capture). It must leave no answers behind: models clear their caches in `after_warmup()`."""
+
+    def register(fn: WarmupFn) -> WarmupFn:
+        WARMUPS[name] = fn
+        return fn
+
+    return register
+
+
 def _lookup[T](table: dict[str, T], kind: str, name: str) -> T:
     from . import benchmarks, models  # noqa: F401, PLC0415 — populate registries
 
@@ -73,6 +91,11 @@ def get_model(name: str) -> ModelFactory:
 
 def get_benchmark(name: str) -> BenchmarkFn:
     return _lookup(BENCHMARKS, "benchmark", name)
+
+
+def get_warmup(name: str) -> WarmupFn | None:
+    get_benchmark(name)  # populates the registries; unknown names raise there
+    return WARMUPS.get(name)
 
 
 def get_str(settings: Settings, key: str, default: str) -> str:

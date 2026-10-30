@@ -19,6 +19,7 @@ semif_max_options = 16     # upstream's cap (letters A-P)
 jeval_limit = 200
 jeval_seed = 0
 jeval_concurrency = 1
+jeval_warmup = true      # one untimed pass first: kernel compilation is not latency
 
 [sweep]
 model = ["semif.direct", "semif.reranker"]
