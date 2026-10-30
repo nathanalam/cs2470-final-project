@@ -25,6 +25,20 @@ answers came from prompts longer than the 16,384-token context. For reference, t
 Table 1 reports hosted Jev at 78.4% and Kev-27b at 77.2% on all 11,257 questions. Latency is far
 above the model card's H100 figures because A10Gs are slower and lack NVLink.
 
+Kev-4B ([jaredpalmer/kev-4b](https://huggingface.co/jaredpalmer/kev-4b), a LoRA adapter on a 4B Qwen base) on the
+same JEVal sample of 200 questions, bf16 on **one L4**, through upstream's own server (`kev.serve`), measured
+warm (`jeval_warmup`: one untimed pass first, then the prefix cache is emptied):
+
+| Run | Base | Accuracy | ECE | Brier | Invalid | Latency mean / p99 (concurrency 1) | q/s (concurrency 8) | GPU util |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| [`20261030-144131-594ef3c9`](results/20261030-144131-594ef3c9.json) / [`…144511…`](results/20261030-144511-1354270f.json) | Qwen3.5-4B (hybrid) | **70.9%** ±6.4 | 0.137 | 0.391 | 6 | 304 ms / 2.5 s | 3.55 | 98% |
+| [`20261030-144732-3359fb5e`](results/20261030-144732-3359fb5e.json) / [`…145138…`](results/20261030-145138-ad478289.json) | Qwen3-4B (attention) | 58.7% ±6.9 | 0.132 | 0.514 | 6 | 618 ms / 7.1 s | 1.67 | 99% |
+
+The hybrid runs with upstream's fused Qwen3.5 kernels and CUDA graphs. Its first run, cold and without them, took
+1.2 s per question at 41% GPU utilization (`20261030-140509-a01f91d9`). The qwen3 latency is provisional: upstream
+serves attention-only bases in a packed form whose explicit attention mask rules out flash attention, and a plain
+causal pass measured 379 ms (`20261030-141249-3126d051`, cold). The invalid answers are prompts over 16,384 tokens.
+
 ## What a run record looks like
 
 ```json
