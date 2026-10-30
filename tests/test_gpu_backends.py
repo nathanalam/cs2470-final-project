@@ -166,6 +166,7 @@ def test_kev_encodes_at_our_limit_and_answers_through_upstream():
     assert server.cleared  # no state survives warm-up
     k.close()
     assert server.closed
+    assert server.model is None  # the weights are released for the next run
 
 
 def test_kev_variants_pin_their_upstream_code():

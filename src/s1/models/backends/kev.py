@@ -73,7 +73,21 @@ class Kev:
             print(f"kev graphs after warm-up: {graphs.stats()}", flush=True)
 
     def close(self) -> None:
-        self.server.close()  # ty: ignore[unresolved-attribute]
+        """Stop the model thread and free the GPU, so the next run in this process can load.
+
+        Server.__post_init__ registers close() with atexit; that reference alone would keep the weights and
+        the CUDA graph buffers alive."""
+        import atexit  # noqa: PLC0415
+        import gc  # noqa: PLC0415
+
+        server = self.server
+        server.close()  # ty: ignore[unresolved-attribute]
+        atexit.unregister(server.close)  # ty: ignore[unresolved-attribute]
+        server.prefix_cache.clear()  # ty: ignore[unresolved-attribute]
+        server.model = server.tok = None  # ty: ignore[unresolved-attribute]
+        gc.collect()
+        if "torch" in sys.modules:
+            sys.modules["torch"].cuda.empty_cache()
 
 
 def build(spec: ModelSpec, settings: dict[str, Scalar]) -> Kev:
