@@ -69,7 +69,9 @@ and current results.
 sbatch scripts/download_model.sh <org>/<name>     # -> /shared/home/$USER/models/<name>, ~10 min for 55 GB
 squeue -u $USER; cat logs/download-<jobid>.out
 ```
-The script runs `sha256sum -c SHA256SUMS` when the repo ships one. For openjev/openjev, only
+Pin the revision and name the directory as the backend expects:
+`sbatch scripts/download_model.sh <org>/<name> <revision> <dir name>` (each model's config lists its
+commands). The script runs `sha256sum -c SHA256SUMS` when the repo ships one. For openjev/openjev, only
 `README.md` mismatches (the card was edited after the sums were generated) and the job then ends
 `FAILED` under `set -e`. That's harmless if every `*.safetensors` and `helper/*` file passed.
 
@@ -190,6 +192,11 @@ Pick the case that matches the model:
    them into answers with the helpers in `s1.models.answers` (`choice_answer`, `noul_from_logits`,
    `score_answer`: temperature-scaled softmax with validation). Put calibration constants in
    `options` so they get recorded.
+   Models that run in-process with `transformers` (`kev`, `semif`, `laya`, `bongard` backends) share
+   `backends/gpu.py`. It refuses to run without CUDA, and it enforces `require_gpu` (a device-name substring,
+   e.g. bongard-mini's `"rtx pro 4500"`). It also checks shipped code by sha256 (`check_sha256`) or a pinned
+   checkout by commit (`check_git_commit`) before importing it. Keep prompt building and readout in
+   torch-free functions so `tests/test_gpu_backends.py` can test them on the login node.
 3. **It's a hosted API.** Make `decide` call it over HTTP. Keep keys in environment variables,
    never in configs or records.
 

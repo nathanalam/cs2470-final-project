@@ -12,13 +12,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Serving stack pinned to the versions OpenJev's serve/SERVE.md was measured with. Install on a GPU node:
-#   uv sync --extra openjev
+# GPU stack. vllm/openai/httpx are pinned to the versions OpenJev's serve/SERVE.md was measured with;
+# peft and flash-linear-attention (Qwen3.5's Gated DeltaNet kernels) to Kev's uv.lock / modal_app.py.
+# Install on a GPU node:  uv sync --extra openjev
 openjev = [
     "vllm==0.29.0",
     "transformers==5.17.0",
     "openai==3.16.2",
     "httpx==0.28.1",
+    "peft==0.21.0",
+    "flash-linear-attention==0.5.2",
 ]
 
 [project.scripts]

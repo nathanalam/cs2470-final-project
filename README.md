@@ -93,6 +93,10 @@ Shipped configs: `configs/openjev_jeval_smoke.toml` (200 questions, about 17 min
 | | Name | Notes |
 |---|---|---|
 | Model | `openjev` | Starts vLLM plus the model's own `helper/shim.py` (`POST /v1/systemone`) with the model card's calibration, and stops both after the run. `openjev_endpoint` reuses a running helper instead. On A10G it needs `quantization = "none"`, because the card's fp8 recipe requires compute capability 8.9 or higher. |
+| Model | `kev-4b.hybrid`, `kev-4b.qwen3` | Backend `kev`: our reimplementation of Kev's inference (LoRA merged into the Qwen3.5-4B-Base / Qwen3-4B-Base backbone, pointer head over `</opt>` and `<decide>` hidden states, head.pt's temperature). One L4. |
+| Model | `semif.direct`, `semif.reranker` | Backend `semif`: controls with no decision training. Qwen3.5-4B's option-letter logits, or Qwen3-Reranker-4B's yes/no log-odds per option. Upstream's 16-option cap makes ~20% of JEVal invalid. One L4. |
+| Model | `laya.english`, `laya.multilingual` | Backend `laya`: the model repo's own `rl_agent_api.py`, run only if its sha256 matches the reviewed file. Small encoders that cut the state to fit 512 / 1024 tokens. Any GPU. |
+| Model | `bongard-mini` | Backend `bongard`: upstream's `Predictor` from a pinned checkout of AgentBull/bongard (`scripts/fetch_code.sh`). RTX Pro 4500 only (`gpu-g7-reserved`); the backend refuses other GPUs. |
 | Benchmark | `jeval` | JEVal (arXiv:2610.03935), pinned revision, 11,257 questions over 10 domains. It reports accuracy with invalid answers counted wrong, ECE (15 bins) and Brier score as in the paper, plus score-question accuracy/MAE and latency percentiles. Subsample with `jeval_limit` / `jeval_seed`. |
 | Benchmark | `shape_sweep` | Model-agnostic cost per question over a `[grid]` of `state_tokens` x `questions_per_request` (synthetic states, JEVal-shaped choice questions, concurrency 1). Each point repeats for `shape_min_point_s` and gets its own GPU sampling; latency is divided by the question count. Headline `shape_sweep_latency_ms` (lower is better), per-point keys `shape_sweep_t{T}_q{Q}_*`. Points above a model's optional `max_state_tokens` are counted as skipped, not wrong. Token counting is a pluggable `state_tokenizer` (only the approximate `approx_words` so far). Example: `configs/openjev_shape_sweep_smoke.toml`. |
 
@@ -110,11 +114,13 @@ src/s1/
   gpu_stats.py    nvidia-smi sampler
   report.py       results/REPORT.md + report.html (run by the pre-commit hook)
   models/         spec.py (ModelSpec), catalog.py (the list of specs), answers.py (System One answer
-                  assembly), backends/ (lazy table + vllm_shim.py, the OpenJev serving code)
+                  assembly), backends/ (lazy table; vllm_shim.py serves OpenJev, kev/semif/laya/
+                  bongard.py run in-process with transformers, gpu.py is their shared GPU guard)
   benchmarks/     jeval.py, shape_sweep.py
 configs/          experiment configs
 results/          run records (committed)
-scripts/          download_model.sh (sbatch), alloc.sh (interactive GPU shell in tmux), hooks/pre-commit
+scripts/          download_model.sh (sbatch; optional revision + dir name), fetch_code.sh (pinned git
+                  checkout of a model's runtime code), alloc.sh (interactive GPU shell in tmux), hooks/pre-commit
 tests/            pytest; fakes in conftest.py
 ```
 
