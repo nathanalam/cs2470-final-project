@@ -4,7 +4,7 @@
 # Weights first (once; both checkpoints are in the one repo):
 #   sbatch scripts/download_model.sh convaiinnovations/laya 7b928d828b7b0e022f929d9bd2e44165aa270148 laya
 # Then:
-#   uv run s1 submit configs/laya_jeval_smoke.toml -p gpu -g 1 -c 8 --mem 32G -t 01:00:00
+#   uv run s1 submit configs/laya_jeval_smoke.toml -p gpu -g 1 -c 8 --mem 28G -t 01:00:00
 benchmarks = ["jeval"]
 
 [invariants]

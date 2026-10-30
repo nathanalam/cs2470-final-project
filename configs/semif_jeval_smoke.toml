@@ -6,7 +6,7 @@
 #   sbatch scripts/download_model.sh Qwen/Qwen3.5-4B 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
 #   sbatch scripts/download_model.sh Qwen/Qwen3-Reranker-4B 22e683669bc0f0bd69640a1354a6d0aebcfeede5
 # Then:
-#   uv run s1 submit configs/semif_jeval_smoke.toml -p gpu -g 1 -c 8 --mem 48G -t 02:00:00
+#   uv run s1 submit configs/semif_jeval_smoke.toml -p gpu -g 1 -c 8 --mem 28G -t 02:00:00
 benchmarks = ["jeval"]
 
 [invariants]
