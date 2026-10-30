@@ -106,14 +106,17 @@ def test_grid_settings_are_comma_joined():
 def test_warmup_runs_before_sampling_and_is_recorded(tmp_path, echo_model):
     events = []
 
-    class Sampler:
+    class Sampler(GpuSampler):
+        @override
         def __enter__(self):
             events.append("sample")
             return self
 
-        def __exit__(self, *exc):
-            return False
+        @override
+        def __exit__(self, exc_type, exc, tb):
+            return None
 
+        @override
         def metrics(self):
             return {}
 
