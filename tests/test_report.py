@@ -1,4 +1,4 @@
-from s1 import report
+from s1 import report, report_roofline
 from s1.record import RunRecord
 from s1.report import DASH, TIMES
 
@@ -60,3 +60,74 @@ def test_write_is_deterministic(tmp_path):
     assert (md.read_text(), page.read_text()) == first
     assert "| otherjev | 81.0% |" in first[0]
     assert "<svg" in first[1] and "otherjev" in first[1]
+
+
+# --- roofline section ---------------------------------------------------------------------------
+
+
+def _roof_rec(run_id, model, metrics, gpu="NVIDIA L4", **params):
+    return RunRecord(run_id, {"gpu": gpu}, {"model": model, **params}, {"roofline": metrics})
+
+
+ROOF = {
+    "roofline_tflops": 30.0,
+    "roofline_intensity": 400.0,
+    "roofline_t512_intensity": 300.0,
+    "roofline_t512_tflops": 25.0,
+    "roofline_t1024_intensity": 600.0,
+    "roofline_t1024_tflops": 35.0,
+    "roofline_params_b": 8.95,
+    "roofline_active_params_b": 6.9,
+    "roofline_attention_layers": 0.25,
+    "roofline_peak_bf16_tflops": 90.0,
+    "roofline_peak_fp32_tflops": 25.0,
+    "roofline_peak_bw_gbs": 270.0,
+    "roofline_spec_bf16_tflops": 121.0,
+    "roofline_spec_bw_gbs": 300.0,
+    "roofline_accuracy": 0.6,
+}
+
+
+def test_roofline_family_comes_from_the_metrics():
+    assert report_roofline.family(ROOF) == 0  # dense, 1 in 4 layers attention
+    assert report_roofline.family(ROOF | {"roofline_attention_layers": 1.0}) == 1
+    assert report_roofline.family(ROOF | {"roofline_active_params_b": 1.1, "roofline_params_b": 6.9}) == 2
+
+
+NCU = ROOF | {"roofline_hw_intensity": 150.0, "roofline_hw_tflops": 29.0}
+
+
+def test_roofline_points_pair_clean_runs_with_their_ncu_run():
+    recs = [
+        _roof_rec("20261104-000001-a", "m1", ROOF),
+        _roof_rec("20261104-000002-b", "m1", ROOF | {"roofline_tflops": 31.0}),  # latest clean run wins
+        _roof_rec("20261104-000003-c", "m1", NCU, roofline_ncu=4),
+        _roof_rec("20261104-000004-d", "m2", ROOF, gpu="NVIDIA A10G"),
+    ]
+    by_gpu = report_roofline.points_by_gpu(recs)
+    assert set(by_gpu) == {"NVIDIA L4", "NVIDIA A10G"}
+    (p,) = by_gpu["NVIDIA L4"]
+    assert p.m["roofline_tflops"] == 31.0
+    assert p.hw["roofline_hw_intensity"] == 150.0
+    assert by_gpu["NVIDIA A10G"][0].hw == {}
+
+
+def test_roofline_chart_and_table():
+    pts = report_roofline.points_by_gpu([_roof_rec("20261104-000001-a", "jevk5-9b", ROOF)])["NVIDIA L4"]
+    svg = report_roofline.chart("NVIDIA L4", pts)
+    assert ">jevk5-9b</text>" in svg  # direct label
+    assert "measured: 90 TFLOP/s bf16 tensor, 270 GB/s" in svg
+    assert "datasheet: 121 TFLOP/s bf16" in svg
+    assert 'class="traj"' in svg  # path through the prompt-length bins
+    header, rows = report_roofline.table(pts)
+    assert len(rows) == 1
+    assert len(rows[0]) == len(header)
+    assert rows[0][header.index("Accuracy")] == "60.0%"
+    assert rows[0][header.index("HW TFLOP/s")] == report_roofline.DASH
+
+
+def test_report_includes_the_roofline_section(tmp_path):
+    _roof_rec("20261104-000001-a", "jevk5-9b", ROOF).save(tmp_path)
+    md, page = report.write(tmp_path)
+    assert "### Roofline on NVIDIA L4" in md.read_text()
+    assert 'class="card chart roof"' in page.read_text()

@@ -42,6 +42,9 @@ dev = [
     "ty>=0.0.86",
 ]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]  # runtimes/*/ hold third-party checkouts with their own tests
+
 [tool.ruff]
 line-length = 110
 target-version = "py312"
@@ -74,6 +77,9 @@ ignore = [
 
 [tool.ty.environment]
 python-version = "3.12"
+
+[tool.ty.src]
+exclude = ["runtimes/"]  # their own venvs (e.g. runtimes/elephant imports qev under torch 2.8)
 
 [tool.ty.rules]
 all = "error"

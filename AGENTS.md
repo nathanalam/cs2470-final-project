@@ -53,6 +53,12 @@ and current results.
   `srun --jobid=$JOB --overlap -n 1 nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv`.
 - **Check the GPU you actually got.** On 2026-10-26 job 4059 on `gpu-parallel` landed on 4x **L4** (sm89), not
   A10G, so results from different days may not be comparable. `invariants.gpu` records it.
+- **`gpu` mislabels too.** On 2026-11-04 jobs 6751/6770 on `gpu` (`gpu:l4:1`) got an **A10G**. For work that
+  must be on an L4, use `-p gpu-spec --gpu-type l4` (it types its GPUs: a10g, l4, rtxpro4500, t4; 6 h limit;
+  the L4 nodes have 8 CPUs and 31 GB RAM, so `--mem 28G`) and set `require_gpu = "L4"` so a wrong GPU fails fast.
+- **Hardware counters are open to users** (`RmProfilingAdminOnly: 0`). `ncu`, `nsys` and `nvcc` (CUDA 13.0,
+  driver 580) are in `/usr/local/cuda/bin` on GPU nodes only, not the login node. `/tmp` is node-local: anything
+  a job reads must be under `/shared`.
 - Nodes are powered-down cloud instances (`idle~`), so expect 5–10 min to boot.
   `NODE_FAIL` / `sinfo -R` showing `InsufficientInstanceCapacity` means AWS is out of that
   instance type. Just resubmit; the second try worked within minutes.
@@ -210,6 +216,11 @@ Before the first GPU run:
 - **Context:** JEVal prompts run up to ~80k tokens, and anything over `max_model_len` is invalid.
 - **License:** note it in the model's docstring (OpenJev weights are CC BY-NC 4.0).
 - **Test it** with a fake in `tests/` if it has logic beyond HTTP plumbing (see `tests/conftest.py::EchoModel`).
+- **Roofline:** the `roofline` benchmark needs `s1.flops` to know the model's `model_type`. Add a builder there
+  and check its parameter count against the Hub's safetensors total in `tests/test_flops.py`; the backend must
+  implement `profile_info`/`take_forwards`/`count_flops` (and `profiler` for `s1 ncu`), see `backends/semif.py`.
+- **Conflicting dependencies** (another torch/transformers): give the model its own uv project under
+  `runtimes/<name>/` and a worker spoken to over a pipe, like `runtimes/elephant/` (`backends/elephant.py`).
 
 ## Adding a benchmark
 
@@ -276,3 +287,8 @@ print(evaluate(EchoModel(), load_rows(), concurrency=1))"
 | Test fakes (EchoModel, fake nvidia-smi) | `tests/conftest.py` |
 | Results report (columns, formatting, chart) | `src/s1/report.py`, hook in `scripts/hooks/pre-commit` |
 | OpenJev serving reference | `/shared/home/$USER/models/openjev/serve/SERVE.md` |
+| Roofline: FLOP/byte cost model per architecture | `src/s1/flops.py` |
+| Forward timing, measured ceilings, FlopCounterMode | `src/s1/profiling.py` |
+| Roofline benchmark; hardware counters (`s1 ncu`) | `src/s1/benchmarks/roofline.py`, `src/s1/ncu.py` |
+| Roofline chart and table in the report | `src/s1/report_roofline.py` |
+| elephant-1's own runtime (torch 2.8) | `runtimes/elephant/` (build: `sbatch runtimes/elephant/setup.sh`) |

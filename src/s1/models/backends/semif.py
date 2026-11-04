@@ -15,12 +15,22 @@ a score level is the option "<i>: <level text>" (our extension). Upstream caps a
 A-P) and rejects over-long prompts rather than truncating; both stay errors, so they count as invalid answers.
 Code MIT; weights Apache-2.0.
 
+The same readout serves any causal LM with a chat template, so the catalog also uses it for zero-shot
+controls of other architectures (Qwen3, OLMoE, LFM2, Granite-4.0-H) and for JevK5, which was trained on
+SemIf's prompt and reads out with a fitted temperature.
+
+For the roofline benchmark the model is profiled (`profile_info`, `take_forwards`, `count_flops`): a forward
+recorder is hooked on first use, and with `measure_ceilings` the GPU's ceilings are measured before the
+weights load. `close()` frees the GPU so the next model of a sweep can load in the same process.
+
 Weights (scripts/download_model.sh at the catalog revision): `model_dir`, default $MODELS_DIR/<repo name>.
 Settings (all optional):
     mode               direct | reranker                                          (from the spec)
     semif_max_options  options per question, at most 26 (A-Z)                    default 16 (upstream)
+    semif_temperature  divides the option scores before the softmax               default 1.0 (upstream)
     max_prompt_tokens  longest prompt (one pair, for the reranker)                default 16384
                        (upstream defaults to 4096; 16384 matches openjev's max_model_len)
+    measure_ceilings   measure the GPU's roofline ceilings before loading         default false
     dtype, require_gpu see backends/gpu.py
 """
 
@@ -33,8 +43,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from ... import profiling
 from ...record import Scalar
-from ...registry import get_int, get_str
+from ...registry import get_bool, get_float, get_int, get_str
 from ..answers import choice_answer, noul_from_logits, score_answer
 from ..spec import ModelSpec
 from . import gpu
@@ -131,8 +142,12 @@ class SemIf:
     max_tokens: int
     max_options: int
     letter_ids: list[int]
-    yes_no: tuple[int, int]  # (no, yes)
+    yes_no: tuple[int, int] | None  # (no, yes); reranker only
+    temperature: float = 1.0
+    hf_config: dict[str, object] = field(default_factory=dict)  # what the roofline cost model reads
+    ceilings: dict[str, float] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    recorder: profiling.ForwardRecorder | None = None
 
     def encode(self, text: str) -> list[int]:
         return list(self.tokenizer.encode(text, add_special_tokens=False))  # ty: ignore[unresolved-attribute]
@@ -165,15 +180,50 @@ class SemIf:
                 direct_messages(state, row), tokenize=False, add_generation_prompt=True, enable_thinking=False
             )
             logits = self._last_logits([self._checked(self.encode(prompt))])[0]
-            return [float(logits[t]) for t in self.letter_ids[: len(row.options)]]
+            return [float(logits[t]) / self.temperature for t in self.letter_ids[: len(row.options)]]
+        if self.yes_no is None:
+            raise RuntimeError("reranker mode needs the yes/no token ids")
         pairs = [self._checked(self.encode(rerank_text(state, row, o))) for o in row.options]
         no, yes = self.yes_no
         logits = self._last_logits(pairs)
-        return [float(x) for x in (logits[:, yes] - logits[:, no]).cpu()]
+        return [float(x) / self.temperature for x in (logits[:, yes] - logits[:, no]).cpu()]
 
     def decide(self, state: str, questions: Mapping[str, object]) -> dict[str, object]:
         rows = {key: to_row(q, self.max_options) for key, q in questions.items()}
         return {key: answer(row, self.scores(state, row)) for key, row in rows.items()}
+
+    def profile_info(self) -> dict[str, object]:
+        if self.recorder is None:
+            self.recorder = profiling.ForwardRecorder(self.model)
+        return {"config": self.hf_config, "head_bytes": 2, "ceilings": self.ceilings}
+
+    def take_forwards(self) -> list[dict[str, object]]:
+        return [] if self.recorder is None else self.recorder.take()
+
+    def count_flops(self, state: str, questions: Mapping[str, object]) -> float:
+        return profiling.count_flops(lambda: self.decide(state, questions))[1]
+
+    def profiler(self, on: bool) -> None:
+        """Open/close the CUDA profiler range Nsight Compute records (`s1 ncu`)."""
+        import torch  # noqa: PLC0415
+
+        torch.cuda.synchronize()
+        (torch.cuda.profiler.start if on else torch.cuda.profiler.stop)()
+
+    def run_info(self) -> dict[str, Scalar]:
+        return {f"env_{k}": v for k, v in profiling.kernel_env(self.model).items()}
+
+    def close(self) -> None:
+        """Drop the weights and free the GPU, so the next run in this process can load."""
+        import gc  # noqa: PLC0415
+
+        import torch  # noqa: PLC0415
+
+        if self.recorder is not None:
+            self.recorder.close()
+        self.model = self.recorder = None  # ty: ignore[invalid-assignment]
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 def single_token(tokenizer: object, text: str) -> int:
@@ -192,6 +242,9 @@ def build(spec: ModelSpec, settings: dict[str, Scalar]) -> SemIf:
     name = spec.repo.rpartition("/")[2]
     model_dir = gpu.local_dir(settings, "model_dir", name, gpu.download_hint(spec.repo, spec.revision, name))
     device = gpu.cuda_device(settings, spec.name)
+    ceilings = (
+        profiling.measure_ceilings(str(device)) if get_bool(settings, "measure_ceilings", False) else {}
+    )
     tok = transformers.AutoTokenizer.from_pretrained(model_dir)
     if tok is None:
         raise RuntimeError(f"no tokenizer in {model_dir}")
@@ -224,7 +277,10 @@ def build(spec: ModelSpec, settings: dict[str, Scalar]) -> SemIf:
         max_tokens=get_int(settings, "max_prompt_tokens", 16384),
         max_options=get_int(settings, "semif_max_options", 16),
         letter_ids=letters,
-        yes_no=(single_token(tok, "no"), single_token(tok, "yes")),
+        yes_no=(single_token(tok, "no"), single_token(tok, "yes")) if mode == "reranker" else None,
+        temperature=get_float(settings, "semif_temperature", 1.0),
+        hf_config=dict(config.to_dict()),
+        ceilings=ceilings,
     )
 
 

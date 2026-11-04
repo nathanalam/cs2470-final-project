@@ -13,6 +13,11 @@ Weights: `scripts/download_model.sh convaiinnovations/laya <revision> laya` hold
     laya_dir   the repo                         default $MODELS_DIR/laya
     checkpoint subdirectory of the checkpoint    from the spec ("" English, "multilingual")
 Settings: require_gpu (see backends/gpu.py). Weights stay fp32 under bf16 autocast, as upstream.
+measure_ceilings (default false) measures the GPU's roofline ceilings before loading.
+
+Roofline (benchmarks/roofline.py): the encoder's forwards are recorded by hooks on `model.encoder` (the
+ModernBERT backbone; the decision head is a small MLP on the option markers, no vocab head, so kept = 0),
+and its weights are fp32 in memory (weight_bytes = 4).
 """
 
 from __future__ import annotations
@@ -24,8 +29,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ... import profiling
 from ...record import Scalar
-from ...registry import get_str
+from ...registry import get_bool, get_str
 from ..spec import ModelSpec
 from . import gpu
 
@@ -53,12 +59,38 @@ class Laya:
     agent: object
     max_state_tokens: int | None = None  # shape_sweep skips longer states
     lock: threading.Lock = field(default_factory=threading.Lock)
+    ceilings: dict[str, float] = field(default_factory=dict)
+    recorder: profiling.ForwardRecorder | None = None
 
     def decide(self, state: str, questions: Mapping[str, object]) -> dict[str, object]:
         with self.lock:
             out = self.agent.system_one(state, dict(questions))  # ty: ignore[unresolved-attribute]
         answers = out["answers"]
         return {str(k): v for k, v in answers.items()}
+
+    def _encoder(self) -> object:
+        return self.agent.model.encoder  # ty: ignore[unresolved-attribute]
+
+    def profile_info(self) -> dict[str, object]:
+        if self.recorder is None:
+            self.recorder = profiling.ForwardRecorder(self._encoder(), head=False)
+        config = dict(self._encoder().config.to_dict())  # ty: ignore[unresolved-attribute]
+        return {"config": config, "head_bytes": 2, "weight_bytes": 4, "ceilings": self.ceilings}
+
+    def take_forwards(self) -> list[dict[str, object]]:
+        return [] if self.recorder is None else self.recorder.take()
+
+    def count_flops(self, state: str, questions: Mapping[str, object]) -> float:
+        return profiling.count_flops(lambda: self.decide(state, questions))[1]
+
+    def profiler(self, on: bool) -> None:
+        import torch  # noqa: PLC0415
+
+        torch.cuda.synchronize()
+        (torch.cuda.profiler.start if on else torch.cuda.profiler.stop)()
+
+    def run_info(self) -> dict[str, Scalar]:
+        return {f"env_{k}": v for k, v in profiling.kernel_env(self._encoder()).items()}
 
 
 def build(spec: ModelSpec, settings: dict[str, Scalar]) -> Laya:
@@ -69,8 +101,11 @@ def build(spec: ModelSpec, settings: dict[str, Scalar]) -> Laya:
     if not (checkpoint / "model.safetensors").is_file():
         raise FileNotFoundError(f"{checkpoint}/model.safetensors missing")
     device = gpu.cuda_device(settings, spec.name)
+    ceilings = (
+        profiling.measure_ceilings(str(device)) if get_bool(settings, "measure_ceilings", False) else {}
+    )
     agent = import_reviewed(code_dir)(str(checkpoint), device=str(device))
-    return Laya(agent, spec.max_state_tokens)
+    return Laya(agent, spec.max_state_tokens, ceilings=ceilings)
 
 
 class LayaBackend:
