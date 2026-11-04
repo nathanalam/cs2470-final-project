@@ -30,25 +30,33 @@ LAYA_REV = "7b928d828b7b0e022f929d9bd2e44165aa270148"
 LAYA_MULTILINGUAL = ModelSpec(
     name="laya.multilingual",
     group="E",
+    status="ready",
+    backend="laya",
     repo="convaiinnovations/laya",
     revision=LAYA_REV,
     license="apache-2.0",
     resolved_on=RESOLVED,
     size_bytes=643_835_514,  # multilingual/model.safetensors only
-    options={"question_mode": "reencode"},
-    notes="Checkpoint in multilingual/. Revision is a proposed pin (unpinned in our doc).",
+    options={"question_mode": "reencode", "checkpoint": "multilingual"},
+    notes="Checkpoint in multilingual/ (mmBERT-base, 1024-token sequences). Revision is a proposed pin "
+    "(unpinned in our doc); the laya package's own reviewed pin is 55cf4c4e. The repo also ships a "
+    "fine-tuned typed-decisions/ checkpoint we don't list.",
 )
 # Same repo and revision; the root checkpoint is the English one, capped at 512 tokens.
 LAYA_ENGLISH = LAYA_MULTILINGUAL.variant(
     "english",
     size_bytes=842_609_210,  # root model.safetensors only
     max_state_tokens=512,
-    notes="Checkpoint at repo root; 512-token cap. Revision is a proposed pin (unpinned in our doc).",
+    options={"checkpoint": ""},
+    notes="Checkpoint at repo root (ModernBERT-large); 512 tokens for the whole sequence, so the state "
+    "gets fewer. Revision is a proposed pin (unpinned in our doc).",
 )
 
 KEV_HYBRID = ModelSpec(
     name="kev-4b.hybrid",
     group="D-hybrid",
+    status="ready",
+    backend="kev",
     repo="jaredpalmer/kev-4b",
     revision="139fdd94f1b6a6ad80cc15e08fcb99cac885a101",
     base_repo="Qwen/Qwen3.5-4B-Base",
@@ -78,6 +86,8 @@ KEV_QWEN3 = KEV_HYBRID.variant(
 BONGARD_MINI = ModelSpec(
     name="bongard-mini",
     group="ED",
+    status="ready",
+    backend="bongard",
     repo="AgentBull/bongard-mini",
     revision="c81c5b883a5983669be84be98658eac940489613",
     base_repo="google/t5gemma-2-4b-4b",
@@ -87,8 +97,9 @@ BONGARD_MINI = ModelSpec(
     license="gemma",
     resolved_on=RESOLVED,
     size_bytes=15_020_655_896,  # backbone/model.safetensors + head.safetensors (backbone is bundled)
-    options={"question_mode": "shared_encoder"},
-    notes="Gemma terms; base repo is gated (manual approval). Needs Python >=3.12 and transformers==5.17.0.",
+    options={"question_mode": "shared_encoder", "require_gpu": "rtx pro 4500"},
+    notes="Gemma terms. The backbone is bundled, so the gated base repo is not needed at runtime. Upstream "
+    "wants Python >=3.12, transformers==5.17.0 and torch>=2.14 (we have 2.13). RTX Pro 4500 (32 GB) only.",
 )
 
 DECIDER = ModelSpec(
@@ -109,6 +120,8 @@ DECIDER = ModelSpec(
 SEMIF_DIRECT = ModelSpec(
     name="semif.direct",
     group="control",
+    status="ready",
+    backend="semif",
     repo="Qwen/Qwen3.5-4B",
     revision="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
     code_repo="TheoLeeCJ/SemIf",

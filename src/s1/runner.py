@@ -98,6 +98,9 @@ def run(
         with metrics_mode(gpu_mode):
             for name in spec.benchmarks:
                 t = time.perf_counter()
+                if (warm := registry.get_warmup(name)) is not None and warm(model, settings):
+                    meta[f"{name}_warmup_s"] = round(time.perf_counter() - t, 3)
+                t = time.perf_counter()
                 with gpu_sampler() as smi:
                     rec.results[name] = registry.get_benchmark(name)(model, settings)
                 meta[f"{name}_s"] = round(time.perf_counter() - t, 3)

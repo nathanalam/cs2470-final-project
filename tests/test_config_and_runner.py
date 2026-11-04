@@ -129,3 +129,45 @@ def test_runner_basic_has_no_schema_and_detailed_records_it(tmp_path, echo_model
     (spec, *_) = config.load(p)
     with pytest.raises(ValueError, match="gpu_metrics"):
         runner.run(spec, results_dir=tmp_path / "e", log=lambda _: None)
+
+
+def test_warmup_runs_before_sampling_and_is_recorded(tmp_path, echo_model):
+    events = []
+
+    class Sampler(GpuSampler):
+        @override
+        def __enter__(self):
+            events.append("sample")
+            return self
+
+        @override
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        @override
+        def metrics(self):
+            return {}
+
+    @registry.benchmark("warm_bench")
+    def bench(model, settings):
+        events.append("bench")
+        return {"warm_bench_x": 1.0}
+
+    @registry.warmup("warm_bench")
+    def warm(model, settings):
+        events.append("warm")
+        return bool(settings.get("do_warm"))
+
+    try:
+        for do_warm in (True, False):
+            spec = config.RunSpec(
+                invariants={"gpu": "cpu"},
+                params={"model": "echo", "do_warm": do_warm},
+                benchmarks=["warm_bench"],
+            )
+            rec = runner.run(spec, results_dir=tmp_path, log=lambda _: None, gpu_sampler=Sampler)
+            assert ("warm_bench_warmup_s" in rec.meta) is do_warm
+    finally:
+        registry.BENCHMARKS.pop("warm_bench", None)
+        registry.WARMUPS.pop("warm_bench", None)
+    assert events == ["warm", "sample", "bench"] * 2
