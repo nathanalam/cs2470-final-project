@@ -41,11 +41,17 @@ Accuracy on 200 questions carries roughly ±6.5 points (95%).
 
 ### What we found
 
-- **At batch 1, a decision costs bytes, not FLOPs.** Every decision model sits near or left of the L4's
-  ridge: intensities run from 105 to 291 FLOP/byte, because a single prefill reads every weight once for only
-  ~200–340 prompt tokens. GPU time per question therefore follows the bytes a recipe makes the GPU read:
-  0.5 GB for laya.multilingual, 7.4 GB for kev-4b.qwen3, 16 GB for JevK5-9B and 36 GB for elephant-1.
-  Achieved throughput (3–30 TFLOP/s) says less about a recipe than its distance to the memory roof.
+- **At batch 1, the recipe decides which roof binds.** Intensities run from 105 to 308 FLOP/byte against
+  a ridge of about 257, because a single prefill reads every weight once for only ~200–340 prompt tokens.
+  - **Compute-bound, barely:** the single-pass dense 9B models: JevK5-9B and its Qwen3.5 base at 291, and
+    zero-shot Qwen3-8B at 308. They reach only 51–56% of the measured bf16 peak, so their gap is serving
+    software, not bandwidth.
+  - **At the ridge:** kev-4b.qwen3, at 236.
+  - **Memory-bound:** the two-pass recipes (elephant-1 at 120, kev-4b.hybrid at 130), laya's encoders (about
+    105) and the MoE bases (56–60). For these, GPU time follows the bytes a recipe makes the GPU read:
+    0.5 GB per question for laya.multilingual, 14.5 GB for kev-4b.hybrid and 36 GB for elephant-1.
+  - The bytes are compulsory traffic, a lower bound, so real intensities are if anything lower. Every point
+    would shift toward the memory side.
 - **The readout head is a hidden weight read.** A vocab readout (JevK5, the Qwen3.5 control, elephant-1) runs
   a 248k × 4096 LM head, 2.0 GB in bf16, on every forward, only to read a handful of letter or slot logits.
   elephant-1 keeps that head in fp32 for calibration, which makes 4.1 GB per pass and about 8 GB of its
@@ -93,8 +99,8 @@ Accuracy on 200 questions carries roughly ±6.5 points (95%).
 
 ### What this suggests for choosing hardware next
 
-Batch-1 decisions on an L4 are bound by memory bandwidth for every recipe here except single-pass 9B models
-with longer prompts. So:
+Batch-1 decisions on an L4 are bound by memory bandwidth for every recipe here except the single-pass dense
+9B models. Those sit just past the ridge and lose about half their peak to software. So:
 
 - **Bandwidth-bound recipes** are the two-pass recipes (elephant-1, kev-4b.hybrid), MoE backbones and small
   encoders. They should gain most from GPUs with more GB/s per dollar, such as an A10G (600 GB/s) or HBM parts.
