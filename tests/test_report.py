@@ -131,3 +131,30 @@ def test_report_includes_the_roofline_section(tmp_path):
     md, page = report.write(tmp_path)
     assert "### Roofline on NVIDIA L4" in md.read_text()
     assert 'class="card chart roof"' in page.read_text()
+
+
+def test_recipes_list_decision_models_and_the_control_only():
+    recs = [
+        _roof_rec("20261104-000001-a", "jevk5-9b", ROOF),
+        _roof_rec("20261104-000002-b", "kev-4b.hybrid", ROOF | {"roofline_padding": 0.25}),
+        _roof_rec("20261104-000003-c", "olmoe-1b-7b.zeroshot", ROOF),  # a reference, no recipe
+        _roof_rec("20261104-000004-d", "qwen35-9b.zeroshot", ROOF),  # the control has one
+    ]
+    header, rows = report_roofline.recipes(report_roofline.points_by_gpu(recs)["NVIDIA L4"])
+    assert [r[0] for r in rows] == ["jevk5-9b", "kev-4b.hybrid", "qwen35-9b.zeroshot"]
+    assert all(len(r) == len(header) for r in rows)
+    assert rows[1][header.index("Padding")] == "25%"
+    assert rows[0][header.index("Padding")] == report_roofline.DASH
+    assert report_roofline.is_decision_model("kev-4b.hybrid")
+    assert not report_roofline.is_decision_model("olmoe-1b-7b.zeroshot")
+
+
+def test_report_includes_findings_when_written(tmp_path):
+    _roof_rec("20261104-000001-a", "jevk5-9b", ROOF).save(tmp_path)
+    md, page = report.write(tmp_path)
+    assert "### Findings" not in md.read_text()
+    (tmp_path / report_roofline.FINDINGS).write_text("Some **bold** claim.\n\n- one `x`\n- two\n  wrapped\n")
+    md, page = report.write(tmp_path)
+    assert "### Findings" in md.read_text() and "### Decision recipes on NVIDIA L4" in md.read_text()
+    assert "<p>Some <strong>bold</strong> claim.</p>" in page.read_text()
+    assert "<ul><li>one <code>x</code></li><li>two wrapped</li></ul>" in page.read_text()

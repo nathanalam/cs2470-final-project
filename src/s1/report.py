@@ -171,7 +171,7 @@ def _md_table(t: Table) -> str:
     return "\n".join(lines)
 
 
-def to_markdown(recs: Sequence[RunRecord]) -> str:
+def to_markdown(recs: Sequence[RunRecord], results_dir: Path = RESULTS_DIR) -> str:
     out = [
         "# Results",
         "",
@@ -182,7 +182,15 @@ def to_markdown(recs: Sequence[RunRecord]) -> str:
     for bench in benchmarks(recs):
         out += [f"## {bench}", ""]
         if bench == report_roofline.BENCH:
+            if text := report_roofline.findings(results_dir):
+                out += ["### Findings", "", text, ""]
             for gpu, pts in report_roofline.points_by_gpu(recs).items():
+                out += [
+                    f"### Decision recipes on {gpu}",
+                    "",
+                    _md_table(Table(*report_roofline.recipes(pts))),
+                    "",
+                ]
                 out += [f"### Roofline on {gpu}", "", _md_table(Table(*report_roofline.table(pts))), ""]
         out += [
             "### Leaderboard (each model's largest run)",
@@ -235,6 +243,8 @@ details{margin:6px 0}summary{cursor:pointer}
 .chart text{fill:var(--ink);font:12px system-ui,sans-serif}.chart .muted{fill:var(--ink-2)}
 .chart .bar{fill:var(--bar)}.chart .track{fill:var(--track)}
 .chart g.mark:hover .bar{opacity:.8}
+.prose{line-height:1.6}.prose p,.prose ul{max-width:90ch}.prose li{margin:4px 0}.prose h4{margin:18px 0 6px}
+.recipes td{white-space:normal;min-width:7em;vertical-align:top}
 """
 
 
@@ -295,7 +305,7 @@ def _bar_chart(bench: str, recs: Sequence[RunRecord]) -> str:
     )
 
 
-def to_html(recs: Sequence[RunRecord]) -> str:
+def to_html(recs: Sequence[RunRecord], results_dir: Path = RESULTS_DIR) -> str:
     parts = [
         "<!doctype html><html lang=en><head><meta charset=utf-8>",
         '<meta name="viewport" content="width=device-width,initial-scale=1">',
@@ -308,7 +318,16 @@ def to_html(recs: Sequence[RunRecord]) -> str:
         n_keys = len(metric_keys(bench, recs))
         parts += [f"<h2>{html.escape(bench)}</h2>", _bar_chart(bench, recs)]
         if bench == report_roofline.BENCH:
+            if text := report_roofline.findings(results_dir):
+                parts += [
+                    '<h3>Findings</h3><div class="card prose">',
+                    report_roofline.markdown_to_html(text),
+                    "</div>",
+                ]
             for gpu, pts in report_roofline.points_by_gpu(recs).items():
+                rh, rr = report_roofline.recipes(pts)
+                parts += [f"<h3>Decision recipes on {html.escape(gpu)}</h3>", '<div class="card recipes">',
+                          _html_table(Table(rh, rr), 5, len(rh)), "</div>"]  # fmt: skip
                 header, rows = report_roofline.table(pts)
                 parts += [report_roofline.chart(gpu, pts), '<div class="card">',
                           _html_table(Table(header, rows), 2, len(header)), "</div>"]  # fmt: skip
@@ -334,6 +353,6 @@ def to_html(recs: Sequence[RunRecord]) -> str:
 def write(results_dir: Path = RESULTS_DIR) -> tuple[Path, Path]:
     recs = load_all(results_dir)
     md, page = results_dir / "REPORT.md", results_dir / "report.html"
-    md.write_text(to_markdown(recs) + "\n")
-    page.write_text(to_html(recs))
+    md.write_text(to_markdown(recs, results_dir) + "\n")
+    page.write_text(to_html(recs, results_dir))
     return md, page

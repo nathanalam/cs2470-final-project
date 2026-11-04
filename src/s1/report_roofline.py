@@ -7,7 +7,13 @@ GEMM, fp32 CUDA-core GEMM, DRAM copy; medians over the runs on that GPU) and the
 
 Color encodes the architecture family, read from the metrics (MoE when active parameters are under half the
 total; else hybrid when some layers are not attention): three hues, the palette's all-pairs-safe slots.
-Identity is a direct label on every point, never color alone, and the table repeats every value.
+Identity is a direct label on every point, never color alone, and the table repeats every value. Decision
+models are full-size points; zero-shot base models (references for the architecture, not decision models)
+are small and faint.
+
+`recipes()` lays the decision models' design choices (RECIPES: backbone, adaptation, readout, serving) next
+to what they cost on the GPU and what they get right, and `findings()` reads the analysis written for the
+current runs from results/roofline_findings.md (prose about the records, kept with them).
 """
 
 from __future__ import annotations
@@ -17,6 +23,7 @@ import math
 import statistics
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 from .record import Metrics, RunRecord
 
@@ -33,7 +40,62 @@ CSS = """
 .roof .key{display:inline-flex;align-items:center;gap:6px}
 .roof .sw{width:10px;height:10px;border-radius:50%;display:inline-block}
 .roof g.pt:hover circle.dot{stroke-width:3}
+.roof .ref{opacity:.55}
 """
+FINDINGS = "roofline_findings.md"
+
+# What each team did to a base model to make it a decision model (catalog names; see models/catalog.py).
+# Columns: backbone, adaptation, readout, serving.
+RECIPES = {
+    "elephant-1": (
+        "Qwen3.5-9B (Gated DeltaNet hybrid)",
+        "full fine-tune",
+        "slot-token logits, fp32 LM head",
+        "own engine (torch 2.8): block-bidirectional attention, state prefilled once, questions forked "
+        "from it in one batched pass",
+    ),
+    "jevk5-9b": (
+        "Qwen3.5-9B (Gated DeltaNet hybrid)",
+        "full fine-tune",
+        "option-letter softmax over the vocab head, temperature 1.316",
+        "plain transformers, one causal pass per question",
+    ),
+    "kev-4b.hybrid": (
+        "Qwen3.5-4B-Base (Gated DeltaNet hybrid)",
+        "LoRA (merged) + pointer head",
+        "pointer over option markers: no vocab head",
+        "prefix cache, fused Triton DeltaNet kernels, CUDA graphs over padded shape buckets",
+    ),
+    "kev-4b.qwen3": (
+        "Qwen3-4B-Base (attention only)",
+        "LoRA (merged) + pointer head",
+        "pointer over option markers: no vocab head",
+        "prefix cache; questions packed in one row under a block mask; eager",
+    ),
+    "laya.english": (
+        "ModernBERT-large encoder (395M)",
+        "fine-tuned encoder + MLP head",
+        "head on each option's [MASK]",
+        "fp32 weights under bf16 autocast; state cut to 512 tokens",
+    ),
+    "laya.multilingual": (
+        "mmBERT-base encoder (307M)",
+        "fine-tuned encoder + MLP head",
+        "head on each option's [MASK]",
+        "fp32 weights under bf16 autocast; state cut to 1024 tokens",
+    ),
+    "qwen35-9b.zeroshot": (
+        "Qwen3.5-9B (Gated DeltaNet hybrid)",
+        "none (zero-shot control: JevK5's and elephant-1's base)",
+        "option-letter softmax over the vocab head",
+        "plain transformers",
+    ),
+}
+
+
+def is_decision_model(model: str) -> bool:
+    """Trained for decisions, as opposed to a zero-shot base model run through the same readout."""
+    return not model.endswith(".zeroshot")
 
 
 def family(m: Metrics) -> int:
@@ -96,6 +158,7 @@ def _f(v: float, digits: int = 3) -> str:
 def table(pts: Sequence[Point]) -> tuple[list[str], list[list[str]]]:
     header = [
         "Model",
+        "Role",
         "Family",
         "Params B (active)",
         "Tokens/q",
@@ -117,6 +180,7 @@ def table(pts: Sequence[Point]) -> tuple[list[str], list[list[str]]]:
         rows.append(
             [
                 p.model,
+                "decision model" if is_decision_model(p.model) else "zero-shot base",
                 FAMILIES[p.family],
                 f"{_f(m.get('roofline_params_b', nan))} ({_f(m.get('roofline_active_params_b', nan))})",
                 _f(m.get("roofline_tokens_per_question", math.nan), 4),
@@ -286,10 +350,11 @@ def chart(gpu: str, pts: Sequence[Point]) -> str:
             + (f", {eff:.0%} of attainable" if math.isfinite(eff) else "")
             + f" (run {p.run_id})"
         )
+        ref, r = ("ref", 3.5) if not is_decision_model(p.model) else ("", 5)
         marks.append(
-            f'<g class="pt"><title>{html.escape(tip)}</title>'
+            f'<g class="pt {ref}"><title>{html.escape(tip)}</title>'
             f'<circle cx="{x:.1f}" cy="{y:.1f}" r="10" fill="transparent"/>'
-            f'<circle class="dot" cx="{x:.1f}" cy="{y:.1f}" r="5" fill="{color}" stroke="var(--surface)" '
+            f'<circle class="dot" cx="{x:.1f}" cy="{y:.1f}" r="{r}" fill="{color}" stroke="var(--surface)" '
             'stroke-width="2"/></g>'
         )
         labels.append((x, y, p.model))
@@ -299,6 +364,7 @@ def chart(gpu: str, pts: Sequence[Point]) -> str:
         for f in present
     )
     legend += (
+        '<span class="key">● decision model · small, faint: zero-shot base model</span>'
         '<span class="key">● cost model: FLOPs ÷ compulsory bytes</span>'
         '<span class="key">○ hardware counters (ncu)</span>'
         '<span class="key">faint path: by prompt length</span>'
@@ -311,3 +377,86 @@ def chart(gpu: str, pts: Sequence[Point]) -> str:
         f'<svg viewBox="0 0 {W} {H}" role="img" aria-label="{html.escape(title)}">'
         f"{_axes(s)}{''.join(roofs)}{''.join(marks)}{_labels(labels)}</svg></figure>"
     )
+
+
+# ---------------------------------------------------------------- decision recipes
+
+
+def recipes(pts: Sequence[Point]) -> tuple[list[str], list[list[str]]]:
+    """Each decision model's design choices beside its GPU use and accuracy on the same questions, best
+    accuracy first. Models without a RECIPES entry (zero-shot references but the control) are left out."""
+    header = [
+        "Model",
+        "Backbone",
+        "Adaptation",
+        "Readout",
+        "Serving",
+        "Accuracy",
+        "Questions/s",
+        "GPU ms/q",
+        "GFLOP/q",
+        "Intensity FLOP/B",
+        "TFLOP/s",
+        "% of bf16 peak",
+        "% of roof",
+        "Padding",
+    ]
+    nan = math.nan
+    rows = []
+    for p in sorted(pts, key=lambda p: -p.m.get("roofline_accuracy", 0.0)):
+        if p.model not in RECIPES:
+            continue
+        m = p.m
+        pad = m.get("roofline_padding", nan)
+        rows.append(
+            [
+                p.model,
+                *RECIPES[p.model],
+                DASH if "roofline_accuracy" not in m else f"{m['roofline_accuracy']:.1%}",
+                _f(m.get("roofline_questions_per_s", nan)),
+                _f(m.get("roofline_gpu_ms", nan)),
+                _f(m.get("roofline_gflop_per_question", nan)),
+                _f(m.get("roofline_intensity", nan)),
+                _f(m.get("roofline_tflops", nan)),
+                _f(100 * m.get("roofline_mfu", nan), 2),
+                _f(100 * m.get("roofline_efficiency", nan), 2),
+                DASH if not math.isfinite(pad) else f"{pad:.0%}",
+            ]
+        )
+    return header, rows
+
+
+def findings(results_dir: Path) -> str:
+    """The analysis written for the current runs (markdown), or "" if there is none."""
+    path = results_dir / FINDINGS
+    return path.read_text().strip() if path.is_file() else ""
+
+
+def markdown_to_html(text: str) -> str:
+    """The small markdown subset the findings use: ### headings, paragraphs, "- " lists, **bold**, `code`."""
+    import re  # noqa: PLC0415
+
+    def inline(t: str) -> str:
+        t = html.escape(t)
+        t = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", t)
+        return re.sub(r"`(.+?)`", r"<code>\1</code>", t)
+
+    out: list[str] = []
+    for block in re.split(r"\n\s*\n", text.strip()):
+        lines = block.splitlines()
+        if lines[0].startswith("### "):
+            out.append(f"<h4>{inline(lines[0][4:])}</h4>")
+            lines = lines[1:]
+            if not lines:
+                continue
+        if all(ln.startswith(("- ", "  ")) for ln in lines):
+            items: list[str] = []
+            for ln in lines:
+                if ln.startswith("- "):
+                    items.append(ln[2:])
+                else:
+                    items[-1] += " " + ln.strip()
+            out.append("<ul>" + "".join(f"<li>{inline(i)}</li>" for i in items) + "</ul>")
+        else:
+            out.append(f"<p>{inline(' '.join(ln.strip() for ln in lines))}</p>")
+    return "\n".join(out)
