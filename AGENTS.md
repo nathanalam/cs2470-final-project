@@ -219,6 +219,11 @@ Before the first GPU run:
 - **Roofline:** the `roofline` benchmark needs `s1.flops` to know the model's `model_type`. Add a builder there
   and check its parameter count against the Hub's safetensors total in `tests/test_flops.py`; the backend must
   implement `profile_info`/`take_forwards`/`count_flops` (and `profiler` for `s1 ncu`), see `backends/semif.py`.
+  A model with no vocab head (pointer/marker heads: kev, laya) records with `ForwardRecorder(m, head=False)`;
+  fp32 weights report `"weight_bytes": 4`; passes that bypass module hooks (CUDA graph replays) are timed with
+  `recorder.span(shape)` and anything that is not a decision (graph captures) runs inside `recorder.suspended()`
+  (see `backends/kev.py`). The analysis prose for the report lives in `results/roofline_findings.md`; rewrite it
+  when the roofline runs change.
 - **Conflicting dependencies** (another torch/transformers): give the model its own uv project under
   `runtimes/<name>/` and a worker spoken to over a pipe, like `runtimes/elephant/` (`backends/elephant.py`).
 

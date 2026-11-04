@@ -92,6 +92,15 @@ def test_roofline_family_comes_from_the_metrics():
     assert report_roofline.family(ROOF) == 0  # dense, 1 in 4 layers attention
     assert report_roofline.family(ROOF | {"roofline_attention_layers": 1.0}) == 1
     assert report_roofline.family(ROOF | {"roofline_active_params_b": 1.1, "roofline_params_b": 6.9}) == 2
+    small_encoder = ROOF | {
+        "roofline_active_params_b": 0.11,
+        "roofline_params_b": 0.31,
+        "roofline_attention_layers": 1.0,
+    }
+    assert (
+        report_roofline.family(small_encoder, "laya.multilingual") == 1
+    )  # the catalog says encoder, not MoE
+    assert report_roofline.family(ROOF, "olmoe-1b-7b.zeroshot") == 2
 
 
 NCU = ROOF | {"roofline_hw_intensity": 150.0, "roofline_hw_tflops": 29.0}

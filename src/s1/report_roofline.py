@@ -25,6 +25,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from .models.catalog import CATALOG
 from .record import Metrics, RunRecord
 
 BENCH = "roofline"
@@ -98,9 +99,13 @@ def is_decision_model(model: str) -> bool:
     return not model.endswith(".zeroshot")
 
 
-def family(m: Metrics) -> int:
+def family(m: Metrics, model: str = "") -> int:
+    """The catalog's group decides MoE for a known model (a small encoder's embedding is most of its
+    parameters, which the active/total rule would misread); otherwise active < half of total is MoE."""
+    group = next((spec.group for spec in CATALOG if spec.name == model), None)
     total, active = m.get("roofline_params_b", math.nan), m.get("roofline_active_params_b", math.nan)
-    if active < 0.5 * total:
+    moe = group.startswith("MoE") if group is not None else active < 0.5 * total
+    if moe:
         return 2
     return 1 if m.get("roofline_attention_layers", 1.0) >= 1.0 else 0
 
@@ -114,7 +119,7 @@ class Point:
 
     @property
     def family(self) -> int:
-        return family(self.m)
+        return family(self.m, self.model)
 
 
 def _model(r: RunRecord) -> str:
