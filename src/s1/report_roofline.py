@@ -21,7 +21,7 @@ from __future__ import annotations
 import html
 import math
 import statistics
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -437,8 +437,23 @@ def findings(results_dir: Path) -> str:
     return path.read_text().strip() if path.is_file() else ""
 
 
+def nested_list(items: list[tuple[int, str]], inline: Callable[[str], str]) -> str:
+    """`<ul>` markup for (depth, text) bullets, nesting each deeper run under the item before it."""
+    parts: list[str] = []
+    depth = -1
+    for d, text in items:
+        if d > depth:
+            parts.append("<ul>" * (d - depth))
+        else:
+            parts.append("</li>" + "</ul></li>" * (depth - d))
+        parts.append(f"<li>{inline(text)}")
+        depth = d
+    parts.append("</li>" + "</ul></li>" * depth + "</ul>")
+    return "".join(parts)
+
+
 def markdown_to_html(text: str) -> str:
-    """The small markdown subset the findings use: ### headings, paragraphs, "- " lists, **bold**, `code`."""
+    """The markdown subset the findings use: ### headings, paragraphs, nested "- " lists, **bold**, `code`."""
     import re  # noqa: PLC0415
 
     def inline(t: str) -> str:
@@ -455,13 +470,15 @@ def markdown_to_html(text: str) -> str:
             if not lines:
                 continue
         if all(ln.startswith(("- ", "  ")) for ln in lines):
-            items: list[str] = []
+            items: list[tuple[int, str]] = []
             for ln in lines:
-                if ln.startswith("- "):
-                    items.append(ln[2:])
+                bullet = re.match(r"( *)- (.*)", ln)
+                if bullet:
+                    items.append((len(bullet[1]) // 2, bullet[2]))
                 else:
-                    items[-1] += " " + ln.strip()
-            out.append("<ul>" + "".join(f"<li>{inline(i)}</li>" for i in items) + "</ul>")
+                    depth, t = items[-1]
+                    items[-1] = (depth, t + " " + ln.strip())
+            out.append(nested_list(items, inline))
         else:
             out.append(f"<p>{inline(' '.join(ln.strip() for ln in lines))}</p>")
     return "\n".join(out)

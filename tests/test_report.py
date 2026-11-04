@@ -167,3 +167,10 @@ def test_report_includes_findings_when_written(tmp_path):
     assert "### Findings" in md.read_text() and "### Decision recipes on NVIDIA L4" in md.read_text()
     assert "<p>Some <strong>bold</strong> claim.</p>" in page.read_text()
     assert "<ul><li>one <code>x</code></li><li>two wrapped</li></ul>" in page.read_text()
+
+
+def test_findings_nested_lists():
+    text = "- a\n  - b\n    wrapped\n    - c\n  - d\n- e\n"
+    assert report_roofline.markdown_to_html(text) == (
+        "<ul><li>a<ul><li>b wrapped<ul><li>c</li></ul></li><li>d</li></ul></li><li>e</li></ul>"
+    )
