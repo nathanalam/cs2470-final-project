@@ -1,9 +1,17 @@
-"""The roofline section of the report: one log-log chart per GPU, plus the same numbers as a table.
+"""The roofline section of the report: one log-log chart per (platform, GPU), plus the same numbers as tables.
+
+Runs are grouped into panels by GPU *and* platform (`invariants.platform`; absent = the HUIT cluster), so a
+cluster L4 and a Modal L4 never share a roof: the Modal L4 measured 3-18% slower. Panels are small
+multiples, one full-size chart each on the same log axes, ordered by datasheet bf16 peak. One chart with a
+series per GPU was the alternative; with five GPUs that is five roofs and ~55 labelled points on one plot,
+where neither the roofs nor the labels stay readable. `roofs()` lists every panel's ceilings and
+`by_gpu()` puts each model's achieved TFLOP/s side by side across panels.
 
 Each model's latest `roofline` run is a filled point at (cost-model intensity, achieved TFLOP/s), with a faint
 trajectory through its prompt-length bins; its latest `s1 ncu` run (roofline_hw_*) adds a hollow point at the
 hardware-counter intensity and FLOP/s. Roofs come from the runs' measured ceilings (solid: bf16 tensor-core
-GEMM, fp32 CUDA-core GEMM, DRAM copy; medians over the runs on that GPU) and the datasheet (dashed).
+GEMM, fp32 CUDA-core GEMM, DRAM copy; medians over the panel's runs) and the datasheet (dashed:
+`roofline.spec_peaks(gpu)`, else the peaks the runs recorded; none drawn when neither knows the GPU).
 
 Color encodes the architecture family, read from the metrics (MoE when active parameters are under half the
 total; else hybrid when some layers are not attention): three hues, the palette's all-pairs-safe slots.
@@ -25,8 +33,9 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from .benchmarks import roofline as bench_roofline
 from .models.catalog import CATALOG
-from .record import Metrics, RunRecord
+from .record import Metrics, RunRecord, Scalar
 
 BENCH = "roofline"
 DASH = "\N{EN DASH}"  # a missing value
@@ -130,25 +139,89 @@ def _is_ncu(r: RunRecord) -> bool:
     return bool(r.params.get("roofline_ncu", 0))
 
 
-def points_by_gpu(recs: Sequence[RunRecord]) -> dict[str, list[Point]]:
-    """Latest clean run per (GPU, model), joined with the latest ncu run of the same pair."""
+def platform(invariants: dict[str, Scalar]) -> str:
+    """Where a run executed, for labels: "Modal", or "cluster" when `platform` is absent (HUIT)."""
+    p = invariants.get("platform")
+    if p is None:
+        return "cluster"
+    return "Modal" if str(p).lower() == "modal" else str(p)
+
+
+def gpu_name(gpu: str) -> str:
+    return gpu.removeprefix("NVIDIA ")
+
+
+@dataclass(frozen=True)
+class Roof:
+    bf16: float  # TFLOP/s, nan when unknown
+    fp32: float
+    bw: float  # GB/s
+
+    @property
+    def ridge(self) -> float:
+        """FLOP/byte where the bf16 roof meets the memory slope."""
+        return self.bf16 * 1e3 / self.bw if self.bw > 0 else math.nan
+
+
+@dataclass(frozen=True)
+class Panel:
+    """Every model's latest run on one GPU type on one platform: one roof, one chart."""
+
+    gpu: str  # as nvidia-smi reports it, e.g. "NVIDIA H100 80GB HBM3"
+    platform: str  # "cluster", "Modal", ...
+    points: list[Point]
+
+    @property
+    def label(self) -> str:
+        return f"{gpu_name(self.gpu)} ({self.platform})"
+
+    @property
+    def measured(self) -> Roof:
+        return Roof(
+            _median(self.points, "roofline_peak_bf16_tflops"),
+            _median(self.points, "roofline_peak_fp32_tflops"),
+            _median(self.points, "roofline_peak_bw_gbs"),
+        )
+
+    @property
+    def datasheet(self) -> Roof:
+        """The current datasheet table; the peaks the runs recorded when it does not know the GPU."""
+        if (spec := bench_roofline.spec_peaks(self.gpu)) is not None:
+            return Roof(*spec)
+        return Roof(
+            _median(self.points, "roofline_spec_bf16_tflops"),
+            _median(self.points, "roofline_spec_fp32_tflops"),
+            _median(self.points, "roofline_spec_bw_gbs"),
+        )
+
+
+def panels(recs: Sequence[RunRecord]) -> list[Panel]:
+    """Latest clean run per (platform, GPU, model), joined with the latest ncu run of the same triple.
+    Ordered by datasheet bf16 peak (unknown last), then GPU name, the cluster before other platforms."""
     runs = sorted((r for r in recs if BENCH in r.results), key=lambda r: r.run_id)
-    clean: dict[tuple[str, str], RunRecord] = {}
-    hw: dict[tuple[str, str], RunRecord] = {}
+    clean: dict[tuple[str, str, str], RunRecord] = {}
+    hw: dict[tuple[str, str, str], RunRecord] = {}
     for r in runs:
-        key = (str(r.invariants.get("gpu", "?")), _model(r))
+        key = (str(r.invariants.get("gpu", "?")), platform(r.invariants), _model(r))
         if _is_ncu(r):
             if "roofline_hw_intensity" in r.results[BENCH]:
                 hw[key] = r
         else:
             clean[key] = r
-    out: dict[str, list[Point]] = {}
-    for (gpu, model), r in sorted(clean.items()):
-        h = hw.get((gpu, model))
-        out.setdefault(gpu, []).append(
+    grouped: dict[tuple[str, str], list[Point]] = {}
+    for (gpu, plat, model), r in sorted(clean.items()):
+        h = hw.get((gpu, plat, model))
+        grouped.setdefault((gpu, plat), []).append(
             Point(model, r.run_id, r.results[BENCH], {} if h is None else h.results[BENCH])
         )
-    return out
+    out = [Panel(gpu, plat, pts) for (gpu, plat), pts in grouped.items()]
+
+    def order(p: Panel) -> tuple[bool, float, str, bool, str]:
+        peak = p.datasheet.bf16
+        known = math.isfinite(peak)
+        return (not known, peak if known else 0.0, p.gpu, p.platform != "cluster", p.platform)
+
+    return sorted(out, key=order)
 
 
 def _median(pts: Sequence[Point], key: str) -> float:
@@ -201,6 +274,53 @@ def table(pts: Sequence[Point]) -> tuple[list[str], list[list[str]]]:
                 DASH if "roofline_accuracy" not in m else f"{m['roofline_accuracy']:.1%}",
             ]
         )
+    return header, rows
+
+
+def roofs(panels: Sequence[Panel]) -> tuple[list[str], list[list[str]]]:
+    """Every panel's ceilings: measured (medians of its runs) beside the datasheet."""
+    header = [
+        "GPU",
+        "Models",
+        "Measured bf16 TFLOP/s",
+        "Measured fp32 TFLOP/s",
+        "Measured DRAM GB/s",
+        "Measured ridge FLOP/B",
+        "Datasheet bf16 TFLOP/s",
+        "Datasheet fp32 TFLOP/s",
+        "Datasheet DRAM GB/s",
+        "Measured / datasheet bf16",
+    ]
+    rows = []
+    for p in panels:
+        meas, spec = p.measured, p.datasheet
+        rows.append(
+            [
+                p.label,
+                str(len(p.points)),
+                _f(meas.bf16),
+                _f(meas.fp32),
+                _f(meas.bw),
+                _f(meas.ridge),
+                _f(spec.bf16),
+                _f(spec.fp32),
+                _f(spec.bw),
+                DASH if not math.isfinite(r := meas.bf16 / spec.bf16) else f"{r:.0%}",
+            ]
+        )
+    return header, rows
+
+
+def by_gpu(panels: Sequence[Panel]) -> tuple[list[str], list[list[str]]]:
+    """Achieved TFLOP/s (% of that panel's attainable roof) per model and panel; models in name order."""
+    cells: dict[str, dict[str, str]] = {}
+    for p in panels:
+        for pt in p.points:
+            tf, eff = pt.m.get("roofline_tflops", math.nan), pt.m.get("roofline_efficiency", math.nan)
+            cell = _f(tf) + (f" ({eff:.0%})" if math.isfinite(eff) else "")
+            cells.setdefault(pt.model, {})[p.label] = cell
+    header = ["Model", *(p.label for p in panels)]
+    rows = [[m, *(cells[m].get(p.label, DASH) for p in panels)] for m in sorted(cells)]
     return header, rows
 
 
@@ -303,15 +423,24 @@ def _labels(placed: list[tuple[float, float, str]]) -> str:
     return "".join(out)
 
 
-def chart(gpu: str, pts: Sequence[Point]) -> str:
-    peak, bw = _median(pts, "roofline_peak_bf16_tflops"), _median(pts, "roofline_peak_bw_gbs")
-    fp32 = _median(pts, "roofline_peak_fp32_tflops")
-    spec_peak, spec_bw = _median(pts, "roofline_spec_bf16_tflops"), _median(pts, "roofline_spec_bw_gbs")
-    s = _scale(pts, [peak, spec_peak])
+def shared_scale(panels: Sequence[Panel]) -> Scale:
+    """One set of log axes for every panel, so heights and ridge points compare across GPUs."""
+    pts = [pt for p in panels for pt in p.points]
+    peaks = [v for p in panels for v in (p.measured.bf16, p.datasheet.bf16)]
+    return _scale(pts, peaks)
+
+
+def chart(panel: Panel, s: Scale | None = None) -> str:
+    """One panel's roofline; `s` is the shared scale (default: fitted to this panel alone)."""
+    pts, meas, spec = panel.points, panel.measured, panel.datasheet
+    if s is None:
+        s = _scale(pts, [meas.bf16, spec.bf16])
     roofs = [
-        _roof(s, spec_peak, spec_bw, "spec", f"datasheet: {spec_peak:.0f} TFLOP/s bf16, {spec_bw:.0f} GB/s"),
-        _roof(s, peak, bw, "", f"measured: {peak:.0f} TFLOP/s bf16 tensor, {bw:.0f} GB/s"),
-        _roof(s, fp32, bw, "", f"measured: {fp32:.0f} TFLOP/s fp32 CUDA cores", slope=False),
+        _roof(s, spec.bf16, spec.bw, "spec", f"datasheet: {spec.bf16:.0f} TFLOP/s bf16, {spec.bw:.0f} GB/s"),
+        _roof(
+            s, meas.bf16, meas.bw, "", f"measured: {meas.bf16:.0f} TFLOP/s bf16 tensor, {meas.bw:.0f} GB/s"
+        ),
+        _roof(s, meas.fp32, meas.bw, "", f"measured: {meas.fp32:.0f} TFLOP/s fp32 CUDA cores", slope=False),
     ]
     marks, labels = [], []
     for p in pts:
@@ -375,7 +504,12 @@ def chart(gpu: str, pts: Sequence[Point]) -> str:
         '<span class="key">faint path: by prompt length</span>'
         '<span class="key">— measured roof · - - datasheet</span>'
     )
-    title = f"Roofline on {gpu}: each model's decision forwards, batch 1"
+    missing = [
+        name for name, roof in (("measured", meas), ("datasheet", spec)) if not math.isfinite(roof.bf16)
+    ]
+    if missing:
+        legend += f'<span class="key">no {" or ".join(missing)} peaks for this GPU: roof not drawn</span>'
+    title = f"Roofline on {panel.label}: each model's decision forwards, batch 1"
     return (
         f'<figure class="card chart roof"><figcaption><strong>{html.escape(title)}</strong></figcaption>'
         f'<div class="legend">{legend}</div>'
