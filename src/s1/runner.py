@@ -54,7 +54,8 @@ def cpu_from_cpuinfo(text: str) -> str | None:
     vendor, family, model = fields.get("vendor_id", ""), fields.get("cpu family", ""), fields.get("model", "")
     if not (vendor and family and model):
         return None
-    stepping = f" stepping {step}" if (step := fields.get("stepping", "")) else ""
+    step = fields.get("stepping", "")
+    stepping = f" stepping {step}" if step and step.lower() != "unknown" else ""
     return f"{vendor} family {family} model {model}{stepping}"
 
 
@@ -80,6 +81,8 @@ def hardware_meta() -> dict[str, Scalar]:
     )  # Linux only; allocations show up here, not in cpu_count
     if (cpus := len(affinity(0)) if callable(affinity) else os.cpu_count()) is not None:
         meta[env.META_CPU_COUNT] = cpus
+    if (asked := env.cpus_requested()) is not None:
+        meta[env.META_CPUS_REQUESTED] = asked
     out = _run(["nvidia-smi", "--query-gpu=driver_version,power.limit", "--format=csv,noheader,nounits"])
     if out is not None and (rows := [r for r in out.splitlines() if r.strip()]):
         driver, _, power = (f.strip() for f in rows[0].partition(","))

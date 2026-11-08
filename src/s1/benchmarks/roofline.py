@@ -295,13 +295,15 @@ def record_kernels(prof: Profiled, row: jeval.Row, top: int = 10) -> None:
         return
     finally:
         prof.take_forwards()
-    shares = profiling.kernel_shares(events, top)
-    note("roofline_kernels_seen", len({name for name, _ in events}))
-    note(
-        "roofline_kernels_top",
-        "; ".join(f"{share:.1%} {name[:120]}" for name, share in shares) or "none seen",
-    )
-    note("roofline_attention_kernel", profiling.attention_kernel(shares) or "none seen")
+    every = profiling.kernel_shares(
+        events, top=None
+    )  # attention can sit below the top 10 (MoE: expert GEMMs)
+    note("roofline_kernels_seen", len(every))
+    note("roofline_kernels_top", "; ".join(f"{s:.1%} {name[:120]}" for name, s in every[:top]) or "none seen")
+    attention = profiling.attention_kernel(every)
+    note("roofline_attention_kernel", attention or "none seen")
+    if attention is not None:
+        note("roofline_attention_share", round(dict(every)[attention], 4))
 
 
 def hardware_region(

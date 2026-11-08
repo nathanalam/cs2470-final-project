@@ -235,7 +235,10 @@ def plan(
         cfg_remote=cfg_remote,
         cfg_text=cfg.read_text(),
         s1_args=tuple(args),
-        env={"S1_GIT_COMMIT": env.git_commit() if git_commit is None else git_commit},
+        env={
+            "S1_GIT_COMMIT": env.git_commit() if git_commit is None else git_commit,
+            "S1_CPUS_REQUESTED": str(resources.cpus),
+        },
     )
 
 

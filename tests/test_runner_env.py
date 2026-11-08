@@ -215,6 +215,11 @@ def test_cpu_from_cpuinfo_real_name_and_sandbox_fallback():
     real = "processor\t: 0\nvendor_id\t: AuthenticAMD\nmodel name\t: AMD EPYC 7R13 Processor\n"
     assert runner.cpu_from_cpuinfo(real) == "AMD EPYC 7R13 Processor"
     assert runner.cpu_from_cpuinfo(GVISOR_CPUINFO) == "GenuineIntel family 6 model 143 stepping 8"
+    # what Modal's gVisor really reported on 2026-11-08: the stepping is "unknown" too
+    seen = GVISOR_CPUINFO.replace("model\t\t: 143", "model\t\t: 85").replace(
+        "stepping\t: 8", "stepping\t: unknown"
+    )
+    assert runner.cpu_from_cpuinfo(seen) == "GenuineIntel family 6 model 85"
     assert runner.cpu_from_cpuinfo("model name\t: unknown\n") is None
     assert runner.cpu_from_cpuinfo("") is None
 
@@ -225,3 +230,13 @@ def test_hardware_meta_records_cpu_count(monkeypatch):
     count = meta[env.META_CPU_COUNT]
     assert isinstance(count, int)
     assert count >= 1
+
+
+def test_cpus_requested_from_slurm_or_modal_launcher(monkeypatch):
+    monkeypatch.delenv("SLURM_CPUS_PER_TASK", raising=False)
+    monkeypatch.delenv("S1_CPUS_REQUESTED", raising=False)
+    assert env.cpus_requested() is None
+    monkeypatch.setenv("S1_CPUS_REQUESTED", "8")
+    assert env.cpus_requested() == 8
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "32")
+    assert env.cpus_requested() == 32

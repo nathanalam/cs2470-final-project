@@ -369,3 +369,14 @@ def test_note_outside_a_run_is_a_no_op():
     with registry.collecting_notes() as notes:
         registry.note("roofline_attention_kernel", "flash")
     assert notes == {"roofline_attention_kernel": "flash"}
+
+
+def test_attention_kernel_found_below_the_top_ten(tmp_path, monkeypatch):
+    """OLMoE on the L4: twelve expert GEMMs outrank attention, which must still be found."""
+    gemms = [(f"ampere_bf16_gemm_{i}", 50.0) for i in range(12)]
+    monkeypatch.setattr(profiling, "profile_kernels", lambda fn: [*gemms, ("flash_fwd_kernel", 4.0)])
+    rec = _roofline_rec(tmp_path, monkeypatch)
+    assert "flash" not in str(rec.meta["roofline_kernels_top"])
+    assert rec.meta["roofline_attention_kernel"] == "flash_fwd_kernel"
+    assert rec.meta["roofline_attention_share"] == round(4.0 / 604.0, 4)
+    assert rec.meta["roofline_kernels_seen"] == 13

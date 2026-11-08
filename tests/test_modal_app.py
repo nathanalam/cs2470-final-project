@@ -125,7 +125,7 @@ def test_cpu_plan(tmp_path):
     assert (p.cpu, p.memory_mib, p.timeout_s) == (2.0, 4096, 600)
     assert p.cfg_remote == "configs/submitted/echo.toml" and p.cfg_text == CPU_CFG
     assert p.s1_args == ("run", "configs/submitted/echo.toml", "--results-dir", "{run_dir}/results")
-    assert p.env == {"S1_GIT_COMMIT": "abc1234-dirty"}
+    assert p.env == {"S1_GIT_COMMIT": "abc1234-dirty", "S1_CPUS_REQUESTED": "2"}
 
 
 def test_gpu_plan_sets_require_gpu(tmp_path):

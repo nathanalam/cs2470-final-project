@@ -213,8 +213,8 @@ def kernel_env(model: Any = None) -> dict[str, str]:  # noqa: ANN401
 ATTENTION_HINTS = ("flash", "fmha", "attention", "attn", "sdpa", "efficient", "cudnn_sdp")
 
 
-def kernel_shares(events: list[tuple[str, float]], top: int = 10) -> list[tuple[str, float]]:
-    """(kernel name, GPU time) pairs -> the `top` names by summed time, each with its share of the total."""
+def kernel_shares(events: list[tuple[str, float]], top: int | None = 10) -> list[tuple[str, float]]:
+    """(kernel name, GPU time) pairs -> the `top` names (None: all) by summed time, each with its share."""
     totals: dict[str, float] = {}
     for name, t in events:
         totals[name] = totals.get(name, 0.0) + t
