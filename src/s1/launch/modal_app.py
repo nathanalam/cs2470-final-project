@@ -418,20 +418,45 @@ class ModalLauncher:
             return [Outcome(gpu=r.gpu) for r in resources]
         _check_python()
         modal = _modal()
-
-        def one(name: str, res: Resources, p: ModalPlan) -> Outcome:
-            log = self._tagged(name)
+        # ONE app holding one named function per GPU, started once: Modal's output display is process-global
+        # and not thread-safe, so starting an app per thread broke every app but the first (2026-11-08:
+        # "'NoneType' object has no attribute 'label'" on 4 of 5 GPUs). The waits run in parallel threads.
+        app = modal.App(APP_NAME)
+        fns = [
+            self._function(modal, app, p, name=f"run-{_slug(n)}") for n, p in zip(names, plans, strict=True)
+        ]
+        logs = [self._tagged(n) for n in names]
+        outcomes: list[Outcome | None] = [None] * len(plans)
+        calls: list[Any] = [None] * len(plans)
+        results: dict[int, RemoteResult] = {}
+        with modal.enable_output(), app.run():
+            for i, (res, fn, p) in enumerate(zip(resources, fns, plans, strict=True)):
+                try:
+                    calls[i] = fn.spawn(self._payload(p))
+                except Exception as e:  # one GPU failing must not stop the others
+                    outcomes[i] = Outcome(res.gpu, error=f"{type(e).__name__}: {e}")
+                    continue
+                logs[i](f"modal function call {calls[i].object_id}")
+            with ThreadPoolExecutor(max_workers=len(plans)) as pool:
+                waits = {i: pool.submit(c.get) for i, c in enumerate(calls) if c is not None}
+                for i, fut in waits.items():
+                    try:
+                        results[i] = remote_result(fut.result())
+                    except Exception as e:
+                        call_id = str(calls[i].object_id)
+                        outcomes[i] = Outcome(resources[i].gpu, call_id, error=f"{type(e).__name__}: {e}")
+        for i, result in sorted(results.items()):  # write-back one GPU at a time
+            res, p = resources[i], plans[i]
             try:
-                call_id, records, logs = self._run(modal, p, log)
+                records, written = self._finish(modal, p, result, logs[i])
             except _Failed as e:
-                return Outcome(res.gpu, e.call_id, e.records, e.logs, error=str(e))
-            except Exception as e:  # one GPU failing must not stop the others
-                return Outcome(res.gpu, error=f"{type(e).__name__}: {e}")
-            return Outcome(res.gpu, call_id, tuple(records), tuple(logs))
-
-        with modal.enable_output(), ThreadPoolExecutor(max_workers=len(plans)) as pool:
-            futures = [pool.submit(one, *job) for job in zip(names, resources, plans, strict=True)]
-            return [f.result() for f in futures]
+                outcomes[i] = Outcome(res.gpu, e.call_id, e.records, e.logs, error=str(e))
+                continue
+            outcomes[i] = Outcome(res.gpu, result["call_id"], tuple(records), tuple(written))
+        return [
+            o if o is not None else Outcome(r.gpu, error="not run")
+            for o, r in zip(outcomes, resources, strict=True)
+        ]
 
     def _tagged(self, name: str) -> Callable[[str], None]:
         def log(text: str) -> None:
@@ -439,24 +464,32 @@ class ModalLauncher:
 
         return log
 
-    def _run(
-        self, modal: ModuleType, p: ModalPlan, log: Callable[[str], None]
-    ) -> tuple[str, list[Path], list[Path]]:
-        """Run one plan in its own ephemeral app, wait, write back; (call id, records, logs)."""
-        app = modal.App(APP_NAME)
-        volumes = _volumes(modal, p.volumes)
-        fn = app.function(
+    def _function(  # app and result are modal.App / modal.Function (modal is imported lazily)
+        self,
+        modal: ModuleType,
+        app: Any,  # noqa: ANN401
+        p: ModalPlan,
+        *,
+        name: str | None = None,
+    ) -> Any:  # noqa: ANN401
+        """The Modal function running plan `p` in `app` (named, so one app can hold one per GPU)."""
+        kw: dict[str, Any] = {} if name is None else {"name": name}
+        return app.function(
             image=_image(modal, openjev=p.openjev, runtime=p.runtime),
             gpu=p.gpu,
             cpu=p.cpu,
             memory=p.memory_mib,
             timeout=p.timeout_s,
-            volumes=volumes,
+            volumes=_volumes(modal, p.volumes),
             secrets=_secrets(modal, p.hf_secret),
             serialized=True,
             include_source=False,
+            **kw,
         )(_remote_run)
-        payload = json.dumps(
+
+    @staticmethod
+    def _payload(p: ModalPlan) -> str:
+        return json.dumps(
             {
                 "cfg_remote": p.cfg_remote,
                 "cfg_text": p.cfg_text,
@@ -466,17 +499,11 @@ class ModalLauncher:
                 "commit": [VOLUMES[RUNS_MOUNT], VOLUMES[HF_MOUNT], *filter(None, [p.triton_volume])],
             }
         )
-        call_id = ""
-        try:
-            with app.run():
-                call = fn.spawn(payload)
-                call_id = str(call.object_id)
-                log(f"modal function call {call_id}")
-                result = remote_result(call.get())
-        except Exception as e:
-            if not call_id:
-                raise
-            raise _Failed(f"{type(e).__name__}: {e}", call_id, [], []) from e
+
+    def _finish(
+        self, modal: ModuleType, p: ModalPlan, result: RemoteResult, log: Callable[[str], None]
+    ) -> tuple[list[Path], list[Path]]:
+        """Write a finished call's records and logs back; raise _Failed if the remote command failed."""
         runs = modal.Volume.from_name(VOLUMES[RUNS_MOUNT])
         records, logs = write_back(
             result, runs.read_file, results_dir=self.results_dir, logs_dir=self.logs_dir
@@ -491,7 +518,31 @@ class ModalLauncher:
                 records,
                 logs,
             )
+        return records, logs
+
+    def _run(
+        self, modal: ModuleType, p: ModalPlan, log: Callable[[str], None]
+    ) -> tuple[str, list[Path], list[Path]]:
+        """Run one plan in its own ephemeral app, wait, write back; (call id, records, logs)."""
+        app = modal.App(APP_NAME)
+        fn = self._function(modal, app, p)
+        call_id = ""
+        try:
+            with app.run():
+                call = fn.spawn(self._payload(p))
+                call_id = str(call.object_id)
+                log(f"modal function call {call_id}")
+                result = remote_result(call.get())
+        except Exception as e:
+            if not call_id:
+                raise
+            raise _Failed(f"{type(e).__name__}: {e}", call_id, [], []) from e
+        records, logs = self._finish(modal, p, result, log)
         return result["call_id"], records, logs
+
+
+def _slug(gpu: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", gpu.lower()).strip("-") or "cpu"
 
 
 class DownloadReport(TypedDict):
