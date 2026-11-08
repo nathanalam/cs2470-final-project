@@ -212,6 +212,25 @@ GRANITE_BUILD_ENV: Mapping[str, str] = {
 }
 
 
+# mamba-ssm 2.2.6's package __init__ imports mamba_ssm.utils.generation, which imports two names that
+# transformers 5 removed (now GenerateDecoderOnlyOutput), so `import mamba_ssm` and every kernel submodule
+# failed (second granite build, 2026-11-08). Patch that one import in the installed file; refuse if the line
+# is not exactly there.
+MAMBA_OLD_IMPORT = (
+    "from transformers.generation import GreedySearchDecoderOnlyOutput, SampleDecoderOnlyOutput"
+)
+MAMBA_TRANSFORMERS5_PATCH = (
+    "import pathlib, sysconfig; "
+    "p = pathlib.Path(sysconfig.get_paths()['purelib'], 'mamba_ssm', 'utils', 'generation.py'); "
+    "s = p.read_text(); "
+    f"old = {MAMBA_OLD_IMPORT!r}; "
+    "assert s.count(old) == 1, 'mamba_ssm/utils/generation.py: expected import not found'; "
+    "g = 'from transformers.generation import GenerateDecoderOnlyOutput as '; "
+    "new = g + 'GreedySearchDecoderOnlyOutput; ' + g + 'SampleDecoderOnlyOutput'; "
+    "p.write_text(s.replace(old, new)); print('patched', p)"
+)
+
+
 def granite_commands() -> list[str]:
     """Shell steps compiling GRANITE_KERNELS against the harness's torch (UV_VENV), no dependency changes."""
     py = f"{UV_VENV}/bin/python"
@@ -232,6 +251,7 @@ def granite_commands() -> list[str]:
         *(fetch(pin, files[name]) for name, pin in {**GRANITE_BUILD_REQS, **GRANITE_KERNELS}.items()),
         f"uv pip install --python {py} --no-deps {files['wheel']}",
         f"{env} uv pip install --python {py} --no-deps --no-build-isolation {kernels}",
+        f"{py} -c {shlex.quote(MAMBA_TRANSFORMERS5_PATCH)}",
         f"{py} -c {shlex.quote(check)}",
         f"rm -rf {build} /root/.cache/uv",
     ]
