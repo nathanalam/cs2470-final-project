@@ -70,6 +70,7 @@ from . import jeval
 from .shape_sweep import FileTokenCounter, TokenCounter, WordCounter, parse_int_list
 
 LENGTH_AXIS = "roofline_state_tokens"  # [grid] axis: state lengths in reference tokens
+WARM_PER_LENGTH = 2  # untimed questions at each length before timing
 
 BINS = (128, 256, 512, 1024, 4096)  # prompt tokens a question processed (all its forwards)
 TYPES = ("choice", "noul")
@@ -262,8 +263,11 @@ def select(settings: Settings) -> tuple[list[jeval.Row], list[jeval.Row], list[i
     lengths = parse_int_list(settings, LENGTH_AXIS)
     tagged = length_rows(jeval.load_rows(), counter, settings, lengths)
     rows = [r for _, r in tagged]
+    # every length warmed with its first WARM_PER_LENGTH questions: the first pass at a new shape pays one-off
+    # costs (an MoE grouped GEMM picks its kernel per token count; one 512-token OLMoE question took 1.2 s on
+    # an H100 on 2026-11-08 against ~45 ms for the rest), then the configured warm-up
     per = max(len(tagged) // len(lengths), 1)
-    warm = [r for i, r in enumerate(rows) if i % per == 0] + rows[:warmup]  # every length once, then warm-up
+    warm = [r for i, r in enumerate(rows) if i % per < WARM_PER_LENGTH] + rows[:warmup]
     return rows, warm, [n for n, _ in tagged]
 
 
@@ -279,6 +283,11 @@ def length_points(questions: Sequence[Question], lengths: Sequence[int]) -> Metr
         m |= point(f"roofline_s{n}_", cost, len(at))
         m[f"roofline_s{n}_tokens"] = cost.tokens / len(at)
         m[f"roofline_s{n}_gpu_ms"] = cost.ms / len(at)
+        ms = sorted(q.cost.ms for q in at)  # a one-off slow pass shows as max >> median
+        m[f"roofline_s{n}_gpu_ms_median"] = (
+            ms[len(ms) // 2] if len(ms) % 2 else (ms[len(ms) // 2 - 1] + ms[len(ms) // 2]) / 2
+        )
+        m[f"roofline_s{n}_gpu_ms_max"] = ms[-1]
     return m
 
 

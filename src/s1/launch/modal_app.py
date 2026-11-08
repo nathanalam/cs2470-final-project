@@ -46,7 +46,7 @@ import sys
 import tempfile
 import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
@@ -428,7 +428,24 @@ class ModalLauncher:
         logs = [self._tagged(n) for n in names]
         outcomes: list[Outcome | None] = [None] * len(plans)
         calls: list[Any] = [None] * len(plans)
-        results: dict[int, RemoteResult] = {}
+        write_lock = threading.Lock()
+
+        def finish(i: int, fut: Future[str]) -> Outcome:
+            """Wait for GPU i and write it back as soon as it finishes (one GPU at a time), so a GPU stuck
+            in Modal's queue never holds finished GPUs' records back (2026-11-08: an L4 queued 25 min)."""
+            res, p = resources[i], plans[i]
+            call_id = str(calls[i].object_id)
+            try:
+                result = remote_result(fut.result())
+            except Exception as e:
+                return Outcome(res.gpu, call_id, error=f"{type(e).__name__}: {e}")
+            with write_lock:
+                try:
+                    records, written = self._finish(modal, p, result, logs[i])
+                except _Failed as e:
+                    return Outcome(res.gpu, e.call_id, e.records, e.logs, error=str(e))
+            return Outcome(res.gpu, result["call_id"], tuple(records), tuple(written))
+
         with modal.enable_output(), app.run():
             for i, (res, fn, p) in enumerate(zip(resources, fns, plans, strict=True)):
                 try:
@@ -437,22 +454,11 @@ class ModalLauncher:
                     outcomes[i] = Outcome(res.gpu, error=f"{type(e).__name__}: {e}")
                     continue
                 logs[i](f"modal function call {calls[i].object_id}")
-            with ThreadPoolExecutor(max_workers=len(plans)) as pool:
+            with ThreadPoolExecutor(max_workers=2 * len(plans)) as pool:
                 waits = {i: pool.submit(c.get) for i, c in enumerate(calls) if c is not None}
-                for i, fut in waits.items():
-                    try:
-                        results[i] = remote_result(fut.result())
-                    except Exception as e:
-                        call_id = str(calls[i].object_id)
-                        outcomes[i] = Outcome(resources[i].gpu, call_id, error=f"{type(e).__name__}: {e}")
-        for i, result in sorted(results.items()):  # write-back one GPU at a time
-            res, p = resources[i], plans[i]
-            try:
-                records, written = self._finish(modal, p, result, logs[i])
-            except _Failed as e:
-                outcomes[i] = Outcome(res.gpu, e.call_id, e.records, e.logs, error=str(e))
-                continue
-            outcomes[i] = Outcome(res.gpu, result["call_id"], tuple(records), tuple(written))
+                done = {i: pool.submit(finish, i, fut) for i, fut in waits.items()}
+                for i, fut in done.items():
+                    outcomes[i] = fut.result()
         return [
             o if o is not None else Outcome(r.gpu, error="not run")
             for o, r in zip(outcomes, resources, strict=True)
