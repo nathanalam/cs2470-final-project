@@ -198,3 +198,17 @@ def test_single_panel_report_has_no_cross_gpu_matrix(tmp_path):
     RECS[0].save(tmp_path)
     md, _ = report.write(tmp_path)
     assert "### Roofs" in md.read_text() and "### Achieved TFLOP/s by GPU" not in md.read_text()
+
+
+def test_a_length_axis_run_never_replaces_the_natural_point():
+    natural = RECS[4]  # jevk5-9b on the Modal H100
+    lengths = RunRecord(
+        "20261109-000001-z",
+        {"gpu": "NVIDIA H100 80GB HBM3", "platform": "modal"},
+        {"model": "jevk5-9b"},
+        {"roofline": _metrics(999.0, 700.0, 2900.0) | {"roofline_lengths": 2.0}},
+        grid={roofline.LENGTH_AXIS: [32, 2048]},
+    )
+    (panel,) = [p for p in report_roofline.panels([natural, lengths]) if p.gpu == natural.invariants["gpu"]]
+    assert [p.run_id for p in panel.points] == [natural.run_id]
+    assert report_roofline.is_length_axis(lengths) and not report_roofline.is_length_axis(natural)

@@ -139,6 +139,12 @@ def _is_ncu(r: RunRecord) -> bool:
     return bool(r.params.get("roofline_ncu", 0))
 
 
+def is_length_axis(r: RunRecord) -> bool:
+    """A state-length-axis run ([grid] roofline_state_tokens): its pooled point mixes lengths, so it never
+    stands in for a model's natural-JEVal point."""
+    return bench_roofline.LENGTH_AXIS in r.grid or "roofline_lengths" in r.results.get(BENCH, {})
+
+
 def platform(invariants: dict[str, Scalar]) -> str:
     """Where a run executed, for labels: "Modal", or "cluster" when `platform` is absent (HUIT)."""
     p = invariants.get("platform")
@@ -196,9 +202,10 @@ class Panel:
 
 
 def panels(recs: Sequence[RunRecord]) -> list[Panel]:
-    """Latest clean run per (platform, GPU, model), joined with the latest ncu run of the same triple.
+    """Latest clean natural-mode run per (platform, GPU, model) (length-axis runs are drawn apart), joined
+    with the latest ncu run of the same triple.
     Ordered by datasheet bf16 peak (unknown last), then GPU name, the cluster before other platforms."""
-    runs = sorted((r for r in recs if BENCH in r.results), key=lambda r: r.run_id)
+    runs = sorted((r for r in recs if BENCH in r.results and not is_length_axis(r)), key=lambda r: r.run_id)
     clean: dict[tuple[str, str, str], RunRecord] = {}
     hw: dict[tuple[str, str, str], RunRecord] = {}
     for r in runs:
