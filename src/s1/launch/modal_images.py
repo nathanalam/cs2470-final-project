@@ -205,6 +205,10 @@ GRANITE_BUILD_ENV: Mapping[str, str] = {
     "CAUSAL_CONV1D_FORCE_BUILD": "TRUE",  # never look for a prebuilt wheel (there is none for torch 2.13)
     "MAMBA_FORCE_BUILD": "TRUE",
     "MAX_JOBS": "4",  # ninja jobs; each nvcc also runs 4 threads (setup.py's --threads 4)
+    # Modal's add_python is a clang-built CPython, so torch's extension builder defaults to clang++, which the
+    # image does not have (the first build failed: "clang++ (0.0.0) is less than the minimum ... CUDA 13.0").
+    "CC": "gcc",
+    "CXX": "g++",
 }
 
 

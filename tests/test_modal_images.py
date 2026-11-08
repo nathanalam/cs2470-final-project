@@ -227,7 +227,7 @@ def test_granite_image():
         assert f"echo '{pin.sha256}  /tmp/granite-build/{pin.filename}' | sha256sum -c -" in text
     install = next(c for c in cmds if "--no-build-isolation" in c)
     assert install.startswith(
-        "CAUSAL_CONV1D_FORCE_BUILD=TRUE MAMBA_FORCE_BUILD=TRUE MAX_JOBS=4 uv pip install"
+        "CAUSAL_CONV1D_FORCE_BUILD=TRUE MAMBA_FORCE_BUILD=TRUE MAX_JOBS=4 CC=gcc CXX=g++ uv pip install"
     )
     assert f"--python {mi.UV_VENV}/bin/python --no-deps" in install  # the harness's torch, no new deps
     assert install.index("causal_conv1d-1.7.0") < install.index("mamba_ssm-2.2.6.post3")
