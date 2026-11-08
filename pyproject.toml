@@ -41,6 +41,11 @@ dev = [
     "ruff>=0.17.0",
     "ty>=0.0.86",
 ]
+# Modal client for `s1 submit --on modal` and the model download (s1.launch.modal_app). Only the machine that
+# launches needs it; the cluster, tests and `import s1` never import it. Install: uv sync --group modal
+modal = [
+    "modal>=1.2",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]  # runtimes/*/ hold third-party checkouts with their own tests
