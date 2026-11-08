@@ -1,10 +1,13 @@
 """s1.launch.modal_app without the Modal client: mapping, dry-run plan, write-back, download check."""
 
+import contextlib
 import hashlib
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -311,3 +314,222 @@ def test_container_entry_runs_echo_config(tmp_path, monkeypatch):
         registry.MODELS.pop("echo", None)
     (rec,) = load_all(tmp_path / "out")
     assert rec.results["modal_count"]["p_true"] == 0.8
+
+
+# ---- M3: Triton cache volume, fan-out, concurrent write-back ----
+
+SWEEP = ["L4", "A100-80GB", "H100", "H200", "B200"]
+
+
+@pytest.mark.parametrize(
+    ("gpu", "name"),
+    [("H100", "s1-triton-h100"), ("a100-80gb", "s1-triton-a100-80gb"), ("L4", "s1-triton-l4")],
+)
+def test_triton_volume_per_gpu(gpu, name):
+    assert ma.triton_volume(gpu) == name
+
+
+def test_gpu_plan_mounts_triton_cache(tmp_path):
+    cfg = tmp_path / "x.toml"
+    cfg.write_text(CPU_CFG)
+    p = ma.plan(cfg, modal_resources(gpu="H200"), ["run", str(cfg)], git_commit="x")
+    assert p.triton_volume == "s1-triton-h200"
+    assert p.volumes["/triton-cache"] == "s1-triton-h200"
+    assert p.env["TRITON_CACHE_DIR"] == "/triton-cache"
+    text = p.describe()
+    assert "s1-triton-h200 -> /triton-cache" in text and "TRITON_CACHE_DIR=/triton-cache" in text
+    cpu = ma.plan(cfg, modal_resources(), ["run", str(cfg)], git_commit="x")
+    assert cpu.triton_volume is None and "/triton-cache" not in cpu.volumes
+    assert "TRITON_CACHE_DIR" not in cpu.env
+
+
+def test_submit_many_dry_run_prints_every_gpu(tmp_path, no_modal):
+    cfg = tmp_path / "x.toml"
+    cfg.write_text(CPU_CFG)
+    lines: list[str] = []
+    launcher = ma.ModalLauncher(results_dir=tmp_path / "results", log=lines.append)
+    outcomes = launcher.submit_many(
+        cfg, [modal_resources(gpu=g) for g in SWEEP], ["run", str(cfg)], dry_run=True
+    )
+    assert [o.gpu for o in outcomes] == SWEEP and all(o.call_id == "" and o.error is None for o in outcomes)
+    text = "\n".join(lines)
+    for gpu, modal_gpu, require in [
+        ("L4", "L4", "L4"),
+        ("A100-80GB", "A100-80GB", "A100"),
+        ("H100", "H100!", "H100"),
+        ("H200", "H200", "H200"),
+        ("B200", "B200", "B200"),
+    ]:
+        assert f"=== {gpu} ===" in text
+        assert f"gpu='{modal_gpu}'" in text
+        assert f"s1-triton-{gpu.lower()} -> /triton-cache" in text
+        assert f"--set require_gpu={require}" in text
+    assert not (tmp_path / "results").exists()
+
+
+def test_submit_many_plans_everything_before_contacting_modal(tmp_path, no_modal):
+    cfg = tmp_path / "x.toml"
+    cfg.write_text(CPU_CFG)
+    launcher = ma.ModalLauncher(results_dir=tmp_path / "results", log=lambda _: None)
+    with pytest.raises(ValueError, match="unknown GPU"):  # the bad name is last: nothing has started
+        launcher.submit_many(
+            cfg, [modal_resources(gpu="H100"), modal_resources(gpu="H300")], ["run", str(cfg)]
+        )
+
+
+class FakeModal:
+    """Just enough of the `modal` client for ModalLauncher: App/function/spawn/get, Volume, enable_output.
+
+    Every call's get() waits on a barrier, so the test only passes if all GPUs are in flight at once.
+    Behaviour per Modal gpu string: in `exits` -> remote exit code 1; in `raises` -> get() raises."""
+
+    def __init__(self, n: int, *, exits=(), raises=()):
+        self.barrier = threading.Barrier(n, timeout=10)
+        self.exits, self.raises = set(exits), set(raises)
+        self.files: dict[str, bytes] = {}
+        self.payloads: dict[str, dict[str, Any]] = {}
+        self.functions: list[dict[str, Any]] = []
+        self.lock = threading.Lock()
+        modal = self
+
+        class Volume:
+            def __init__(self, name):
+                self.name = name
+
+            @classmethod
+            def from_name(cls, name, create_if_missing=False):
+                return cls(name)
+
+            def read_file(self, path):
+                yield modal.files[path]
+
+        class Call:
+            def __init__(self, gpu, payload):
+                self.gpu, self.payload = gpu, payload
+                self.object_id = f"fc-{gpu.rstrip('!')}"
+
+            def get(self):
+                modal.barrier.wait()
+                if self.gpu in modal.raises:
+                    raise ConnectionError(f"lost {self.gpu}")
+                rec = _record(f"20261108-120000-{self.object_id[3:].lower()}")
+                log = f"logs/{self.object_id}.out"
+                with modal.lock:
+                    modal.files[f"{self.object_id}/{log}"] = f"{self.gpu}\n".encode()
+                    modal.files[f"{self.object_id}/logs/shared.log"] = self.gpu.encode()
+                return json.dumps(
+                    {
+                        "call_id": self.object_id,
+                        "returncode": 1 if self.gpu in modal.exits else 0,
+                        "records": {f"{rec.run_id}.json": json.dumps(rec.to_json())},
+                        "logs": [log, "logs/shared.log"],
+                    }
+                )
+
+        class Function:
+            def __init__(self, kw):
+                self.kw = kw
+
+            def spawn(self, payload):
+                with modal.lock:
+                    modal.payloads[self.kw["gpu"]] = json.loads(payload)
+                return Call(self.kw["gpu"], payload)
+
+        class App:
+            def __init__(self, name):
+                self.name = name
+
+            def function(self, **kw):
+                with modal.lock:
+                    modal.functions.append(kw)
+                return lambda fn: Function(kw)
+
+            def run(self):
+                return contextlib.nullcontext()
+
+        self.App, self.Volume = App, Volume
+
+    def enable_output(self):
+        return contextlib.nullcontext()
+
+
+def _fan_out(tmp_path, monkeypatch, fake):
+    cfg = tmp_path / "x.toml"
+    cfg.write_text(CPU_CFG)
+    monkeypatch.setattr(ma, "_modal", lambda: fake)
+    monkeypatch.setattr(ma, "_image", lambda modal, **kw: "image")
+    lines: list[str] = []
+    lock = threading.Lock()
+
+    def log(text):
+        with lock:
+            lines.append(text)
+
+    launcher = ma.ModalLauncher(results_dir=tmp_path / "results", logs_dir=tmp_path / "logs", log=log)
+    outcomes = launcher.submit_many(cfg, [modal_resources(gpu=g) for g in SWEEP], ["run", str(cfg)])
+    return outcomes, lines
+
+
+def test_submit_many_runs_concurrently_and_survives_failures(tmp_path, monkeypatch):
+    fake = FakeModal(len(SWEEP), exits={"H200"}, raises={"B200"})
+    outcomes, lines = _fan_out(tmp_path, monkeypatch, fake)
+    by_gpu = {o.gpu: o for o in outcomes}
+    assert [o.gpu for o in outcomes] == SWEEP
+    for gpu in ("L4", "A100-80GB", "H100"):
+        o = by_gpu[gpu]
+        assert o.error is None and o.call_id == f"fc-{gpu}"
+        assert [p.name for p in o.records] == [f"20261108-120000-{gpu.lower()}.json"]
+    h200 = by_gpu["H200"]  # the remote run failed, but its records and logs were still written back
+    assert h200.call_id == "fc-H200" and "exited 1" in (h200.error or "")
+    assert h200.records and h200.logs
+    b200 = by_gpu["B200"]  # the call started, then the client lost it
+    assert b200.call_id == "fc-B200" and "ConnectionError: lost B200" in (b200.error or "")
+    assert not b200.records
+    # four records, distinct run ids; per-call logs, and the shared log name never overwritten
+    assert len(load_all(tmp_path / "results")) == 4
+    names = sorted(p.name for p in (tmp_path / "logs").iterdir())
+    assert len(names) == 8  # 4 written-back calls x 2 logs, nothing overwritten
+    assert [n for n in names if n.endswith(".out")] == sorted(f"fc-{g}.out" for g in SWEEP[:4])
+    shared = [n for n in names if n.endswith("shared.log")]  # first write-back keeps the name
+    assert len(shared) == 4 and "shared.log" in shared
+    contents = {(tmp_path / "logs" / n).read_text() for n in shared}
+    assert contents == {"L4", "A100-80GB", "H100!", "H200"}
+    # one Modal function per GPU, each with its own Triton cache volume, require_gpu and commit list
+    assert sorted(f["gpu"] for f in fake.functions) == sorted(str(ma.modal_gpu(g)) for g in SWEEP)
+    for f in fake.functions:
+        gpu = next(g for g in SWEEP if ma.modal_gpu(g) == f["gpu"])
+        assert f["volumes"]["/triton-cache"].name == ma.triton_volume(gpu)
+        payload = fake.payloads[f["gpu"]]
+        assert payload["env"]["TRITON_CACHE_DIR"] == "/triton-cache"
+        assert payload["commit"] == ["s1-runs", "s1-hf-cache", ma.triton_volume(gpu)]
+        assert f"require_gpu={ma.gpu_kind(gpu).require}" in payload["s1_args"]
+    assert any(line.startswith("[H100] modal function call fc-H100") for line in lines)
+
+
+def test_single_submit_still_raises_on_remote_failure(tmp_path, monkeypatch):
+    cfg = tmp_path / "x.toml"
+    cfg.write_text(CPU_CFG)
+    monkeypatch.setattr(ma, "_modal", lambda: FakeModal(1, exits={"H100!"}))
+    monkeypatch.setattr(ma, "_image", lambda modal, **kw: "image")
+    launcher = ma.ModalLauncher(
+        results_dir=tmp_path / "results", logs_dir=tmp_path / "logs", log=lambda _: None
+    )
+    with pytest.raises(RuntimeError, match="exited 1"):
+        launcher.submit(cfg, modal_resources(gpu="H100"), ["run", str(cfg)])
+    assert len(load_all(tmp_path / "results")) == 1
+
+
+def test_write_back_never_replaces_a_different_record(tmp_path):
+    rec = _record("20261108-120000-deadbeef")
+    other = _record(rec.run_id)
+    other.params["model"] = "other"
+    other.save(tmp_path / "results")
+    result = ma.remote_result(
+        json.dumps(
+            {"call_id": "c", "returncode": 0, "records": {"r.json": json.dumps(rec.to_json())}, "logs": []}
+        )
+    )
+    with pytest.raises(FileExistsError, match="not overwriting"):
+        ma.write_back(result, lambda _: iter([b""]), results_dir=tmp_path / "results", logs_dir=tmp_path)
+    rec.save(tmp_path / "other")  # the same record again is fine (re-running a write-back)
+    ma.write_back(result, lambda _: iter([b""]), results_dir=tmp_path / "other", logs_dir=tmp_path)

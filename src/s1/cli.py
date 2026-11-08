@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Annotated
@@ -14,7 +15,7 @@ from rich.console import Console
 from rich.table import Table
 
 from . import config, env, ncu, report, runner
-from .launch import Resources, get_launcher
+from .launch import FanOutLauncher, Outcome, Resources, get_launcher
 from .models.catalog import CATALOG
 from .record import RESULTS_DIR, RunRecord, Scalar, load_all
 
@@ -101,23 +102,69 @@ def launch_resources(
     time: str | None = None,
 ) -> Resources:
     """The config's [launch] table (Slurm defaults when absent), each flag that was given overriding its
-    field: `on` the orchestrator, `partition`/`gpu_type` the extras of that orchestrator."""
-    target = None if on is None else config.target(on, "--on")
-    res = config.load_launch(cfg, target) or Resources(orchestrator=target or "slurm")
-    extras = dict(res.extras)
-    if partition is not None:
-        extras["partition"] = partition
-    if gpu_type is not None:
-        extras["gpu_type"] = gpu_type
-    return replace(
-        res,
-        gpu=res.gpu if gpu is None else gpu,
-        gpus=res.gpus if gpus is None else gpus,
-        cpus=res.cpus if cpus is None else cpus,
-        mem=res.mem if mem is None else mem,
-        time=res.time if time is None else time,
-        extras=extras,
+    field: `on` the orchestrator, `partition`/`gpu_type` the extras of that orchestrator. For a config
+    whose `gpu` lists several GPUs, pass `gpu` to pick one, or use `launch_resources_all`."""
+    resolved = launch_resources_all(
+        cfg, on=on, partition=partition, gpu=gpu, gpus=gpus, gpu_type=gpu_type, cpus=cpus, mem=mem, time=time
     )
+    if len(resolved) > 1:
+        names = ", ".join(str(r.gpu) for r in resolved)
+        raise ValueError(f"{cfg}: [launch] gpu lists several GPUs ({names}); pick one with --gpu")
+    return resolved[0]
+
+
+def launch_resources_all(
+    cfg: Path,
+    *,
+    on: str | None = None,
+    partition: str | None = None,
+    gpu: str | None = None,
+    gpus: int | None = None,
+    gpu_type: str | None = None,
+    cpus: int | None = None,
+    mem: str | None = None,
+    time: str | None = None,
+) -> list[Resources]:
+    """`launch_resources` for every GPU of the config, in config order (one entry unless [launch] gpu is a
+    list). `gpu` replaces a single GPU, and narrows a list to that GPU (it must be in the list)."""
+    target = None if on is None else config.target(on, "--on")
+    launches = config.load_launches(cfg, target) or [Resources(orchestrator=target or "slurm")]
+    if gpu is not None and len(launches) > 1:
+        picked = [r for r in launches if r.gpu is not None and r.gpu.strip().lower() == gpu.strip().lower()]
+        if not picked:
+            names = ", ".join(str(r.gpu) for r in launches)
+            raise ValueError(f"--gpu {gpu}: not one of the config's [launch] gpu list ({names})")
+        launches, gpu = picked, None  # keep the config's spelling of the name
+    out: list[Resources] = []
+    for res in launches:
+        extras = dict(res.extras)
+        if partition is not None:
+            extras["partition"] = partition
+        if gpu_type is not None:
+            extras["gpu_type"] = gpu_type
+        out.append(
+            replace(
+                res,
+                gpu=res.gpu if gpu is None else gpu,
+                gpus=res.gpus if gpus is None else gpus,
+                cpus=res.cpus if cpus is None else cpus,
+                mem=res.mem if mem is None else mem,
+                time=res.time if time is None else time,
+                extras=extras,
+            )
+        )
+    return out
+
+
+def _fan_out_summary(outcomes: Sequence[Outcome]) -> Table:
+    t = Table(header_style="bold", title="fan-out")
+    for col in ["gpu", "call id", "records", "result"]:
+        t.add_column(col, no_wrap=col != "result")
+    for o in outcomes:
+        result = "ok" if o.error is None else f"[red]FAILED[/red] {o.error}"
+        records = "\n".join(str(p) for p in o.records) or "-"
+        t.add_row(str(o.gpu), o.call_id or "-", records, result)
+    return t
 
 
 @app.command()
@@ -130,7 +177,9 @@ def submit(
     partition: str | None = typer.Option(
         None, "-p", "--partition", help="Default: [launch.<on>], else cluster default."
     ),
-    gpu: str | None = typer.Option(None, "--gpu", help="Portable GPU name (Modal), e.g. H100, L4."),
+    gpu: str | None = typer.Option(
+        None, "--gpu", help="Portable GPU name (Modal), e.g. H100, L4. Narrows a [launch] gpu list to it."
+    ),
     gpus: int | None = typer.Option(None, "-g", "--gpus", help="Default: [launch], else 1."),
     gpu_type: str | None = typer.Option(None, "--gpu-type", help="GRES type, e.g. l4 (gpu-spec types them)."),
     cpus: int | None = typer.Option(None, "-c", "--cpus", help="Default: [launch], else 8."),
@@ -140,15 +189,32 @@ def submit(
     ncu_questions: int = typer.Option(0, "--ncu", help="Queue `s1 ncu` with this many questions instead."),
 ) -> None:
     """Queue `s1 run CONFIG` (or `s1 ncu CONFIG`) on Slurm or Modal, per the config's [launch] table and
-    the flags (flags win). Without [launch] or --on it is a Slurm batch job; logs go to logs/<jobid>.out."""
+    the flags (flags win). Without [launch] or --on it is a Slurm batch job; logs go to logs/<jobid>.out.
+    A [launch] gpu list runs every GPU concurrently on Modal, prints a per-GPU summary and exits 1 if any
+    GPU failed (the others still finish and write back)."""
     config.load(cfg)  # fail fast on a bad config before queueing
     if on is not None and on not in config.ORCHESTRATORS:
         raise typer.BadParameter(f"must be one of {', '.join(config.ORCHESTRATORS)}", param_hint="--on")
-    res = launch_resources(
+    resolved = launch_resources_all(
         cfg, on=on, partition=partition, gpu=gpu, gpus=gpus, gpu_type=gpu_type, cpus=cpus, mem=mem, time=time
     )
     s1 = ["ncu", str(cfg), "--questions", str(ncu_questions)] if ncu_questions else ["run", str(cfg)]
-    get_launcher(res.orchestrator).submit(cfg, res, s1, dry_run=dry_run)
+    if len(resolved) == 1:
+        (res,) = resolved
+        get_launcher(res.orchestrator).submit(cfg, res, s1, dry_run=dry_run)
+        return
+    launcher = get_launcher(resolved[0].orchestrator)  # always "modal": load_launches checks it
+    if not isinstance(launcher, FanOutLauncher):
+        raise TypeError(f"the {resolved[0].orchestrator} launcher cannot fan out across GPUs")
+    outcomes = launcher.submit_many(cfg, resolved, s1, dry_run=dry_run)
+    if dry_run:
+        console.print(f"dry run: {len(outcomes)} GPU(s) would run concurrently, nothing queued")
+        return
+    console.print(_fan_out_summary(outcomes))
+    failed = [str(o.gpu) for o in outcomes if o.error is not None]
+    if failed:
+        console.print(f"[red]{len(failed)} of {len(outcomes)} GPU(s) failed: {', '.join(failed)}[/red]")
+        raise typer.Exit(1)
 
 
 @app.command()
