@@ -125,6 +125,12 @@ class Point:
     run_id: str
     m: Metrics
     hw: Metrics  # the model's latest ncu run on this GPU ({} if none)
+    variant: str = ""  # a runtime difference for the same model, e.g. "fused Mamba kernels"
+
+    @property
+    def name(self) -> str:
+        """The model as labelled in tables and charts: with its variant, so two runtimes never merge."""
+        return f"{self.model} ({self.variant})" if self.variant else self.model
 
     @property
     def family(self) -> int:
@@ -133,6 +139,13 @@ class Point:
 
 def _model(r: RunRecord) -> str:
     return str(r.params.get("model", "?"))
+
+
+def variant(r: RunRecord) -> str:
+    """What sets this run apart from another of the same model on the same GPU: granite with the fused
+    Mamba kernels (mamba-ssm installed) against plain PyTorch."""
+    mamba = str(r.invariants.get("env_mamba_ssm", "absent"))
+    return "fused Mamba kernels" if mamba not in ("absent", "") else ""
 
 
 def _is_ncu(r: RunRecord) -> bool:
@@ -202,24 +215,24 @@ class Panel:
 
 
 def panels(recs: Sequence[RunRecord]) -> list[Panel]:
-    """Latest clean natural-mode run per (platform, GPU, model) (length-axis runs are drawn apart), joined
-    with the latest ncu run of the same triple.
+    """Latest clean natural-mode run per (platform, GPU, model, variant) (length-axis runs are drawn apart),
+    joined with the latest ncu run of the same key.
     Ordered by datasheet bf16 peak (unknown last), then GPU name, the cluster before other platforms."""
     runs = sorted((r for r in recs if BENCH in r.results and not is_length_axis(r)), key=lambda r: r.run_id)
-    clean: dict[tuple[str, str, str], RunRecord] = {}
-    hw: dict[tuple[str, str, str], RunRecord] = {}
+    clean: dict[tuple[str, str, str, str], RunRecord] = {}
+    hw: dict[tuple[str, str, str, str], RunRecord] = {}
     for r in runs:
-        key = (str(r.invariants.get("gpu", "?")), platform(r.invariants), _model(r))
+        key = (str(r.invariants.get("gpu", "?")), platform(r.invariants), _model(r), variant(r))
         if _is_ncu(r):
             if "roofline_hw_intensity" in r.results[BENCH]:
                 hw[key] = r
         else:
             clean[key] = r
     grouped: dict[tuple[str, str], list[Point]] = {}
-    for (gpu, plat, model), r in sorted(clean.items()):
-        h = hw.get((gpu, plat, model))
+    for (gpu, plat, model, var), r in sorted(clean.items()):
+        h = hw.get((gpu, plat, model, var))
         grouped.setdefault((gpu, plat), []).append(
-            Point(model, r.run_id, r.results[BENCH], {} if h is None else h.results[BENCH])
+            Point(model, r.run_id, r.results[BENCH], {} if h is None else h.results[BENCH], var)
         )
     out = [Panel(gpu, plat, pts) for (gpu, plat), pts in grouped.items()]
 
@@ -264,7 +277,7 @@ def table(pts: Sequence[Point]) -> tuple[list[str], list[list[str]]]:
         m, h = p.m, p.hw
         rows.append(
             [
-                p.model,
+                p.name,
                 "decision model" if is_decision_model(p.model) else "zero-shot base",
                 FAMILIES[p.family],
                 f"{_f(m.get('roofline_params_b', nan))} ({_f(m.get('roofline_active_params_b', nan))})",
@@ -325,7 +338,7 @@ def by_gpu(panels: Sequence[Panel]) -> tuple[list[str], list[list[str]]]:
         for pt in p.points:
             tf, eff = pt.m.get("roofline_tflops", math.nan), pt.m.get("roofline_efficiency", math.nan)
             cell = _f(tf) + (f" ({eff:.0%})" if math.isfinite(eff) else "")
-            cells.setdefault(pt.model, {})[p.label] = cell
+            cells.setdefault(pt.name, {})[p.label] = cell
     header = ["Model", *(p.label for p in panels)]
     rows = [[m, *(cells[m].get(p.label, DASH) for p in panels)] for m in sorted(cells)]
     return header, rows
@@ -464,7 +477,7 @@ def chart(panel: Panel, s: Scale | None = None) -> str:
             )
             marks.append(f'<path class="traj" stroke="{color}" d="{d}"/>')
             for a, t, name in bins:
-                tip = f"{p.model}, questions of ≤{name[1:]} tokens: {a:.0f} FLOP/B, {t:.2f} TFLOP/s"
+                tip = f"{p.name}, questions of ≤{name[1:]} tokens: {a:.0f} FLOP/B, {t:.2f} TFLOP/s"
                 marks.append(
                     f'<g class="pt"><title>{html.escape(tip)}</title>'
                     f'<circle cx="{s.x(a):.1f}" cy="{s.y(t):.1f}" r="2.5" fill="{color}" opacity=".6"/></g>'
@@ -476,7 +489,7 @@ def chart(panel: Panel, s: Scale | None = None) -> str:
         hai, htf = p.hw.get("roofline_hw_intensity", math.nan), p.hw.get("roofline_hw_tflops", math.nan)
         if math.isfinite(hai) and math.isfinite(htf) and hai > 0 and htf > 0:
             hx, hy = s.x(hai), s.y(htf)
-            tip = f"{p.model}, hardware counters: {hai:.0f} FLOP/B, {htf:.2f} TFLOP/s"
+            tip = f"{p.name}, hardware counters: {hai:.0f} FLOP/B, {htf:.2f} TFLOP/s"
             marks.append(
                 f'<line x1="{x:.1f}" y1="{y:.1f}" x2="{hx:.1f}" y2="{hy:.1f}" stroke="{color}" '
                 'stroke-width="1" stroke-dasharray="2 3"/>'
@@ -487,7 +500,7 @@ def chart(panel: Panel, s: Scale | None = None) -> str:
             )
         eff = p.m.get("roofline_efficiency", math.nan)
         tip = (
-            f"{p.model} ({FAMILIES[p.family]}): {ai:.0f} FLOP/B, {tf:.2f} TFLOP/s"
+            f"{p.name} ({FAMILIES[p.family]}): {ai:.0f} FLOP/B, {tf:.2f} TFLOP/s"
             + (f", {eff:.0%} of attainable" if math.isfinite(eff) else "")
             + f" (run {p.run_id})"
         )
@@ -498,7 +511,7 @@ def chart(panel: Panel, s: Scale | None = None) -> str:
             f'<circle class="dot" cx="{x:.1f}" cy="{y:.1f}" r="{r}" fill="{color}" stroke="var(--surface)" '
             'stroke-width="2"/></g>'
         )
-        labels.append((x, y, p.model))
+        labels.append((x, y, p.name))
     present = sorted({p.family for p in pts})
     legend = "".join(
         f'<span class="key"><span class="sw" style="background:var(--fam-{f})"></span>{FAMILIES[f]}</span>'
@@ -556,7 +569,7 @@ def recipes(pts: Sequence[Point]) -> tuple[list[str], list[list[str]]]:
         pad = m.get("roofline_padding", nan)
         rows.append(
             [
-                p.model,
+                p.name,
                 *RECIPES[p.model],
                 DASH if "roofline_accuracy" not in m else f"{m['roofline_accuracy']:.1%}",
                 _f(m.get("roofline_questions_per_s", nan)),

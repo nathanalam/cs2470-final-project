@@ -16,7 +16,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import report_roofline
+from . import report_lengths, report_roofline
 from .record import RESULTS_DIR, Metrics, RunRecord, load_all
 
 SUFFIXES = ("accuracy", "ece", "brier", "invalid", "n", "latency_ms", "latency_ms_p99", "questions_per_s")
@@ -262,6 +262,47 @@ def _md_table(t: Table) -> str:
     return "\n".join(lines)
 
 
+def _md_lengths(recs: Sequence[RunRecord]) -> list[str]:
+    """The state-length axis: median GPU ms by length per panel, then the H200-vs-H100 speedups."""
+    lpanels = report_lengths.panels(recs)
+    out: list[str] = []
+    for sp in report_lengths.speedups(lpanels):
+        name = f"{report_roofline.gpu_name(sp.other.gpu)} vs {report_roofline.gpu_name(sp.base.gpu)}"
+        out += [
+            f"### {name} speedup by state length ({sp.platform})",
+            "",
+            f"Median GPU ms on the {report_roofline.gpu_name(sp.base.gpu)} over the "
+            f"{report_roofline.gpu_name(sp.other.gpu)}, same questions at each length. Memory-bound: "
+            f"~{sp.bw_ratio:.2f}x (bandwidth ratio); compute- or overhead-bound: ~1.0x.",
+            "",
+            _md_table(Table(*report_lengths.speedup_table(sp))),
+            "",
+        ]
+    for lp in lpanels:
+        out += [
+            f"### State-length axis on {lp.label}: median GPU ms per question",
+            "",
+            _md_table(Table(*report_lengths.ms_table(lp))),
+            "",
+        ]
+    return out
+
+
+def _html_lengths(recs: Sequence[RunRecord]) -> list[str]:
+    lpanels = report_lengths.panels(recs)
+    parts: list[str] = []
+    for sp in report_lengths.speedups(lpanels):
+        h, rows = report_lengths.speedup_table(sp)
+        parts += [report_lengths.speedup_chart(sp), '<div class="card">',
+                  _html_table(Table(h, rows), 1, len(h)), "</div>"]  # fmt: skip
+    scale = report_lengths.shared_scale(lpanels)
+    for lp in lpanels:
+        h, rows = report_lengths.ms_table(lp)
+        parts += [report_lengths.length_chart(lp, scale), '<div class="card">',
+                  _html_table(Table(h, rows), 1, len(h) - 2), "</div>"]  # fmt: skip
+    return parts
+
+
 def to_markdown(recs: Sequence[RunRecord], results_dir: Path = RESULTS_DIR) -> str:
     out = [
         "# Results",
@@ -297,6 +338,7 @@ def to_markdown(recs: Sequence[RunRecord], results_dir: Path = RESULTS_DIR) -> s
                     _md_table(Table(*report_roofline.table(panel.points))),
                     "",
                 ]
+            out += _md_lengths(recs)
         out += [
             "### Leaderboard (each model's largest run)",
             "",
@@ -453,6 +495,7 @@ def to_html(recs: Sequence[RunRecord], results_dir: Path = RESULTS_DIR) -> str:
                 header, rows = report_roofline.table(panel.points)
                 parts += [report_roofline.chart(panel, scale), '<div class="card">',
                           _html_table(Table(header, rows), 2, len(header)), "</div>"]  # fmt: skip
+            parts += _html_lengths(recs)
         parts += ["<h3>Leaderboard (each model's largest run)</h3>", '<div class="card">',
                   _html_table(leaderboard(bench, recs), 1, 1 + n_keys), "</div>"]  # fmt: skip
         parts += ["<h3>All runs</h3>", '<div class="card">',
