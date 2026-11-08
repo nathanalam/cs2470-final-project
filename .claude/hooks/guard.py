@@ -80,7 +80,7 @@ def check_bash(command: str, cwd: str) -> None:
             if PROTECTED_BRANCH.search(part):
                 deny("pushing to main/master is not allowed; push your own branch")
     if LEDGER_WORD in command or "ledger.py" in command:
-        if re.search(r"\bledger\.py\s+add\b", command) and in_worktree(cwd):
+        if re.search(r"\bledger\.py\s+(?:add|cap)\b", command) and in_worktree(cwd):
             deny("only the coordinator (main checkout) may add ledger entries")
         writes = re.search(
             r">\s*\S*" + LEDGER_WORD + r"|\b(?:tee|mv|cp|rm|truncate|chmod|ln)\b[^;&|]*" + LEDGER_WORD
