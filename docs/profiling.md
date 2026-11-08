@@ -140,8 +140,8 @@ directory. Raw ncu/nsys files land in `~/probes/out/<jobid>/`.
 
 The GPU sweep moves to Modal (the course workspace; credits are shared by the whole class, so probes stay at
 a few minutes each). `scripts/modal_probe.py` runs the same `profiling_probe.sh` and `ncu_smoke.py` inside a
-Modal container. **Status: built and tested locally, not yet run on Modal. The tables below are empty until
-the probe runs.**
+Modal container. **Status: run on 2026-11-08 on a Modal L4 and a pinned H100 (results below). ncu and nsys
+both work as a normal user on both GPUs; DCGM is not installed.**
 
 ### Running the probe
 
@@ -191,20 +191,25 @@ uvx --python 3.12 --from modal==1.6.3 modal run scripts/modal_probe.py --gpu 'H1
 
 | | L4 | H100! |
 |---|---|---|
-| Modal task / date | | |
-| GPU, cc, SMs, memory | | |
-| driver / CUDA | | |
-| power limit (enforced / max) | | |
-| `RmProfilingAdminOnly` | | |
-| nvidia-smi detailed fields | | |
-| `dmon -s t` | | |
-| DCGM | | |
-| ncu (`--clock-control none`) | | |
-| ncu tensor metric | | |
-| nsys trace / GPU metrics | | |
-| 4096 bf16 matmul: ncu TFLOP/s, % peak, AI | | |
-| 4096 bf16 matmul: unprofiled TFLOP/s | | |
-| throttle under load | | |
+| Modal task / date | `ta-01M6XXSCNA1A8WHNHE4DBK1TER`, 2026-11-08 | `ta-01M6XXSCJAW4EXRVMGE80VA1YR`, 2026-11-08 |
+| GPU, cc, SMs, memory | NVIDIA L4, 8.9, 58 SMs, 22.1 GiB | NVIDIA H100 80GB HBM3, 9.0, 132 SMs, 79.2 GiB (no H200 swap) |
+| driver / CUDA | 610.57.04 / 13.3 | 610.57.04 / 13.3 |
+| power limit (enforced / max) | 72 W / 72 W | 700 W / 700 W |
+| virtualization | pass-through | none |
+| `RmProfilingAdminOnly` | 0 | 0 |
+| nvidia-smi detailed fields | all 38 sampler keys present idle and busy | all 38 sampler keys present idle and busy |
+| `dmon -s t` | works, streams line by line | works, streams line by line |
+| DCGM | `dcgmi` missing | `dcgmi` missing |
+| ncu (`--clock-control none`) | runs, no `ERR_NVGPUCTRPERM` | runs, no `ERR_NVGPUCTRPERM` |
+| ncu tensor metric | `sm__pipe_tensor_op_hmma_cycles_active` | same name works on sm90 |
+| nsys trace / GPU metrics | trace + kernel summary work; GPU-metrics sampling exits 0 (read the `.sqlite`; `--report gpu_metrics` does not exist, as on the cluster) | same |
+| 4096 bf16 matmul: ncu TFLOP/s, % peak, AI | 76.9, 64% of 121, 838 FLOP/B | 767, 78% of 989, 766 FLOP/B |
+| 4096 bf16 matmul: unprofiled TFLOP/s | 51.7 (2048: 72.8) | 773 |
+| throttle under load | 95% of busy samples, mask `0x4` (SW power cap), max 74 W | 88% of busy samples, mask `0x4`, max 719 W, SM clock 1375 MHz mean |
+
+Both GPUs run power-capped under a sustained bf16 matmul, as the cluster L4 did: throttle fractions and clocks
+belong next to any cross-GPU latency comparison. Raw files: `logs/modal-probe-{l4,h100}-20261108T155248Z-*`
+(gitignored).
 
 ### Clock control in `s1 ncu`
 
