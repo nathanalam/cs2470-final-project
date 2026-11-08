@@ -1,16 +1,23 @@
 # Profiling on the HUIT cluster: what works
 
-Probed with `scripts/profiling_probe.sh` (Slurm job 4233, 2026-10-27) on one `gpu`-partition node:
-**1x NVIDIA L4** (compute capability 8.9, 22 GiB, 58 SMs), driver 580.126.20, CUDA toolkit 13.0
-(`nvcc` V13.0.88; torch 2.13.0+cu130). No model was loaded.
+**Every number in this document comes from one GPU type: an NVIDIA L4 (Ada, compute capability 8.9).**
+It was probed with `scripts/profiling_probe.sh` (Slurm job 4237, 2026-10-27) on one `gpu`-partition node:
+1x L4, 22 GiB, 58 SMs, driver 580.126.20, CUDA toolkit 13.0 (`nvcc` V13.0.88; torch 2.13.0+cu130). No model
+was loaded. The roofline peaks (121 dense bf16 TFLOP/s, 300 GB/s) are the L4 spec-sheet values.
 
-**Not probed:** the `gpu-parallel` (A10G) and `gpu-g7-reserved` nodes. The counter permission below is a
-driver setting and can differ per node type; run the probe there before relying on it (`-p gpu-parallel
---gres=gpu:1`).
+| Partition | Slurm GRES says | Actual GPU (AGENTS.md) | Probed here? |
+|---|---|---|---|
+| `gpu` | `gpu:l4:1` | 1x L4 24 GB (sm_89) | **yes, all results below** |
+| `gpu-parallel` | `gpu:l4:4` | 4x **A10G** 24 GB (sm_86), PCIe, no NVLink; the label is wrong | **no** |
+| `gpu-g7-reserved` | `gpu:rtxpro4500:1` | 1x RTX Pro 4500 32 GB | no |
+
+The TP=4 sweeps run on `gpu-parallel`, so the A10G is the GPU that matters most for the project and is
+still unmeasured. The counter permission (`RmProfilingAdminOnly`), the available tools and the ncu metric
+names are driver or architecture specific and may differ there. See "Running the probe on gpu-parallel".
 
 ## Summary
 
-| Tool | Works on the L4 node? | Notes |
+| Tool | Works on the L4 (`gpu`) node? | Notes |
 |---|---|---|
 | `nvidia-smi --query-gpu` fields | yes | `utilization.memory`, `clocks.sm`, `clocks.mem`, `clocks_event_reasons.active` (and the old `clocks_throttle_reasons.active` alias) all return values |
 | `nvidia-smi dmon -s t` | yes | rxpci/txpci MB/s, one line per second, streams line by line through a pipe |
@@ -41,13 +48,13 @@ All probed fields work; `nvidia-smi --help-query-gpu` lists both `clocks_event_r
 
 | key | idle | busy |
 |---|---|---|
-| `gpu0_util_pct` | 0 | 91.3 |
+| `gpu0_util_pct` | 0 | 92.0 |
 | `gpu0_mem_util_pct` | 0 | 7.2 |
-| `gpu0_clock_sm_mhz` | 210 | 1043 |
+| `gpu0_clock_sm_mhz` | 210 | 1048 |
 | `gpu0_clock_mem_mhz` | 405 | 5973 |
-| `gpu0_power_w` | 16.2 | 65.8 |
-| `gpu0_throttle_frac` | 0 | 0.90 (mask `0x4` = SW power cap; the L4 is a 72 W card) |
-| `gpu0_pcie_tx_mb_s` | 0 | 6.6 |
+| `gpu0_power_w` | 16.2 | 65.3 |
+| `gpu0_throttle_frac` | 0 | 0.95 (mask `0x4` = SW power cap; the L4 is a 72 W card) |
+| `gpu0_pcie_tx_mb_s` | 0 | 1.6 |
 | `gpu_util_pct_spread` | 0 | 0 (one GPU; it needs a multi-GPU node to be non-zero) |
 
 The throttle result is the useful surprise: a busy L4 runs power-capped, which pooled utilization hides.
@@ -95,10 +102,10 @@ Result (L4; spec peaks 121 dense bf16 TFLOP/s, 300 GB/s, ridge 403 FLOP/B):
 
 | n | kernel | us | DRAM MB | TFLOP/s | % peak | AI FLOP/B | ideal AI (n/3) | sm% | mem% | tensor% |
 |---|---|---|---|---|---|---|---|---|---|---|
-| 512 | ampere_bf16_s16816gemm 128x64 | 19.6 | 1.27 | 13.7 | 11 | 211 | 171 | 29 | 28 | 61 |
-| 1024 | ampere_bf16_s1688gemm 128x128 | 81.1 | 5.03 | 26.5 | 22 | 427 | 341 | 56 | 45 | 67 |
-| 2048 | ampere_bf16_s1688gemm 128x128 | 425.3 | 20.20 | 40.4 | 33 | 850 | 683 | 86 | 56 | 88 |
-| 4096 | ampere_bf16_s1688gemm 128x128 | 3123.9 | 164.64 | 44.0 | 36 | 835 | 1365 | 93 | 55 | 95 |
+| 512 | ampere_bf16_s16816gemm 128x64 | 19.7 | 1.28 | 13.6 | 11 | 210 | 171 | 29 | 28 | 61 |
+| 1024 | ampere_bf16_s1688gemm 128x128 | 80.9 | 5.03 | 26.5 | 22 | 427 | 341 | 55 | 45 | 67 |
+| 2048 | ampere_bf16_s1688gemm 128x128 | 424.4 | 20.21 | 40.5 | 33 | 850 | 683 | 86 | 56 | 88 |
+| 4096 | ampere_bf16_s1688gemm 128x128 | 3123.0 | 164.52 | 44.0 | 36 | 835 | 1365 | 93 | 55 | 95 |
 
 Reading it: SM and tensor-pipe utilization climb with size (29% -> 93% SM, 61% -> 95% tensor), arithmetic
 intensity is above the ridge from n=1024 up (compute-bound), and n=512 sits below it with lower
@@ -106,7 +113,7 @@ utilization. Measured AI is below the ideal at n=4096 because tiled kernels re-r
 
 Caveats on the numbers:
 - **ncu locks clocks to base by default**, so its TFLOP/s is below the unprofiled run. CUDA-event timing
-  without a profiler gave 25.2 / 57.2 / 72.5 / 57.1 TFLOP/s for the same sizes. Use `--clock-control none`
+  without a profiler gave 27.6 / 57.3 / 72.6 / 57.3 TFLOP/s for the same sizes. Use `--clock-control none`
   to measure at boost clocks. Use ncu for ratios and bytes, not absolute speed.
 - The L4 is power-capped (72 W), which also lowers sustained clocks (see the throttle row above).
 - Peaks come from spec sheets in `PEAKS` in `ncu_smoke.py`; check them for other GPUs.
@@ -219,3 +226,26 @@ line. Inside a Modal container (`s1.env.orchestrator() == "modal"`) the default 
 locking fails there. Every `s1 ncu` run records it as `roofline_hw_clocks_locked` in `results["roofline"]`
 (1 = base, 0 = none). Kernel times (`roofline_hw_kernel_ms`) from the two settings are not comparable: base
 clocks are lower than boost.
+
+## Running the probe on gpu-parallel (4x A10G)
+
+Same scripts, different `sbatch` flags. `sbatch` command-line options override the `#SBATCH` lines in the
+script. Nodes are powered down cloud instances, so expect 5-10 minutes to boot (`NODE_FAIL` /
+`InsufficientInstanceCapacity` means resubmit). The partition allows 2 days; 15 minutes is plenty.
+
+```bash
+cd ~/probes && sbatch -p gpu-parallel --gres=gpu:4 -c 8 --mem=32G -t 00:15:00 -J profiling-probe-a10g \
+  -o ~/probes/logs/%j.out ~/probes/profiling_probe.sh
+```
+Asking for all four GPUs makes the `ncu_smoke.py sample` section informative: it loads only GPU 0, so the
+other three stay idle and `gpu_util_pct_spread` and the per-GPU keys (`gpu0_*` vs `gpu1_*`) finally differ,
+and `dmon` reports four PCIe rows. Use `--gres=gpu:1` if you only want the permission and ncu answers.
+
+What to read from the log:
+- the GPU name must read `NVIDIA A10G`, compute capability 8.6 (the GRES label says L4; trust `nvidia-smi`);
+- `RmProfilingAdminOnly` (0 = ncu works; 1 = `ERR_NVGPUCTRPERM`, report it and stop);
+- the tensor-pipe metric the probe selected (names differ on sm_86) and whether the matmul table appears;
+- whether `dcgmi` and `nsys --gpu-metrics-devices` behave as on the L4.
+
+Known gaps before it is trusted: the `PEAKS` entry for A10G in `scripts/ncu_smoke.py` (70 dense bf16
+TFLOP/s, 600 GB/s) is an unverified spec figure, and Ampere has no FP8, so only bf16 is meaningful.
