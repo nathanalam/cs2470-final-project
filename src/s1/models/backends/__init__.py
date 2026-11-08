@@ -27,6 +27,7 @@ BACKENDS: dict[str, str] = {
     "semif": "s1.models.backends.semif:SemIfBackend",
     "laya": "s1.models.backends.laya:LayaBackend",
     "bongard": "s1.models.backends.bongard:BongardBackend",
+    "elephant": "s1.models.backends.elephant:ElephantBackend",
 }
 
 

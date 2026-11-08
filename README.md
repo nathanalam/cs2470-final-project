@@ -39,6 +39,24 @@ The hybrid runs with upstream's fused Qwen3.5 kernels and CUDA graphs. Its first
 serves attention-only bases in a packed form whose explicit attention mask rules out flash attention, and a plain
 causal pass measured 379 ms (`20261030-141249-3126d051`, cold). The invalid answers are prompts over 16,384 tokens.
 
+**Decision-model recipes on one L4 (roofline, 2026-11-04).** The same 200 short JEVal questions (≤1,024 tokens,
+≤16 options), one per request, every forward timed with CUDA events and costed with `s1.flops`.
+The measured L4 ceilings are 59 TFLOP/s bf16 and 231 GB/s, which puts the ridge at about 257 FLOP/B.
+The analysis is in [`results/REPORT.md`](results/REPORT.md#findings) (prose: `results/roofline_findings.md`).
+
+| Model | Recipe | Accuracy | GPU ms/q | GB read/q | FLOP/B | % of roof |
+|---|---|---:|---:|---:|---:|---:|
+| elephant-1 | Qwen3.5-9B full FT, fp32 slot head, state + forked questions (2 passes) | **75.5%** | 225 | 36 | 120 | 70% |
+| jevk5-9b | Qwen3.5-9B full FT, letter softmax over the vocab head | 70.5% | 156 | 16 | 291 | 51% |
+| qwen35-9b.zeroshot | its zero-shot base (control) | 72.5% | 154 | 16 | 291 | 51% |
+| kev-4b.qwen3 | Qwen3-4B LoRA + pointer head, one packed pass | 65.5% | **66** | 7.4 | 236 | 48% |
+| kev-4b.hybrid | Qwen3.5-4B LoRA + pointer head, fused kernels + CUDA graphs (2 passes) | 65.0% | 89 | 14.5 | 130 | 70% |
+| laya.english | ModernBERT-large encoder + marker head, fp32 | 44.0% | 20 | 1.4 | 105 | 31% |
+
+At batch 1 every recipe is bound by memory, so GPU time follows the bytes read. A vocab-sized readout head
+and a two-pass state/question split are the expensive choices; kev's pointer head avoids the first and its
+graphs reach the roof. Accuracy is ±6.5 points at this sample size.
+
 ## What a run record looks like
 
 ```json

@@ -93,6 +93,9 @@ def run(
     model = registry.get_model(str(spec.params["model"]))(settings)
     for key, val in models.spec_params(str(spec.params["model"])).items():
         rec.params.setdefault(key, val)  # resolved spec values (revision, options); config wins
+    if callable(run_info := getattr(model, "run_info", None)):
+        for key, val in run_info().items():
+            rec.invariants.setdefault(key, val)  # software the model actually ran with (versions, kernels)
     meta["load_s"] = round(time.perf_counter() - t0, 3)
     try:
         with metrics_mode(gpu_mode):

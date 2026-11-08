@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import config, report, runner
+from . import config, ncu, report, runner
 from .models.catalog import CATALOG
-from .record import RESULTS_DIR, load_all
+from .record import RESULTS_DIR, RunRecord, Scalar, load_all
 
 console = Console()
 app = typer.Typer(add_completion=False, no_args_is_help=True, help=__doc__)
@@ -21,13 +23,62 @@ app = typer.Typer(add_completion=False, no_args_is_help=True, help=__doc__)
 ResultsDir = typer.Option(RESULTS_DIR, "--results-dir", "-o", help="Where run records are written/read.")
 
 
+def _scalar(text: str) -> Scalar:
+    """A `--set` value: true/false, an int, a float, else the string."""
+    if text in ("true", "false"):
+        return text == "true"
+    for kind in (int, float):
+        try:
+            return kind(text)
+        except ValueError:
+            pass
+    return text
+
+
 @app.command()
-def run(cfg: Path, results_dir: Path = ResultsDir) -> None:
+def run(
+    cfg: Path,
+    results_dir: Path = ResultsDir,
+    index: int | None = typer.Option(None, "--index", help="Run only this combination (0-based)."),
+    sets: list[str] = typer.Option([], "--set", help="Override a param: key=value (repeatable)."),
+) -> None:
     """Run every combination in CONFIG in this process (use inside an allocation)."""
     specs = config.load(cfg)
+    if index is not None:
+        specs = [specs[index]]
+    overrides = {k: _scalar(v) for k, _, v in (s.partition("=") for s in sets)}
     console.print(f"{cfg}: {len(specs)} run(s)")
     for spec in specs:
+        spec.params |= overrides
         runner.run(spec, config_path=cfg, results_dir=results_dir, log=console.print)
+
+
+@app.command("ncu")
+def ncu_cmd(
+    cfg: Path,
+    questions: int = typer.Option(4, "--questions", help="Questions profiled per model."),
+    results_dir: Path = ResultsDir,
+    ncu_bin: str = typer.Option("/usr/local/cuda/bin/ncu", "--ncu", help="Nsight Compute CLI."),
+) -> None:
+    """Run each model of CONFIG under Nsight Compute (use inside an allocation): the roofline benchmark
+    re-answers `--questions` questions in a CUDA profiler range, and the summed hardware counters (FLOPs,
+    DRAM bytes) are added to that run's record as roofline_hw_*. See s1/ncu.py."""
+    specs = config.load(cfg)
+    job = os.environ.get("SLURM_JOB_ID", "local")
+    Path("logs").mkdir(exist_ok=True)
+    for i in range(len(specs)):
+        log = Path("logs") / f"ncu-{job}-{cfg.stem}-{i}.csv"
+        before = set(results_dir.glob("*.json"))
+        child = [sys.executable, "-m", "s1.cli", "run", str(cfg), "--index", str(i)]
+        child += ["--results-dir", str(results_dir), "--set", f"roofline_ncu={questions}"]
+        subprocess.run([ncu_bin, *ncu.ARGS, "--log-file", str(log), *child], check=True)
+        (path,) = set(results_dir.glob("*.json")) - before
+        rec = RunRecord.load(path)
+        hw = ncu.summarize(ncu.parse(log.read_text()), rec.results["roofline"])
+        rec.results["roofline"] |= hw
+        rec.meta["ncu_log"] = str(log)
+        rec.save(results_dir)
+        console.print(f"[{rec.run_id}] hardware counters: {hw}")
 
 
 @app.command()
@@ -36,20 +87,23 @@ def submit(
     *,
     partition: str | None = typer.Option(None, "-p", "--partition", help="Default: cluster default."),
     gpus: int = typer.Option(1, "-g", "--gpus"),
+    gpu_type: str | None = typer.Option(None, "--gpu-type", help="GRES type, e.g. l4 (gpu-spec types them)."),
     cpus: int = typer.Option(8, "-c", "--cpus"),
     mem: str = typer.Option("32G", "--mem"),
     time: str = typer.Option("01:00:00", "-t", "--time"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print the sbatch command only."),
+    ncu_questions: int = typer.Option(0, "--ncu", help="Queue `s1 ncu` with this many questions instead."),
 ) -> None:
-    """Queue `s1 run CONFIG` as a batch job; logs go to logs/<jobid>.out."""
+    """Queue `s1 run CONFIG` (or `s1 ncu CONFIG`) as a batch job; logs go to logs/<jobid>.out."""
     config.load(cfg)  # fail fast on a bad config before queueing
     cmd = ["sbatch", "-J", f"s1-{cfg.stem}", "-c", str(cpus), f"--mem={mem}", "-t", time]
     cmd += ["-o", "logs/%j.out"]
     if partition is not None:
         cmd += ["-p", partition]
     if gpus:
-        cmd += [f"--gres=gpu:{gpus}"]
-    cmd += ["--wrap", shlex.join(["uv", "run", "--extra", "openjev", "s1", "run", str(cfg)])]
+        cmd += [f"--gres=gpu:{'' if gpu_type is None else gpu_type + ':'}{gpus}"]
+    s1 = ["ncu", str(cfg), "--questions", str(ncu_questions)] if ncu_questions else ["run", str(cfg)]
+    cmd += ["--wrap", shlex.join(["uv", "run", "--extra", "openjev", "s1", *s1])]
     console.print(shlex.join(cmd))
     if not dry_run:
         Path("logs").mkdir(exist_ok=True)
@@ -124,3 +178,7 @@ def report_cmd(results_dir: Path = ResultsDir) -> None:
 
 def main() -> None:
     app()
+
+
+if __name__ == "__main__":
+    main()

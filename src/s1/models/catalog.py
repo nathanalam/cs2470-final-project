@@ -9,7 +9,9 @@ Add a spec as "planned" (no backend); flip it to "ready" with a `backend` key on
 
 from __future__ import annotations
 
-from .spec import ModelSpec
+from dataclasses import replace
+
+from .spec import Group, ModelSpec
 
 RESOLVED = "2026-10-25"
 
@@ -154,6 +156,105 @@ DJEV = ModelSpec(
     "size. Needs a patched vLLM nightly. Base revision is a proposed pin (HEAD, 51.6 GB, apache-2.0).",
 )
 
+# The ~8B L4 set: one parameter band (7-9B, bf16 on one 24 GB L4) varying the token mixer (Gated DeltaNet
+# hybrid, plain attention, short conv, Mamba2), dense vs MoE, and the readout. Six run through SemIf's
+# letter-softmax readout on the same transformers runtime, so only the architecture differs; elephant-1 runs
+# its own optimized engine. Revisions are the default-branch HEAD on the date (proposed pins).
+L4_RESOLVED = "2026-11-04"
+
+
+def zeroshot(name: str, repo: str, *, revision: str, size_bytes: int, group: Group, notes: str) -> ModelSpec:
+    """An off-the-shelf model read out zero-shot by SemIf's direct letter softmax (no decision training)."""
+    weights = "lfm1.0" if repo.startswith("LiquidAI/") else "apache-2.0"
+    return replace(
+        SEMIF_DIRECT,
+        name=f"{name}.zeroshot",
+        group=group,
+        repo=repo,
+        revision=revision,
+        size_bytes=size_bytes,
+        license=f"MIT (SemIf code); {weights} ({repo} weights)",
+        resolved_on=L4_RESOLVED,
+        notes=notes,
+    )
+
+
+QWEN35_9B = zeroshot(
+    "qwen35-9b",
+    "Qwen/Qwen3.5-9B",
+    revision="c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+    size_bytes=19_306_310_880,
+    group="control",
+    notes="Base of jevk5-9b and elephant-1. 24 Gated DeltaNet + 8 gated-attention layers; text tower only "
+    "(the vision tower and MTP layer in the size are not loaded).",
+)
+JEVK5_9B = replace(
+    QWEN35_9B,
+    name="jevk5-9b",
+    group="D-hybrid",
+    repo="alibiserikbay/JevK5-9B",
+    revision="d6521a18a86999190e9d775c915af3d6d6772fc4",
+    size_bytes=17_907_663_008,
+    license="MIT (SemIf code); apache-2.0 (JevK5-9B weights)",
+    options={**QWEN35_9B.options, "semif_temperature": 1.316},
+    notes="Qwen3.5-9B with a merged LoRA trained on SemIf's prompt; readout = SemIf's letter softmax at the "
+    "card's fitted temperature (jevk5_config.json; the knockout pass for >16 options is not implemented). "
+    "Upstream's runtime (allebee/jevk5) adds CUDA graphs; here it runs on the same eager transformers path.",
+)
+QWEN3_8B = zeroshot(
+    "qwen3-8b",
+    "Qwen/Qwen3-8B",
+    revision="b968826d9c46dd6066d109eabc6255188de91218",
+    size_bytes=16_381_516_776,
+    group="control",
+    notes="Dense, plain attention (36 layers): the dense control for the MoE models.",
+)
+OLMOE = zeroshot(
+    "olmoe-1b-7b",
+    "allenai/OLMoE-1B-7B-0125-Instruct",
+    revision="b89a7c4bc24fb9e55ce2543c9458ce0ca5c4650e",
+    size_bytes=13_838_721_960,
+    group="MoE",
+    notes="MoE with plain attention: 6.9B total, ~1.1B active (64 experts, top-8, 16 layers). 4k context.",
+)
+LFM2_MOE = zeroshot(
+    "lfm2-8b-a1b",
+    "LiquidAI/LFM2-8B-A1B",
+    revision="7ed1404fdf502a5446c1b67d4fe1533158d6f2ad",
+    size_bytes=16_680_151_504,
+    group="MoE",
+    notes="MoE with 18 short-conv + 6 attention layers: 8.3B total, ~1.4B active (32 experts, top-4). "
+    "LFM Open License v1.0. Short convolutions run in plain torch without causal-conv1d.",
+)
+GRANITE_H = zeroshot(
+    "granite4-h-tiny",
+    "ibm-granite/granite-4.0-h-tiny",
+    revision="791e0d3d28c86e106c9b6e0b4cecdee0375b6124",
+    size_bytes=13_878_142_256,
+    group="MoE",
+    notes="MoE with 36 Mamba2 + 4 attention layers: 6.9B total, ~1.3B active (64 experts, top-6, plus a "
+    "shared expert). Without mamba-ssm, transformers runs the Mamba2 scan in plain torch.",
+)
+ELEPHANT = ModelSpec(
+    name="elephant-1",
+    group="D-hybrid",
+    status="ready",
+    backend="elephant",
+    repo="baselabs/elephant-1",
+    revision="b3f8a93462fb1051a9de031e94a7ff380e254072",
+    base_repo="Qwen/Qwen3.5-9B",
+    base_revision="c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+    code_repo="OmniJev/OneJev",
+    code_revision="81ce62f1597c91e46767d4d02d6ac2e18534fe94",
+    license="mit",
+    resolved_on=L4_RESOLVED,
+    size_bytes=18_819_722_392,
+    options={"head_dtype": "float32"},
+    notes="Full fine-tune of Qwen3.5-9B, served on OneJev qev @81ce62f + the repo's serve.patch in its own "
+    "runtime (runtimes/elephant: torch 2.8, transformers 5.19): block-bidirectional full attention, one "
+    "shared-prefix prefill per request, slot_lm readout, fp32 LM head. #1 of 6-13B on Decision Index 0.4.1.",
+)
+
 CATALOG: list[ModelSpec] = [
     OPENJEV,
     LAYA_MULTILINGUAL,
@@ -165,4 +266,11 @@ CATALOG: list[ModelSpec] = [
     SEMIF_DIRECT,
     SEMIF_RERANKER,
     DJEV,
+    QWEN35_9B,
+    JEVK5_9B,
+    QWEN3_8B,
+    OLMOE,
+    LFM2_MOE,
+    GRANITE_H,
+    ELEPHANT,
 ]

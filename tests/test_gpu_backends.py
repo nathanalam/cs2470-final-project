@@ -39,7 +39,25 @@ def test_single_gpu_models_are_ready_and_parallel_ones_planned():
         "bongard-mini": "bongard",
         "semif.direct": "semif",
         "semif.reranker": "semif",
+        "qwen35-9b.zeroshot": "semif",
+        "jevk5-9b": "semif",
+        "qwen3-8b.zeroshot": "semif",
+        "olmoe-1b-7b.zeroshot": "semif",
+        "lfm2-8b-a1b.zeroshot": "semif",
+        "granite4-h-tiny.zeroshot": "semif",
+        "elephant-1": "elephant",
     }
+
+
+def test_l4_set_shares_semif_readout_and_differs_in_weights():
+    names = ["qwen35-9b.zeroshot", "qwen3-8b.zeroshot", "olmoe-1b-7b.zeroshot", "lfm2-8b-a1b.zeroshot"]
+    names += ["granite4-h-tiny.zeroshot", "jevk5-9b"]
+    specs = [spec(n) for n in names]
+    assert {s.options["mode"] for s in specs} == {"direct"}
+    assert len({s.repo for s in specs}) == len(specs)
+    assert all(s.revision is not None and len(s.revision) == 40 for s in specs)
+    assert spec("jevk5-9b").options["semif_temperature"] == 1.316  # jevk5_config.json
+    assert all(7e9 < (s.size_bytes or 0) < 20e9 for s in specs)  # one bf16 band that fits a 24 GB L4
 
 
 def test_bongard_requires_the_rtx_pro_4500():
