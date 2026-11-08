@@ -18,12 +18,12 @@ options whose state + question JSON is at most `roofline_max_tokens` tokens of o
 (`roofline_tokenizer_file`, a tokenizer.json; words if unset), then a seeded sample.
 
 **State-length axis** (`[grid] roofline_state_tokens = [32, 128, 256, 512, 768, 1024, 1536, 2048]`): in place
-of natural JEVal lengths, `roofline_per_length` seeded questions whose own state is at least the longest
-length (in reference tokens) run at every length, each state cut to that length's prefix (`counter.fit`).
-Every point is a contiguous prefix of one real state and the same questions run at every length, so only the
-state length differs between points. It places each model's forwards across every GPU's ridge (bf16 intensity
-grows with tokens; natural JEVal at <= 1024 tokens sits left of all of them). Too few qualifying rows is an
-error, never a silent fallback. Per-length points are
+of natural JEVal lengths, `roofline_per_length` seeded questions, spread round-robin across JEVal's datasets,
+whose own state is at least the longest length (in reference tokens) run at every length, each state cut to
+that length's prefix (`counter.fit`). Every point is a contiguous prefix of one real state and the same
+questions run at every length, so only the state length differs between points. It places each model's
+forwards across every GPU's ridge (bf16 intensity grows with tokens; natural JEVal at <= 1024 tokens sits left
+of all of them). Too few qualifying rows is an error, never a silent fallback. Per-length points are
 `roofline_s<L>_{tflops,intensity,bandwidth_gbs,n,tokens,gpu_ms,gpu_ms_median,gpu_ms_max}`; the headline keys
 pool all lengths. Accuracy at cut lengths is not meaningful (cut states lose evidence): only timing and the
 roofline are. A backend that cuts its input (Laya: 512 / 1024 tokens) is charged for what it processed, so its
@@ -51,7 +51,7 @@ Settings (all optional):
     roofline_kernel_profile  1: note the CUDA kernels of one question in meta (roofline_kernels_top,
                            roofline_attention_kernel), traced after timing; 0: skip     default 1
     roofline_per_length    questions per state length (with the [grid] axis)        default 40
-    roofline_max_question_tokens  reference tokens of a length-axis question's JSON  default 256
+    roofline_max_question_tokens  reference tokens of a length-axis question's JSON  default 512
     roofline_tokenizer_file
 """
 
@@ -144,11 +144,31 @@ class FittingCounter(TokenCounter, Protocol):
     def fit(self, text: str, tokens: int) -> str: ...
 
 
+def spread(rows: Sequence[jeval.Row], k: int, rng: random.Random) -> list[jeval.Row]:
+    """`k` rows taken round-robin across datasets (`source`), each dataset shuffled by `rng` and the datasets
+    visited in a seeded order: at most ceil(k / datasets) from each, the rest filled from the datasets that
+    still have rows when a small one runs out."""
+    groups: dict[str, list[jeval.Row]] = {}
+    for r in rows:
+        groups.setdefault(r.source, []).append(r)
+    order = sorted(groups)
+    rng.shuffle(order)
+    for name in order:
+        rng.shuffle(groups[name])
+    out: list[jeval.Row] = []
+    while len(out) < k and any(groups.values()):
+        for name in order:
+            if groups[name] and len(out) < k:
+                out.append(groups[name].pop())
+    return out
+
+
 def length_rows(
     rows: Sequence[jeval.Row], counter: FittingCounter, settings: Settings, lengths: Sequence[int]
 ) -> list[tuple[int, jeval.Row]]:
     """(length, row) for every length in `lengths` x the same `roofline_per_length` seeded rows, states cut
-    to its first `length` reference tokens. Rows qualify when they are choice/noul with at most
+    to its first `length` reference tokens, picked round-robin across datasets (`spread`; the per-dataset
+    counts are noted as roofline_length_sources). Rows qualify when they are choice/noul with at most
     `roofline_max_options` options, their question JSON is at most `roofline_max_question_tokens` tokens, and
     their own state is at least max(lengths) tokens, so every point is a prefix of one real state. Ordered
     length-major (all questions at one length, then the next). Raises if too few rows qualify."""
@@ -156,7 +176,7 @@ def length_rows(
         raise ValueError(f"{LENGTH_AXIS} is empty")
     per = get_int(settings, "roofline_per_length", 40)
     max_options = get_int(settings, "roofline_max_options", 16)
-    max_question = get_int(settings, "roofline_max_question_tokens", 256)
+    max_question = get_int(settings, "roofline_max_question_tokens", 512)
     longest = max(lengths)
     keep = [
         r
@@ -171,7 +191,11 @@ def length_rows(
             f"only {len(keep)} JEVal rows have a state of at least {longest} reference tokens (and at most "
             f"{max_options} options, {max_question} question tokens); roofline_per_length = {per}"
         )
-    chosen = random.Random(get_int(settings, "roofline_seed", 0)).sample(keep, per)
+    chosen = spread(keep, per, random.Random(get_int(settings, "roofline_seed", 0)))
+    counts: dict[str, int] = {}
+    for r in chosen:
+        counts[r.source] = counts.get(r.source, 0) + 1
+    note("roofline_length_sources", "; ".join(f"{k}:{v}" for k, v in sorted(counts.items())))
     out: list[tuple[int, jeval.Row]] = []
     for n in lengths:
         for r in chosen:

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import collections
 import dataclasses
+import random
 
 import pytest
 
@@ -48,7 +50,7 @@ def test_length_rows_cut_long_states_and_reuse_the_questions():
 
 def test_length_rows_skip_short_states_and_long_questions():
     long_q = jeval.Row(
-        "long-q", "src", "noul", " ".join(["w"] * 100), {"q": {"type": "noul", "instructions": "x " * 300}}, 1
+        "long-q", "src", "noul", " ".join(["w"] * 100), {"q": {"type": "noul", "instructions": "x " * 600}}, 1
     )
     rows = [
         row(0, state_words=10),
@@ -59,6 +61,30 @@ def test_length_rows_skip_short_states_and_long_questions():
     rows += [row(10 + i, state_words=100) for i in range(3)]
     tagged = roofline.length_rows(rows, shape_sweep.WordCounter(), {"roofline_per_length": 3}, [16, 64])
     assert {r.id for _, r in tagged} == {"r10", "r11", "r12"}
+
+
+def test_spread_takes_round_robin_across_datasets_and_fills_from_larger_ones():
+    rows = [
+        dataclasses.replace(row(i), source=src)
+        for i, src in enumerate(["big"] * 30 + ["mid"] * 6 + ["tiny"] * 1)
+    ]
+    got = roofline.spread(rows, 12, random.Random(0))
+    counts = collections.Counter(r.source for r in got)
+    assert counts in ({"tiny": 1, "mid": 6, "big": 5}, {"tiny": 1, "mid": 5, "big": 6})
+    assert len({r.id for r in got}) == 12  # no row twice
+    even = [dataclasses.replace(row(i), source=f"d{i % 4}") for i in range(40)]
+    assert (
+        max(collections.Counter(r.source for r in roofline.spread(even, 9, random.Random(1))).values()) == 3
+    )
+    assert roofline.spread(rows, 12, random.Random(0)) == got  # seeded
+
+
+def test_length_rows_note_the_datasets_they_used(monkeypatch):
+    notes: dict[str, object] = {}
+    monkeypatch.setattr(roofline, "note", notes.__setitem__)
+    rows = [dataclasses.replace(row(i, state_words=100), source=f"d{i % 3}") for i in range(30)]
+    roofline.length_rows(rows, shape_sweep.WordCounter(), {"roofline_per_length": 6}, [16, 64])
+    assert notes == {"roofline_length_sources": "d0:2; d1:2; d2:2"}
 
 
 def test_length_rows_raise_when_too_few_states_are_long_enough():
