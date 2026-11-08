@@ -79,7 +79,7 @@ ignore = [
 python-version = "3.12"
 
 [tool.ty.src]
-exclude = ["runtimes/"]  # their own venvs (e.g. runtimes/elephant imports qev under torch 2.8)
+exclude = ["runtimes/", ".claude/"]  # .claude/hooks: stdlib-only hook scripts; runtimes: their own venvs (e.g. runtimes/elephant imports qev under torch 2.8)
 
 [tool.ty.rules]
 all = "error"
