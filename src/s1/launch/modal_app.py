@@ -338,7 +338,7 @@ def build_image(*, openjev: bool = False) -> None:
     modal = _modal()
     app = modal.App(APP_NAME)
     with modal.enable_output(), app.run():
-        modal.Image.build(_image(modal, openjev=openjev), app)
+        _image(modal, openjev=openjev).build(app)  # instance method: Image.build(self, app)
 
 
 @dataclass
