@@ -19,6 +19,7 @@ Record fields (names are fixed here so every workstream writes the same keys):
     meta["slurm_job_id"]          unchanged: Slurm runs only
     meta[META_MODAL_TASK_ID]      Modal runs only
     meta[META_CPU_MODEL]          host CPU model string, when it can be read
+    meta[META_CPU_COUNT]          CPUs this process may run on (the Slurm/Modal allocation, not the host)
     meta[META_GPU_DRIVER]         NVIDIA driver version, when nvidia-smi is present
     meta[META_GPU_POWER_LIMIT_W]  enforced power limit of GPU 0 in watts, when present
     meta[META_NVIDIA_SMI_Q_LOG]   path of the saved `nvidia-smi -q` output (the text stays out of the record)
@@ -41,6 +42,7 @@ type Orchestrator = Literal["slurm", "modal", "local"]
 META_ORCHESTRATOR = "orchestrator"
 META_MODAL_TASK_ID = "modal_task_id"
 META_CPU_MODEL = "cpu_model"
+META_CPU_COUNT = "cpu_count"
 META_GPU_DRIVER = "gpu_driver"
 META_GPU_POWER_LIMIT_W = "gpu_power_limit_w"
 META_NVIDIA_SMI_Q_LOG = "nvidia_smi_q_log"

@@ -14,6 +14,8 @@ mem = "96G"
 time = "02:00:00"
 
 [invariants]
+gpu_metrics = "detailed"   # every Modal run (superset of basic); the M1/M2 records committed on 2026-11-08 were basic
+gpu_metrics_schema = 1
 gpu = "auto"
 require_gpu = "H100"
 tensor_parallel_size = 1

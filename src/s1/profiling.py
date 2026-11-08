@@ -208,3 +208,46 @@ def kernel_env(model: Any = None) -> dict[str, str]:  # noqa: ANN401
     if model is not None:
         env["attn_implementation"] = str(getattr(model.config, "_attn_implementation", "unknown"))
     return env
+
+
+ATTENTION_HINTS = ("flash", "fmha", "attention", "attn", "sdpa", "efficient", "cudnn_sdp")
+
+
+def kernel_shares(events: list[tuple[str, float]], top: int = 10) -> list[tuple[str, float]]:
+    """(kernel name, GPU time) pairs -> the `top` names by summed time, each with its share of the total."""
+    totals: dict[str, float] = {}
+    for name, t in events:
+        totals[name] = totals.get(name, 0.0) + t
+    whole = sum(totals.values())
+    if whole <= 0:
+        return []
+    ranked = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)[:top]
+    return [(name, t / whole) for name, t in ranked]
+
+
+def attention_kernel(shares: list[tuple[str, float]]) -> str | None:
+    """The busiest kernel whose name looks like attention (flash/fmha/efficient/cudnn sdp...), if any."""
+    for name, _ in shares:
+        if any(h in name.lower() for h in ATTENTION_HINTS):
+            return name
+    return None
+
+
+def profile_kernels(fn: Callable[[], object]) -> list[tuple[str, float]]:
+    """Run `fn` once under torch.profiler (CUDA activity only) and return (kernel name, device time in us)
+    for every CUDA kernel it launched. Uses CUPTI tracing, not hardware counters, so it needs no special
+    permission; run it outside timed regions, since tracing adds overhead."""
+    import torch  # noqa: PLC0415
+
+    cuda = torch.autograd.DeviceType.CUDA
+    torch.cuda.synchronize()
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    events = prof.events() or []
+    # kernel launches are the events that ran on the device; their own interval is the kernel's duration
+    return [
+        (str(e.name), float(e.time_range.elapsed_us()))
+        for e in events
+        if e.device_type == cuda and e.time_range.elapsed_us() > 0
+    ]

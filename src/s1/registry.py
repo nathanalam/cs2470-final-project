@@ -7,6 +7,8 @@ Add a model:      add a ModelSpec to s1/models/catalog.py (see AGENTS.md), or fo
 Add a benchmark:  @benchmark("name")  def run(model, settings) -> Metrics
 Warm one up:      @warmup("name")     def warm(model, settings) -> bool   (optional; runs before GPU sampling;
                                                                           True if it did anything)
+Text facts:       note("<bench>_key", "value") inside a benchmark puts a string/scalar into the record's
+                  `meta` (e.g. which CUDA kernels ran); metrics stay numbers
 
 Implementations live in s1/models/ and s1/benchmarks/ and are imported by those packages'
 __init__.py so registering is just "write the function, add the import".
@@ -14,7 +16,9 @@ __init__.py so registering is just "write the function, add the import".
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Protocol, runtime_checkable
 
 from .record import Metrics, Scalar
@@ -124,3 +128,23 @@ def get_float(settings: Settings, key: str, default: float) -> float:
     if not isinstance(val, int | float) or isinstance(val, bool):
         raise TypeError(f"setting {key!r} must be a number, got {val!r}")
     return float(val)
+
+
+_NOTES: ContextVar[dict[str, Scalar] | None] = ContextVar("s1_notes", default=None)
+
+
+@contextmanager
+def collecting_notes() -> Generator[dict[str, Scalar]]:
+    """The runner wraps each benchmark in this; `note()` calls inside land in the yielded dict."""
+    notes: dict[str, Scalar] = {}
+    token = _NOTES.set(notes)
+    try:
+        yield notes
+    finally:
+        _NOTES.reset(token)
+
+
+def note(key: str, value: Scalar) -> None:
+    """Record a non-numeric fact about this run in `meta` (a no-op outside a runner benchmark)."""
+    if (notes := _NOTES.get()) is not None:
+        notes[key] = value

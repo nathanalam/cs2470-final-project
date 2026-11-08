@@ -154,7 +154,8 @@ exist is a per-run setting, recorded in the run record (`invariants`):
 | `gpu_metrics = "detailed"` | Basic keys plus the schema-1 keys below. The runner records `gpu_metrics_schema = 1` in `invariants`. |
 | `gpu_metrics_schema = 1` | Version of the detailed key set. A config that names a schema this code does not write is an error; changing the key set bumps it. |
 
-**Old records do not have the detailed keys. That is intentional** (opt-in, versioned): compare detailed
+**Every Modal GPU config sets `gpu_metrics = "detailed"`** (a test enforces it). **Old records do not have
+the detailed keys. That is intentional** (opt-in, versioned): compare detailed
 runs only with detailed runs. Example config: `configs/openjev_shape_sweep_cache_detailed.toml`.
 
 Schema 1 (`g` = GPU index; a key is absent when its source is missing or `[N/A]`, never zero-filled):
@@ -265,6 +266,8 @@ A benchmark is `@benchmark("name") def run(model, settings) -> dict[str, float]`
 
 - **Prefix every metric key with the benchmark name.** Make the **first key the headline**: `s1 ls` shows it.
 - Use `summarize("<name>_latency_ms", values)` for distributions (mean/std/p90/p95/p99).
+- Metrics are numbers. For a text fact about the run (which CUDA kernels ran), call
+  `note("<name>_key", value)` from `s1.registry`; the runner puts it in the record's `meta`.
 - Count failed or malformed answers as **invalid and wrong**, and report the invalid count.
 - Pin the dataset: `REPO` and a commit-SHA `REVISION` constant (get it with
   `HfApi().dataset_info(repo).sha`).

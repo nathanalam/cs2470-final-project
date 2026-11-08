@@ -39,15 +39,33 @@ def _run(cmd: list[str]) -> str | None:
         return None
 
 
+def cpu_from_cpuinfo(text: str) -> str | None:
+    """The CPU named by /proc/cpuinfo text. Its "model name" when real; sandboxes such as Modal's gVisor
+    report "unknown" there but keep the CPUID numbers, so fall back to "<vendor> family F model M stepping S"
+    (enough to look the part up, e.g. GenuineIntel family 6 model 143 = Sapphire Rapids)."""
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        key, _, val = line.partition(":")
+        if key.strip() and key.strip() not in fields:  # first processor block only
+            fields[key.strip()] = val.strip()
+    name = fields.get("model name", "")
+    if name and name.lower() != "unknown":
+        return name
+    vendor, family, model = fields.get("vendor_id", ""), fields.get("cpu family", ""), fields.get("model", "")
+    if not (vendor and family and model):
+        return None
+    stepping = f" stepping {step}" if (step := fields.get("stepping", "")) else ""
+    return f"{vendor} family {family} model {model}{stepping}"
+
+
 def cpu_model() -> str | None:
-    """Host CPU model: /proc/cpuinfo "model name" (Linux), else sysctl's brand string (macOS), else None."""
+    """Host CPU model: /proc/cpuinfo (Linux, see cpu_from_cpuinfo), else sysctl's brand string (macOS)."""
     try:
-        for line in Path("/proc/cpuinfo").read_text().splitlines():
-            key, _, val = line.partition(":")
-            if key.strip() == "model name" and val.strip():
-                return val.strip()
+        name = cpu_from_cpuinfo(Path("/proc/cpuinfo").read_text())
     except OSError:
-        pass
+        name = None
+    if name is not None:
+        return name
     out = _run(["sysctl", "-n", "machdep.cpu.brand_string"])
     return (out or "").strip() or None
 
@@ -57,6 +75,11 @@ def hardware_meta() -> dict[str, Scalar]:
     meta: dict[str, Scalar] = {}
     if (cpu := cpu_model()) is not None:
         meta[env.META_CPU_MODEL] = cpu
+    affinity = getattr(
+        os, "sched_getaffinity", None
+    )  # Linux only; allocations show up here, not in cpu_count
+    if (cpus := len(affinity(0)) if callable(affinity) else os.cpu_count()) is not None:
+        meta[env.META_CPU_COUNT] = cpus
     out = _run(["nvidia-smi", "--query-gpu=driver_version,power.limit", "--format=csv,noheader,nounits"])
     if out is not None and (rows := [r for r in out.splitlines() if r.strip()]):
         driver, _, power = (f.strip() for f in rows[0].partition(","))
@@ -147,8 +170,9 @@ def run(
                 if (warm := registry.get_warmup(name)) is not None and warm(model, settings):
                     meta[f"{name}_warmup_s"] = round(time.perf_counter() - t, 3)
                 t = time.perf_counter()
-                with gpu_sampler() as smi:
+                with gpu_sampler() as smi, registry.collecting_notes() as notes:
                     rec.results[name] = registry.get_benchmark(name)(model, settings)
+                meta |= notes
                 meta[f"{name}_s"] = round(time.perf_counter() - t, 3)
                 if gpu := smi.metrics():
                     rec.results[f"{name}/nvidia_smi"] = gpu

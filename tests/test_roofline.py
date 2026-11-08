@@ -9,7 +9,7 @@ from typing import override
 
 import pytest
 
-from s1 import flops, registry, runner
+from s1 import flops, profiling, registry, runner
 from s1.benchmarks import jeval, roofline
 from s1.config import RunSpec
 from s1.models.backends import elephant, kev
@@ -296,3 +296,76 @@ def test_runner_records_model_run_info(tmp_path, echo_model):
     assert rec.invariants["env_torch"] == "2.13.0"
     assert rec.invariants["gpu"] == "NVIDIA L4"  # the config's value wins
     assert json.loads((tmp_path / f"{rec.run_id}.json").read_text())
+
+
+def test_kernel_shares_rank_and_attention_pick():
+
+    events = [
+        ("ampere_bf16_gemm", 60.0),
+        ("flash_fwd_kernel", 30.0),
+        ("ampere_bf16_gemm", 30.0),
+        ("copy", 0.0),
+    ]
+    shares = profiling.kernel_shares(events, top=2)
+    assert [n for n, _ in shares] == ["ampere_bf16_gemm", "flash_fwd_kernel"]
+    assert shares[0][1] == pytest.approx(0.75)
+    assert profiling.attention_kernel(shares) == "flash_fwd_kernel"
+    assert profiling.attention_kernel([("gemm", 1.0)]) is None
+    assert profiling.kernel_shares([]) == []
+
+
+def _roofline_rec(tmp_path, monkeypatch, **params):
+    rows = [row(i, state_words=10 + i) for i in range(12)]
+    monkeypatch.setattr(jeval, "load_rows", lambda: rows)
+    registry.MODELS["fake-profiled"] = lambda settings: FakeProfiled()
+    try:
+        spec = RunSpec(
+            benchmarks=["roofline"],
+            invariants={"gpu": "NVIDIA L4"},
+            params={"model": "fake-profiled", "roofline_limit": 10, "roofline_counted": 0, **params},
+        )
+        return runner.run(spec, results_dir=tmp_path, log=lambda _: None, gpu_sampler=_no_gpu)
+    finally:
+        registry.MODELS.pop("fake-profiled")
+
+
+def test_kernel_names_land_in_meta_after_timing(tmp_path, monkeypatch):
+
+    calls = []
+
+    def fake_profile(fn):
+        calls.append(fn())  # the profiled question really runs
+        return [("sm90_xmma_gemm_bf16", 80.0), ("fmha_cutlassF_bf16", 20.0)]
+
+    monkeypatch.setattr(profiling, "profile_kernels", fake_profile)
+    rec = _roofline_rec(tmp_path, monkeypatch)
+    assert calls
+    assert rec.meta["roofline_kernels_top"] == "80.0% sm90_xmma_gemm_bf16; 20.0% fmha_cutlassF_bf16"
+    assert rec.meta["roofline_attention_kernel"] == "fmha_cutlassF_bf16"
+    assert rec.meta["roofline_kernels_seen"] == 2
+    assert rec.results["roofline"]["roofline_n"] == 10  # the traced question is not a measured one
+
+
+def test_kernel_profile_failure_is_noted_not_fatal(tmp_path, monkeypatch):
+
+    def broken(fn):
+        raise RuntimeError("CUPTI unavailable")
+
+    monkeypatch.setattr(profiling, "profile_kernels", broken)
+    rec = _roofline_rec(tmp_path, monkeypatch)
+    assert rec.meta["roofline_kernels_error"] == "RuntimeError: CUPTI unavailable"
+    assert "roofline" in rec.results
+
+
+def test_kernel_profile_can_be_turned_off(tmp_path, monkeypatch):
+
+    monkeypatch.setattr(profiling, "profile_kernels", lambda fn: pytest.fail("should not trace"))
+    rec = _roofline_rec(tmp_path, monkeypatch, roofline_kernel_profile=0)
+    assert not any(k.startswith("roofline_kernels") for k in rec.meta)
+
+
+def test_note_outside_a_run_is_a_no_op():
+    registry.note("x", "y")  # no collector: nothing happens, nothing raises
+    with registry.collecting_notes() as notes:
+        registry.note("roofline_attention_kernel", "flash")
+    assert notes == {"roofline_attention_kernel": "flash"}

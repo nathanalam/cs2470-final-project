@@ -196,3 +196,32 @@ def test_vllm_shim_log_names_use_job_id(tmp_path, monkeypatch):
 def test_gpu_models_dir_delegates_to_env(monkeypatch):
     monkeypatch.setenv("MODELS_DIR", "/models")
     assert gpu.models_dir() == Path("/models")
+
+
+GVISOR_CPUINFO = """processor\t: 0
+vendor_id\t: GenuineIntel
+cpu family\t: 6
+model\t\t: 143
+model name\t: unknown
+stepping\t: 8
+
+processor\t: 1
+vendor_id\t: GenuineIntel
+model name\t: unknown
+"""
+
+
+def test_cpu_from_cpuinfo_real_name_and_sandbox_fallback():
+    real = "processor\t: 0\nvendor_id\t: AuthenticAMD\nmodel name\t: AMD EPYC 7R13 Processor\n"
+    assert runner.cpu_from_cpuinfo(real) == "AMD EPYC 7R13 Processor"
+    assert runner.cpu_from_cpuinfo(GVISOR_CPUINFO) == "GenuineIntel family 6 model 143 stepping 8"
+    assert runner.cpu_from_cpuinfo("model name\t: unknown\n") is None
+    assert runner.cpu_from_cpuinfo("") is None
+
+
+def test_hardware_meta_records_cpu_count(monkeypatch):
+    monkeypatch.setattr(runner, "_run", lambda cmd: None)
+    meta = runner.hardware_meta()
+    count = meta[env.META_CPU_COUNT]
+    assert isinstance(count, int)
+    assert count >= 1
