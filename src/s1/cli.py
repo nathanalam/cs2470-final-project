@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import json
-import os
-import shlex
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import config, ncu, report, runner
+from . import config, env, ncu, report, runner
+from .launch import Resources, get_launcher
 from .models.catalog import CATALOG
 from .record import RESULTS_DIR, RunRecord, Scalar, load_all
 
@@ -64,7 +64,7 @@ def ncu_cmd(
     re-answers `--questions` questions in a CUDA profiler range, and the summed hardware counters (FLOPs,
     DRAM bytes) are added to that run's record as roofline_hw_*. See s1/ncu.py."""
     specs = config.load(cfg)
-    job = os.environ.get("SLURM_JOB_ID", "local")
+    job = env.job_id()
     Path("logs").mkdir(exist_ok=True)
     for i in range(len(specs)):
         log = Path("logs") / f"ncu-{job}-{cfg.stem}-{i}.csv"
@@ -81,33 +81,67 @@ def ncu_cmd(
         console.print(f"[{rec.run_id}] hardware counters: {hw}")
 
 
+def launch_resources(
+    cfg: Path,
+    *,
+    on: str | None = None,
+    partition: str | None = None,
+    gpu: str | None = None,
+    gpus: int | None = None,
+    gpu_type: str | None = None,
+    cpus: int | None = None,
+    mem: str | None = None,
+    time: str | None = None,
+) -> Resources:
+    """The config's [launch] table (Slurm defaults when absent), each flag that was given overriding its
+    field: `on` the orchestrator, `partition`/`gpu_type` the extras of that orchestrator."""
+    target = None if on is None else config.target(on, "--on")
+    res = config.load_launch(cfg, target) or Resources(orchestrator=target or "slurm")
+    extras = dict(res.extras)
+    if partition is not None:
+        extras["partition"] = partition
+    if gpu_type is not None:
+        extras["gpu_type"] = gpu_type
+    return replace(
+        res,
+        gpu=res.gpu if gpu is None else gpu,
+        gpus=res.gpus if gpus is None else gpus,
+        cpus=res.cpus if cpus is None else cpus,
+        mem=res.mem if mem is None else mem,
+        time=res.time if time is None else time,
+        extras=extras,
+    )
+
+
 @app.command()
 def submit(
     cfg: Path,
     *,
-    partition: str | None = typer.Option(None, "-p", "--partition", help="Default: cluster default."),
-    gpus: int = typer.Option(1, "-g", "--gpus"),
+    on: str | None = typer.Option(
+        None, "--on", help="slurm or modal. Default: [launch] orchestrator, else slurm."
+    ),
+    partition: str | None = typer.Option(
+        None, "-p", "--partition", help="Default: [launch.<on>], else cluster default."
+    ),
+    gpu: str | None = typer.Option(None, "--gpu", help="Portable GPU name (Modal), e.g. H100, L4."),
+    gpus: int | None = typer.Option(None, "-g", "--gpus", help="Default: [launch], else 1."),
     gpu_type: str | None = typer.Option(None, "--gpu-type", help="GRES type, e.g. l4 (gpu-spec types them)."),
-    cpus: int = typer.Option(8, "-c", "--cpus"),
-    mem: str = typer.Option("32G", "--mem"),
-    time: str = typer.Option("01:00:00", "-t", "--time"),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Print the sbatch command only."),
+    cpus: int | None = typer.Option(None, "-c", "--cpus", help="Default: [launch], else 8."),
+    mem: str | None = typer.Option(None, "--mem", help="Default: [launch], else 32G."),
+    time: str | None = typer.Option(None, "-t", "--time", help="Default: [launch], else 01:00:00."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print what would be queued only."),
     ncu_questions: int = typer.Option(0, "--ncu", help="Queue `s1 ncu` with this many questions instead."),
 ) -> None:
-    """Queue `s1 run CONFIG` (or `s1 ncu CONFIG`) as a batch job; logs go to logs/<jobid>.out."""
+    """Queue `s1 run CONFIG` (or `s1 ncu CONFIG`) on Slurm or Modal, per the config's [launch] table and
+    the flags (flags win). Without [launch] or --on it is a Slurm batch job; logs go to logs/<jobid>.out."""
     config.load(cfg)  # fail fast on a bad config before queueing
-    cmd = ["sbatch", "-J", f"s1-{cfg.stem}", "-c", str(cpus), f"--mem={mem}", "-t", time]
-    cmd += ["-o", "logs/%j.out"]
-    if partition is not None:
-        cmd += ["-p", partition]
-    if gpus:
-        cmd += [f"--gres=gpu:{'' if gpu_type is None else gpu_type + ':'}{gpus}"]
+    if on is not None and on not in config.ORCHESTRATORS:
+        raise typer.BadParameter(f"must be one of {', '.join(config.ORCHESTRATORS)}", param_hint="--on")
+    res = launch_resources(
+        cfg, on=on, partition=partition, gpu=gpu, gpus=gpus, gpu_type=gpu_type, cpus=cpus, mem=mem, time=time
+    )
     s1 = ["ncu", str(cfg), "--questions", str(ncu_questions)] if ncu_questions else ["run", str(cfg)]
-    cmd += ["--wrap", shlex.join(["uv", "run", "--extra", "openjev", "s1", *s1])]
-    console.print(shlex.join(cmd))
-    if not dry_run:
-        Path("logs").mkdir(exist_ok=True)
-        subprocess.run(cmd, check=True)
+    get_launcher(res.orchestrator).submit(cfg, res, s1, dry_run=dry_run)
 
 
 @app.command("ls")
