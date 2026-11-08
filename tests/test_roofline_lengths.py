@@ -2,23 +2,14 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from s1 import registry, runner
 from s1.benchmarks import jeval, roofline, shape_sweep
 from s1.config import RunSpec
 from tests.test_roofline import FakeProfiled, _no_gpu, row
-
-
-def test_fit_state_cuts_and_pads_with_real_filler():
-    counter = shape_sweep.WordCounter()
-    long = " ".join(f"s{i}" for i in range(50))
-    assert counter.count(roofline.fit_state(long, 16, counter, [])) == 16
-    short = "a b c"
-    out = roofline.fit_state(short, 12, counter, ["d e f g h", "i j k l m n"])
-    assert out == "a b c d e f g h i j k l"  # the state first, then filler, cut (words rejoined)
-    with pytest.raises(ValueError, match="not enough filler"):
-        roofline.fit_state(short, 100, counter, ["x"])
 
 
 def test_file_counter_fit_is_exact_with_a_real_tokenizer(tmp_path):
@@ -36,23 +27,48 @@ def test_file_counter_fit_is_exact_with_a_real_tokenizer(tmp_path):
         assert counter.count(counter.fit(text, n)) == n
 
 
-def test_length_rows_use_the_same_questions_at_every_length():
-    rows = [row(i, state_words=10 + i) for i in range(60)]
+def test_length_rows_cut_long_states_and_reuse_the_questions():
+    rows = [row(i, state_words=10 + 4 * i) for i in range(60)]  # states of 10 .. 246 words
+    rows = [
+        dataclasses.replace(r, state=" ".join(f"{r.id}w{j}" for j in range(len(r.state.split()))))
+        for r in rows
+    ]
     counter = shape_sweep.WordCounter()
-    tagged = roofline.length_rows(rows, counter, {"roofline_per_length": 5}, [8, 64])
-    assert [n for n, _ in tagged] == [8] * 5 + [64] * 5  # length-major
-    ids8 = [r.id for n, r in tagged if n == 8]
-    ids64 = [r.id for n, r in tagged if n == 64]
-    assert ids8 == ids64  # only the state length differs between points
-    assert {counter.count(r.state) for _, r in tagged} == {8, 64}
+    tagged = roofline.length_rows(rows, counter, {"roofline_per_length": 5}, [8, 64, 200])
+    assert [n for n, _ in tagged] == [8] * 5 + [64] * 5 + [200] * 5  # length-major
+    ids = {n: [r.id for m, r in tagged if m == n] for n in (8, 64, 200)}
+    assert ids[8] == ids[64] == ids[200]  # only the state length differs between points
+    assert {counter.count(r.state) for _, r in tagged} == {8, 64, 200}
     by_id = {r.id: r for r in rows}
-    for n, r in tagged:  # cut states keep the original's start; padded ones keep all of it
+    for n, r in tagged:  # each point is a prefix of that row's own state (no padding from other rows)
         original = by_id[r.id].state.split()
-        assert r.state.split()[: min(n, len(original))] == original[:n]
+        assert len(original) >= 200
+        assert r.state.split() == original[:n]
+
+
+def test_length_rows_skip_short_states_and_long_questions():
+    long_q = jeval.Row(
+        "long-q", "src", "noul", " ".join(["w"] * 100), {"q": {"type": "noul", "instructions": "x " * 300}}, 1
+    )
+    rows = [
+        row(0, state_words=10),
+        row(1, "score", state_words=100),
+        row(2, n_options=17, state_words=100),
+        long_q,
+    ]
+    rows += [row(10 + i, state_words=100) for i in range(3)]
+    tagged = roofline.length_rows(rows, shape_sweep.WordCounter(), {"roofline_per_length": 3}, [16, 64])
+    assert {r.id for _, r in tagged} == {"r10", "r11", "r12"}
+
+
+def test_length_rows_raise_when_too_few_states_are_long_enough():
+    rows = [row(i, state_words=50) for i in range(10)]
+    with pytest.raises(ValueError, match="only 0 JEVal rows have a state of at least 2048"):
+        roofline.length_rows(rows, shape_sweep.WordCounter(), {"roofline_per_length": 4}, [32, 2048])
 
 
 def _run(tmp_path, monkeypatch, *, grid):
-    rows = [row(i, "noul" if i % 2 else "choice", state_words=10 + i) for i in range(80)]
+    rows = [row(i, "noul" if i % 2 else "choice", state_words=10 + 8 * i) for i in range(80)]
     monkeypatch.setattr(jeval, "load_rows", lambda: rows)
     registry.MODELS["fake-profiled"] = lambda settings: FakeProfiled()
     try:

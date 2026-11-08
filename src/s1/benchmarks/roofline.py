@@ -17,16 +17,18 @@ The subset is the same for every model: choice and noul questions with at most `
 options whose state + question JSON is at most `roofline_max_tokens` tokens of one reference tokenizer
 (`roofline_tokenizer_file`, a tokenizer.json; words if unset), then a seeded sample.
 
-**State-length axis** (`[grid] roofline_state_tokens = [32, 128, 512, 1024, 2048]`): instead of natural
-JEVal lengths, every question's state is fitted to exactly each length in reference tokens (cut, or padded
-with other JEVal states, all real text), and the same `roofline_per_length` seeded questions run at every
-length, so only the state length differs between points. It places each model's forwards across every GPU's
-ridge (bf16 intensity grows with tokens; natural JEVal at <= 1024 tokens sits left of all of them).
-Per-length points are `roofline_s<L>_{tflops,intensity,bandwidth_gbs,n,tokens,gpu_ms}`; the headline keys
-pool all lengths. Accuracy at fitted lengths is not meaningful (cut states lose evidence): only timing and
-the roofline are. A backend that cuts its input (Laya: 512 / 1024 tokens) is charged for what it processed,
-so its long points stop growing. Without the axis the benchmark is exactly the natural mode (Nathan's
-records stay comparable).
+**State-length axis** (`[grid] roofline_state_tokens = [32, 128, 256, 512, 768, 1024, 1536, 2048]`): in place
+of natural JEVal lengths, `roofline_per_length` seeded questions whose own state is at least the longest
+length (in reference tokens) run at every length, each state cut to that length's prefix (`counter.fit`).
+Every point is a contiguous prefix of one real state and the same questions run at every length, so only the
+state length differs between points. It places each model's forwards across every GPU's ridge (bf16 intensity
+grows with tokens; natural JEVal at <= 1024 tokens sits left of all of them). Too few qualifying rows is an
+error, never a silent fallback. Per-length points are
+`roofline_s<L>_{tflops,intensity,bandwidth_gbs,n,tokens,gpu_ms,gpu_ms_median,gpu_ms_max}`; the headline keys
+pool all lengths. Accuracy at cut lengths is not meaningful (cut states lose evidence): only timing and the
+roofline are. A backend that cuts its input (Laya: 512 / 1024 tokens) is charged for what it processed, so its
+long points stop growing. Without the axis the benchmark is exactly the natural mode (Nathan's records stay
+comparable).
 
 The model must implement (see backends/semif.py, backends/elephant.py):
     profile_info() -> {"config": HF config dict, "head_bytes": int, "ceilings": {name: float}}
@@ -49,6 +51,7 @@ Settings (all optional):
     roofline_kernel_profile  1: note the CUDA kernels of one question in meta (roofline_kernels_top,
                            roofline_attention_kernel), traced after timing; 0: skip     default 1
     roofline_per_length    questions per state length (with the [grid] axis)        default 40
+    roofline_max_question_tokens  reference tokens of a length-axis question's JSON  default 256
     roofline_tokenizer_file
 """
 
@@ -141,33 +144,38 @@ class FittingCounter(TokenCounter, Protocol):
     def fit(self, text: str, tokens: int) -> str: ...
 
 
-def fit_state(state: str, tokens: int, counter: FittingCounter, filler: Sequence[str]) -> str:
-    """`state` made exactly `tokens` reference tokens long: cut, or padded with `filler` texts (other JEVal
-    states, in order) and then cut. Real text either way, so tokenizers see what they see in JEVal."""
-    text, extra = state, iter(filler)
-    while counter.count(text) < tokens:
-        nxt = next(extra, None)
-        if nxt is None:
-            raise ValueError(f"not enough filler text to reach {tokens} tokens")
-        text = f"{text}\n\n{nxt}"
-    return counter.fit(text, tokens)
-
-
 def length_rows(
     rows: Sequence[jeval.Row], counter: FittingCounter, settings: Settings, lengths: Sequence[int]
 ) -> list[tuple[int, jeval.Row]]:
-    """(length, row) for every length in `lengths` x the same `roofline_per_length` seeded subset rows, the
-    state fitted to that length. Ordered length-major (all questions at one length, then the next)."""
+    """(length, row) for every length in `lengths` x the same `roofline_per_length` seeded rows, states cut
+    to its first `length` reference tokens. Rows qualify when they are choice/noul with at most
+    `roofline_max_options` options, their question JSON is at most `roofline_max_question_tokens` tokens, and
+    their own state is at least max(lengths) tokens, so every point is a prefix of one real state. Ordered
+    length-major (all questions at one length, then the next). Raises if too few rows qualify."""
+    if not lengths:
+        raise ValueError(f"{LENGTH_AXIS} is empty")
     per = get_int(settings, "roofline_per_length", 40)
-    chosen = subset(rows, counter, {**settings, "roofline_limit": per})
-    ids = {r.id for r in chosen}
-    pool = [r.state for r in rows if r.id not in ids and r.state.strip()]
-    random.Random(get_int(settings, "roofline_seed", 0)).shuffle(pool)
+    max_options = get_int(settings, "roofline_max_options", 16)
+    max_question = get_int(settings, "roofline_max_question_tokens", 256)
+    longest = max(lengths)
+    keep = [
+        r
+        for r in rows
+        if r.qtype in TYPES
+        and options(r) <= max_options
+        and counter.count(json.dumps(r.questions, ensure_ascii=False)) <= max_question
+        and counter.count(r.state) >= longest
+    ]
+    if len(keep) < per:
+        raise ValueError(
+            f"only {len(keep)} JEVal rows have a state of at least {longest} reference tokens (and at most "
+            f"{max_options} options, {max_question} question tokens); roofline_per_length = {per}"
+        )
+    chosen = random.Random(get_int(settings, "roofline_seed", 0)).sample(keep, per)
     out: list[tuple[int, jeval.Row]] = []
     for n in lengths:
-        for i, r in enumerate(chosen):
-            filler = pool[i * 8 :] + pool[: i * 8]  # a different, seeded start per question
-            out.append((n, dataclasses.replace(r, state=fit_state(r.state, n, counter, filler))))
+        for r in chosen:
+            out.append((n, dataclasses.replace(r, state=counter.fit(r.state, n))))
     return out
 
 
