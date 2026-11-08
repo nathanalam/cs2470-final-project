@@ -8,6 +8,10 @@
 #          -o ~/probes/logs/%j.out ~/probes/profiling_probe.sh
 #
 # Output: stdout (the slurm log) and $OUT (default ~/probes/out/<jobid>) with the raw ncu/nsys files.
+# On Modal (MODAL_TASK_ID set) scripts/modal_probe.py runs this script; the Slurm guard is skipped there.
+# Overrides: PROBE_DIR, OUT, PYBIN, SIZES, TOOL_PATH (dirs prepended to PATH, default /usr/local/cuda/bin),
+# NCU_CLOCK_CONTROL (passed as `ncu --clock-control`; default: ncu's own (base) on Slurm, `none` on Modal,
+# where clock locking fails).
 # Sections: 0 node, a nvidia-smi fields and dmon, b DCGM, c ncu, d nsys, e GPU-metrics sampler idle vs busy.
 #SBATCH -J profiling-probe
 #SBATCH -p gpu
@@ -17,29 +21,35 @@
 #SBATCH -t 00:10:00
 set -u
 
-if [ -z "${SLURM_JOB_ID:-}" ]; then
+JOB="${SLURM_JOB_ID:-${MODAL_TASK_ID:-}}"
+if [ -z "$JOB" ]; then
     echo "not inside a Slurm allocation: refusing to run on the login node (sbatch me)" >&2
     exit 2
 fi
+if [ -n "${MODAL_TASK_ID:-}" ] && [ -z "${SLURM_JOB_ID:-}" ]; then
+    NCU_CLOCK_CONTROL="${NCU_CLOCK_CONTROL-none}"
+fi
+NCU_CC=()
+[ -n "${NCU_CLOCK_CONTROL:-}" ] && NCU_CC=(--clock-control "$NCU_CLOCK_CONTROL")
 
 # Slurm runs a COPY of this script from its spool dir, so look for ncu_smoke.py where sbatch was invoked
 HERE="${PROBE_DIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}}"
 [ -f "$HERE/ncu_smoke.py" ] || { echo "ncu_smoke.py not found in $HERE (sbatch from the directory holding it)" >&2; exit 2; }
-OUT="${OUT:-$HOME/probes/out/$SLURM_JOB_ID}"
+OUT="${OUT:-$HOME/probes/out/$JOB}"
 PY="${PYBIN:-$HOME/cs2470-final-project/.venv/bin/python}"   # read-only use of the shared venv's torch
 [ -x "$PY" ] || PY="$(command -v python3)"
 SIZES="${SIZES:-512,1024,2048,4096}"
 mkdir -p "$OUT"
 export PYTHONPATH="$HERE/pkg:${PYTHONPATH:-}"
 # ncu / nsys / nvcc live in /usr/local/cuda/bin on the compute nodes but are not on PATH
-export PATH="/usr/local/cuda/bin:$PATH"
+export PATH="${TOOL_PATH:-/usr/local/cuda/bin}:$PATH"
 
 hr() { printf '\n==== %s ====\n' "$*"; }
 run() { echo "\$ $*"; timeout "${T:-60}" "$@" 2>&1; echo "[exit $?]"; }
 
 # ---------------------------------------------------------------- 0. node
 hr "0. node"
-date -Is; hostname; echo "job $SLURM_JOB_ID partition ${SLURM_JOB_PARTITION:-?}"
+date -Is; hostname; echo "job $JOB partition ${SLURM_JOB_PARTITION:-?}"
 run nvidia-smi -L
 run nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv
 nvidia-smi | head -4 | tail -2    # banner shows "CUDA Version: X" = what the driver supports
@@ -127,8 +137,9 @@ else
     [ -n "$TENSOR" ] && METRICS="$METRICS,$TENSOR"
     echo "tensor metric used: ${TENSOR:-NONE FOUND}"
     echo "metrics: $METRICS"
+    echo "clock control: ${NCU_CLOCK_CONTROL:-ncu default (base)}"
     echo "--- profiling the matmul workload (sizes $SIZES)"
-    T=240 run ncu --target-processes all --csv --metrics "$METRICS" \
+    T=240 run ncu ${NCU_CC[@]+"${NCU_CC[@]}"} --target-processes all --csv --metrics "$METRICS" \
         --log-file "$OUT/ncu.csv" "$PY" "$HERE/ncu_smoke.py" run --sizes "$SIZES"
     if grep -q ERR_NVGPUCTRPERM "$OUT/ncu.csv" 2>/dev/null; then
         echo "!!! ncu: ERR_NVGPUCTRPERM -- exact message:"

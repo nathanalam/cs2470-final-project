@@ -135,3 +135,82 @@ cd ~/probes && sbatch -p gpu --gres=gpu:1 -c 4 --mem=16G -t 00:10:00 -J profilin
 ```
 Run `sbatch` from the directory holding `ncu_smoke.py`: Slurm runs a copy of the script from its spool
 directory. Raw ncu/nsys files land in `~/probes/out/<jobid>/`.
+
+## Modal
+
+The GPU sweep moves to Modal (the course workspace; credits are shared by the whole class, so probes stay at
+a few minutes each). `scripts/modal_probe.py` runs the same `profiling_probe.sh` and `ncu_smoke.py` inside a
+Modal container. **Status: built and tested locally, not yet run on Modal. The tables below are empty until
+the probe runs.**
+
+### Running the probe
+
+`modal` is not a dependency of s1; run the script through `uvx`. Auth is the user's own Modal profile, never
+a file in the repo.
+
+```bash
+uvx --python 3.12 --from modal==1.6.3 modal run scripts/modal_probe.py --gpu L4
+```
+```bash
+uvx --python 3.12 --from modal==1.6.3 modal run scripts/modal_probe.py --gpu 'H100!'
+```
+- `--gpu` takes `L4`, `A10`, `L40S`, `A100-80GB` or `H100!`. A plain `H100` is refused: Modal may upgrade it
+  to an H200. `--sizes` (default `512,1024,2048,4096`) are the matmul sizes.
+- The image (built once, CPU only): `debian_slim` Python 3.12, `torch==2.14.1` (the course starter's), and
+  Nsight Compute 2026.3.1.2 and Nsight Systems 2026.3.2.476 from NVIDIA's CUDA redist archive (the pair in
+  `redistrib_13.4.3.json`), sha256-checked, unpacked to `/opt/nvidia/{ncu,nsys}` and called through wrappers in
+  `/opt/nvidia/bin` (`TOOL_PATH`). DCGM is not installed, so section b should report `dcgmi: MISSING`.
+- One function call, `gpu=<--gpu>`, 4 CPUs, 16 GiB, 20 min timeout. In the container the script saves
+  `nvidia-smi -q`, prints a summary of it, then runs `profiling_probe.sh` with `MODAL_TASK_ID` set. That skips
+  the Slurm guard and runs ncu with `--clock-control none`.
+- Output: Modal volume `s1-probe-logs`, directory `<gpu>-<UTC stamp>-<id>/`, downloaded to
+  `logs/modal-probe-<gpu>-<stamp>-<id>/`: `probe.log` (the whole probe output), `summary.json` (GPU name,
+  driver, compute capability, tool versions, whether ncu ran or hit `ERR_NVGPUCTRPERM`, the
+  `RmProfilingAdminOnly` value), `nvidia-smi-q.txt`, `ncu.csv`, `ncu_query_metrics.txt`, the nsys reports.
+
+### What to check per GPU
+
+1. **Which GPU you got.** `nvidia-smi --query-gpu=name,compute_cap` and the `nvidia-smi -q` summary: product
+   name, compute capability, SM count (torch line in section 0), memory, driver and CUDA version, power limits
+   (current, default, max), persistence and virtualization mode. An `H100!` should be an H100 80GB HBM3 (sm90).
+2. **nvidia-smi fields** (section a): whether `utilization.memory`, `clocks.sm`, `clocks.mem` and
+   `clocks_event_reasons.active` return values inside the container, and whether `dmon -s t` gives PCIe rx/tx.
+   The `gpu_metrics = "detailed"` sampler depends on these.
+3. **DCGM** (section b): expected missing; note it if `dcgmi` is somehow present.
+4. **ncu** (section c): `RmProfilingAdminOnly` (it may not be readable under Modal's sandbox), whether the
+   profiled run produces `ncu.csv` or `ERR_NVGPUCTRPERM`, which tensor-pipe metric exists (Hopper may need a
+   different name than Ada's `sm__pipe_tensor_op_hmma_cycles_active`), the roofline table against the spec
+   peaks in `ncu_smoke.py` (`PEAKS`: L4 121 TFLOP/s and 300 GB/s; H100 SXM 989 TFLOP/s and 3.35 TB/s), and
+   how close ncu's TFLOP/s (unlocked clocks here) is to the unprofiled CUDA-event numbers.
+5. **nsys** (section d): CUDA trace and kernel summary, and whether `--gpu-metrics-devices=cuda-visible` works
+   (it needs the same counter permission as ncu).
+6. **GpuSampler idle vs busy** (section e): which detailed keys move, and the throttle mask under load (the
+   cluster L4 ran power-capped, mask `0x4`).
+
+### Results
+
+| | L4 | H100! |
+|---|---|---|
+| Modal task / date | | |
+| GPU, cc, SMs, memory | | |
+| driver / CUDA | | |
+| power limit (enforced / max) | | |
+| `RmProfilingAdminOnly` | | |
+| nvidia-smi detailed fields | | |
+| `dmon -s t` | | |
+| DCGM | | |
+| ncu (`--clock-control none`) | | |
+| ncu tensor metric | | |
+| nsys trace / GPU metrics | | |
+| 4096 bf16 matmul: ncu TFLOP/s, % peak, AI | | |
+| 4096 bf16 matmul: unprofiled TFLOP/s | | |
+| throttle under load | | |
+
+### Clock control in `s1 ncu`
+
+`s1.ncu` has an `ncu_clock_control` setting (`base` or `none`, ncu's `--clock-control`). The default is
+unchanged off Modal: `base`, ncu's own default, which locks clocks to base, and the flag is left off the command
+line. Inside a Modal container (`s1.env.orchestrator() == "modal"`) the default is `none`, because clock
+locking fails there. Every `s1 ncu` run records it as `roofline_hw_clocks_locked` in `results["roofline"]`
+(1 = base, 0 = none). Kernel times (`roofline_hw_kernel_ms`) from the two settings are not comparable: base
+clocks are lower than boost.

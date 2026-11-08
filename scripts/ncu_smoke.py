@@ -27,7 +27,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 # Spec-sheet peaks, dense bf16 tensor FLOP/s and DRAM bytes/s, by substring of the GPU name.
-PEAKS = {"L4": (121e12, 300e9), "A10G": (70e12, 600e9), "A100": (312e12, 1555e9)}
+# H100 is the SXM5 80 GB part Modal rents ("NVIDIA H100 80GB HBM3"); the PCIe card is lower (756e12, 2.0e12).
+PEAKS = {
+    "L4": (121e12, 300e9),
+    "A10G": (70e12, 600e9),
+    "A100": (312e12, 1555e9),
+    "H100": (989e12, 3350e9),
+}
 GEMM = re.compile(r"gemm|cutlass|xmma|nvjet|cublas|sm\d\d_", re.IGNORECASE)
 MARKER = re.compile(r"spin", re.IGNORECASE)
 UNIT_TO_S = {
