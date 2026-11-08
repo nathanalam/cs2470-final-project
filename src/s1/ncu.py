@@ -10,8 +10,14 @@ worker process), replays each kernel in that range and reads:
 
 so `roofline_hw_intensity` is the measured operational intensity, and `roofline_hw_tflops` divides the
 measured FLOPs by the same questions' GPU time from the run's timed pass (ncu's own kernel durations are taken
-at locked base clocks, so they are kept separately as `roofline_hw_kernel_ms`). `roofline_hw_flop_ratio` and
+at the clocks ncu sets, so they are kept separately as `roofline_hw_kernel_ms`). `roofline_hw_flop_ratio` and
 `roofline_hw_byte_ratio` compare the counters with the cost model (s1.flops) for the same forwards.
+
+Clock control (`ncu_clock_control`, ncu's `--clock-control`): "base" is ncu's default, which locks clocks to
+base (what every Slurm run so far used, and the flag is then left off the command line, so it is unchanged);
+"none" leaves the GPU's own clocks. On Modal the default is "none", because clock locking fails on Modal
+workers. The value is recorded as `roofline_hw_clocks_locked` (1 = base, 0 = none) next to the kernel times it
+qualifies.
 
 Torch-free: only parses ncu's `--csv --page raw` output.
 """
@@ -22,6 +28,7 @@ import csv
 import io
 from collections.abc import Mapping
 
+from . import env
 from .record import Metrics
 
 TENSOR = (
@@ -41,7 +48,9 @@ CORE = {  # CUDA-core instruction counts and the FLOPs each is worth
 DRAM = ("dram__bytes_read.sum", "dram__bytes_write.sum")
 TIME = "gpu__time_duration.sum"
 METRICS = (*TENSOR, *CORE, *DRAM, TIME)
-ARGS = (
+CLOCK_CONTROLS = ("base", "none")  # ncu --clock-control values that profile (ncu's "reset" just exits)
+META_CLOCK_CONTROL = "ncu_clock_control"  # meta field for the resolved value (written by `s1 ncu`)
+BASE_ARGS = (
     "--profile-from-start",
     "off",
     "--target-processes",
@@ -52,6 +61,23 @@ ARGS = (
     "--metrics",
     ",".join(METRICS),
 )
+
+
+def clock_control(explicit: str | None = None) -> str:
+    """The `ncu_clock_control` to use: `explicit` if set, else "none" on Modal, else "base" (the default)."""
+    value = explicit or ("none" if env.orchestrator() == "modal" else "base")
+    if value not in CLOCK_CONTROLS:
+        raise ValueError(f"ncu_clock_control must be one of {CLOCK_CONTROLS}, not {value!r}")
+    return value
+
+
+def args(clock: str | None = None) -> tuple[str, ...]:
+    """ncu's arguments for `s1 ncu`. "base" adds no flag: the cluster's command line is unchanged."""
+    clock = clock_control(clock)
+    return BASE_ARGS if clock == "base" else ("--clock-control", clock, *BASE_ARGS)
+
+
+ARGS = args()  # resolved for this process's orchestrator (with "none" inside a Modal container)
 
 
 def parse(text: str) -> list[dict[str, float]]:
@@ -75,8 +101,9 @@ def parse(text: str) -> list[dict[str, float]]:
     return out
 
 
-def summarize(kernels: list[dict[str, float]], run: Mapping[str, float]) -> Metrics:
-    """Totals over the profiled kernels, against the run's own `roofline_hw_*` numbers for the same work."""
+def summarize(kernels: list[dict[str, float]], run: Mapping[str, float], clock: str | None = None) -> Metrics:
+    """Totals over the profiled kernels, against the run's own `roofline_hw_*` numbers for the same work.
+    `clock` is the clock control the kernels ran under (default: this process's, as in `ARGS`)."""
     tensor = sum(k.get(m, 0.0) for k in kernels for m in TENSOR)
     core = sum(k.get(m, 0.0) * w for k in kernels for m, w in CORE.items())
     dram = sum(k.get(m, 0.0) for k in kernels for m in DRAM)
@@ -98,4 +125,5 @@ def summarize(kernels: list[dict[str, float]], run: Mapping[str, float]) -> Metr
         "roofline_hw_byte_ratio": ratio(dram, theory_bytes),
         "roofline_hw_kernels": float(len(kernels)),
         "roofline_hw_kernel_ms": sum(k.get(TIME, 0.0) for k in kernels) / 1e6,
+        "roofline_hw_clocks_locked": 1.0 if clock_control(clock) == "base" else 0.0,
     }
