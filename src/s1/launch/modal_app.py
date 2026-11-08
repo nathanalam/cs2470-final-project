@@ -10,6 +10,7 @@
     [launch.modal]        # optional, see EXTRAS
     openjev = true        # install the openjev extra (vLLM, transformers); default: true iff gpu is set
     echo = true           # register a built-in fake model "echo" (tests' EchoModel) for a CPU round trip
+    runtime = "default"   # which image (s1/launch/modal_images.py RUNTIMES): default, elephant, granite
     hf_secret = "hf"      # a Modal secret holding HF_TOKEN, for gated repos
 
 What runs where:
@@ -47,28 +48,24 @@ from typing import Any, TypedDict
 
 from .. import config, env
 from ..record import RESULTS_DIR, RunRecord, Scalar
+from . import modal_images
 from .base import Resources
+from .modal_images import (
+    HF_MOUNT,
+    IMAGE_ENV,
+    MODELS_MOUNT,
+    PYTHON,
+    REPO_ROOT,
+    WORKDIR,
+)
 
 APP_NAME = "s1"
-PYTHON = "3.12"
-UV_VERSION = "0.13.5"  # uv.lock is lock revision 5; pin the uv that reads it
-CUDA_DEVEL_IMAGE = "nvidia/cuda:13.0.3-devel-ubuntu24.04"  # GPU image base: nvcc for FlashInfer's JIT
-REPO_ROOT = Path(__file__).resolve().parents[3]
-WORKDIR = "/root/s1"  # container cwd: src/, configs/ and the submitted config live here
 VENV_PYTHON = "/.uv/.venv/bin/python"  # where Image.uv_sync puts the environment
-MODELS_MOUNT = "/models"
-HF_MOUNT = "/hf-cache"
 RUNS_MOUNT = "/runs"
 VOLUMES: Mapping[str, str] = {MODELS_MOUNT: "s1-models", HF_MOUNT: "s1-hf-cache", RUNS_MOUNT: "s1-runs"}
-IMAGE_ENV: Mapping[str, str] = {
-    "PYTHONPATH": f"{WORKDIR}/src",
-    "MODELS_DIR": MODELS_MOUNT,
-    "HF_HOME": HF_MOUNT,
-    "PYTHONUNBUFFERED": "1",
-}
 RUN_DIR = "{run_dir}"  # placeholder in planned args, filled in the container with /runs/<function call id>
 MAX_TIMEOUT_S = 24 * 3600
-EXTRAS = {"openjev", "echo", "hf_secret"}
+EXTRAS = {"openjev", "echo", "hf_secret", "runtime"}
 DOWNLOAD_CPU, DOWNLOAD_MEMORY_MIB, DOWNLOAD_TIMEOUT_S = 8.0, 16 * 1024, 4 * 3600  # as download_model.sh
 
 
@@ -160,14 +157,13 @@ class ModalPlan:
     cfg_text: str
     s1_args: tuple[str, ...]  # contains RUN_DIR, filled in remotely
     env: Mapping[str, str] = field(default_factory=dict)  # passed to the remote command
+    runtime: str = "default"  # [launch.modal] runtime: which modal_images image
 
     def describe(self) -> str:
-        extra = "--extra openjev" if self.openjev else "(base dependencies)"
         vols = ", ".join(f"{name} -> {mount}" for mount, name in VOLUMES.items())
         cmd = shlex.join(["s1", *(a.replace(RUN_DIR, f"{RUNS_MOUNT}/CALL_ID") for a in self.s1_args)])
         lines = [
-            f"modal app {APP_NAME!r}, image: python {PYTHON} + uv {UV_VERSION} sync --frozen {extra}"
-            f" + src/ configs/ at {WORKDIR}",
+            f"modal app {APP_NAME!r}, image: {modal_images.describe(self.runtime, openjev=self.openjev)}",
             f"  gpu={self.gpu!r} cpu={self.cpu:g} memory={self.memory_mib} MiB timeout={self.timeout_s} s",
             f"  volumes: {vols}",
             f"  env: {', '.join(f'{k}={v}' for k, v in {**IMAGE_ENV, **self.env}.items())}",
@@ -231,6 +227,7 @@ def plan(
         timeout_s=timeout_s(resources.time),
         openjev=bool(extras.get("openjev", kind is not None)),
         echo=bool(extras.get("echo", False)),
+        runtime=modal_images.check_runtime(str(extras.get("runtime", "default"))),
         hf_secret=None if hf_secret is None else str(hf_secret),
         cfg_remote=cfg_remote,
         cfg_text=cfg.read_text(),
@@ -314,26 +311,8 @@ def _check_python() -> None:
         raise RuntimeError(f"launch from Python {PYTHON} (this is {here}): uv run --python {PYTHON} ...")
 
 
-def _image(modal: ModuleType, *, openjev: bool) -> object:
-    if openjev:
-        # GPU runs need a CUDA toolkit at /usr/local/cuda, as on the cluster nodes: FlashInfer JIT-compiles
-        # its sampling kernel with nvcc during vLLM's warmup (debian_slim has no nvcc: vLLM failed to start).
-        # 13.0 matches torch 2.13.0's CUDA build and the cluster's toolkit. Triton needs gcc for its launcher.
-        base = (
-            modal.Image.from_registry(CUDA_DEVEL_IMAGE, add_python=PYTHON)
-            .apt_install("gcc", "libc6-dev")
-            .env({"CUDA_HOME": "/usr/local/cuda"})
-        )
-    else:
-        base = modal.Image.debian_slim(python_version=PYTHON)
-    return (
-        base.uv_sync(
-            str(REPO_ROOT), extras=["openjev"] if openjev else [], frozen=True, uv_version=UV_VERSION
-        )
-        .env(dict(IMAGE_ENV))
-        .add_local_dir(REPO_ROOT / "src", f"{WORKDIR}/src", ignore=["**/__pycache__", "**/*.pyc"])
-        .add_local_dir(REPO_ROOT / "configs", f"{WORKDIR}/configs")
-    )
+def _image(modal: ModuleType, *, openjev: bool, runtime: str = "default") -> object:
+    return modal_images.image(modal, runtime=runtime, openjev=openjev)
 
 
 def _volumes(modal: ModuleType) -> dict[str, object]:
@@ -374,7 +353,7 @@ class ModalLauncher:
         app = modal.App(APP_NAME)
         volumes = _volumes(modal)
         fn = app.function(
-            image=_image(modal, openjev=p.openjev),
+            image=_image(modal, openjev=p.openjev, runtime=p.runtime),
             gpu=p.gpu,
             cpu=p.cpu,
             memory=p.memory_mib,
