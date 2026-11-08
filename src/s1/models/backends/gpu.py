@@ -10,10 +10,10 @@ Settings (all optional):
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ... import env
 from ...record import Scalar
 from ...registry import get_str
 
@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 
 def models_dir() -> Path:
-    return Path(os.environ.get("MODELS_DIR", f"/shared/home/{os.environ.get('USER', '')}/models"))
+    return env.models_dir()
 
 
 def download_hint(repo: str, revision: str | None, name: str) -> str:
