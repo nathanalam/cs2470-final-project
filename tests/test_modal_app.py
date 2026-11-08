@@ -147,6 +147,15 @@ def test_config_require_gpu_is_kept_or_rejected():
     assert "--set" not in p.s1_args
     with pytest.raises(ValueError, match="contradicts"):
         ma.plan(cfg, modal_resources(gpu="H100"), ["run", str(cfg)], git_commit="x")
+    with pytest.raises(ValueError, match="no GPU requested"):
+        ma.plan(cfg, modal_resources(), ["run", str(cfg)], git_commit="x")
+
+
+def test_slurm_flags_are_rejected_on_modal(tmp_path):
+    cfg = tmp_path / "x.toml"
+    cfg.write_text(CPU_CFG)
+    with pytest.raises(ValueError, match="partition"):
+        ma.plan(cfg, modal_resources(extras={"partition": "gpu-spec"}), ["run", str(cfg)], git_commit="x")
 
 
 def test_ncu_plan_gets_results_dir_but_no_set(tmp_path):

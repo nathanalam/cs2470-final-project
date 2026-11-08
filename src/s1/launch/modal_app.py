@@ -193,10 +193,16 @@ def _cfg_remote(cfg: Path) -> str:
         return f"configs/submitted/{cfg.name}"
 
 
-def _require_gpu_args(cfg: Path, kind: GpuKind) -> list[str]:
+def _require_gpu_args(cfg: Path, kind: GpuKind | None) -> list[str]:
     """`--set require_gpu=...` unless the config sets it already (then it must agree with the request)."""
     found = ((s.invariants | s.params).get("require_gpu", "") for s in config.load(cfg))
     given = {str(r) for r in found if r != ""}
+    if kind is None:
+        if given:
+            raise ValueError(
+                f"{cfg}: require_gpu = {sorted(given)} but no GPU requested; pass --gpu or [launch] gpu"
+            )
+        return []
     for req in sorted(given):
         if _norm(req) not in _norm(kind.example):
             raise ValueError(f"{cfg}: require_gpu = {req!r} contradicts [launch] gpu ({kind.example})")
@@ -213,8 +219,9 @@ def plan(
     args = [cfg_remote if a == str(cfg) else a for a in s1_args]
     if args[:1] in (["run"], ["ncu"]):
         args += ["--results-dir", f"{RUN_DIR}/results"]
-    if args[:1] == ["run"] and kind is not None:
-        args += _require_gpu_args(cfg, kind)
+    if args[:1] in (["run"], ["ncu"]):
+        required = _require_gpu_args(cfg, kind)
+        args += required if args[:1] == ["run"] else []  # `s1 ncu` takes no --set
     hf_secret = extras.get("hf_secret")
     return ModalPlan(
         gpu=modal_gpu(resources.gpu, resources.gpus),
