@@ -221,7 +221,8 @@ class SemIf:
 
         if self.recorder is not None:
             self.recorder.close()
-        self.model = self.recorder = None  # ty: ignore[invalid-assignment]
+        self.recorder = None
+        del self.model
         gc.collect()
         torch.cuda.empty_cache()
 

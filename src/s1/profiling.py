@@ -195,8 +195,8 @@ def kernel_env(model: Any = None) -> dict[str, str]:  # noqa: ANN401
     """Which fast kernels this process can use; transformers falls back to plain torch without them."""
     import torch  # noqa: PLC0415
 
-    env = {
-        "torch": torch.__version__,
+    env: dict[str, str] = {
+        "torch": str(torch.__version__),
         "cuda": str(torch.version.cuda),
         "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
     }
