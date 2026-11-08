@@ -43,7 +43,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from .. import config, env
 from ..record import RESULTS_DIR, RunRecord, Scalar
@@ -347,7 +347,8 @@ def build_image(*, openjev: bool = False) -> None:
     modal = _modal()
     app = modal.App(APP_NAME)
     with modal.enable_output(), app.run():
-        _image(modal, openjev=openjev).build(app)  # instance method: Image.build(self, app)
+        image: Any = _image(modal, openjev=openjev)  # a modal.Image (modal is imported lazily)
+        image.build(app)  # instance method: Image.build(self, app)
 
 
 @dataclass
