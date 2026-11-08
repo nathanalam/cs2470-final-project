@@ -52,6 +52,7 @@ from .base import Resources
 APP_NAME = "s1"
 PYTHON = "3.12"
 UV_VERSION = "0.13.5"  # uv.lock is lock revision 5; pin the uv that reads it
+CUDA_DEVEL_IMAGE = "nvidia/cuda:13.0.3-devel-ubuntu24.04"  # GPU image base: nvcc for FlashInfer's JIT
 REPO_ROOT = Path(__file__).resolve().parents[3]
 WORKDIR = "/root/s1"  # container cwd: src/, configs/ and the submitted config live here
 VENV_PYTHON = "/.uv/.venv/bin/python"  # where Image.uv_sync puts the environment
@@ -311,9 +312,17 @@ def _check_python() -> None:
 
 
 def _image(modal: ModuleType, *, openjev: bool) -> object:
-    base = modal.Image.debian_slim(python_version=PYTHON)
-    if openjev:  # Triton (vLLM, flash-linear-attention) compiles a small C launcher at runtime
-        base = base.apt_install("gcc", "libc6-dev")
+    if openjev:
+        # GPU runs need a CUDA toolkit at /usr/local/cuda, as on the cluster nodes: FlashInfer JIT-compiles
+        # its sampling kernel with nvcc during vLLM's warmup (debian_slim has no nvcc: vLLM failed to start).
+        # 13.0 matches torch 2.13.0's CUDA build and the cluster's toolkit. Triton needs gcc for its launcher.
+        base = (
+            modal.Image.from_registry(CUDA_DEVEL_IMAGE, add_python=PYTHON)
+            .apt_install("gcc", "libc6-dev")
+            .env({"CUDA_HOME": "/usr/local/cuda"})
+        )
+    else:
+        base = modal.Image.debian_slim(python_version=PYTHON)
     return (
         base.uv_sync(
             str(REPO_ROOT), extras=["openjev"] if openjev else [], frozen=True, uv_version=UV_VERSION
