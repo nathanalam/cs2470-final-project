@@ -1,0 +1,48 @@
+# M4 GPU sweep: granite4-h-tiny WITH its fused Mamba kernels (the midterm's planned rerun). STATE-LENGTH AXIS.
+# roofline_sweep_granite_fused.toml plus [grid] roofline_state_tokens: the same 40 seeded JEVal questions with their state
+# fitted to exactly 32, 128, 512, 1024 and 2048 reference tokens (200 forwards per model, as in the
+# natural runs), so every model crosses each GPU's ridge (A100 153, H200 206, B200 292, H100 295,
+# L4 403 FLOP/byte). Timing and roofline only: accuracy at fitted lengths is not meaningful.
+# configs/roofline_l4.toml (Nathan's cluster L4 settings: 200 questions, seed 0, same warmup and counted)
+# unchanged except where it runs: [launch] fans out across five Modal GPUs, gpu_metrics is detailed
+# (every Modal GPU run), and require_gpu comes from the launcher, one per GPU.
+# Granite only: LFM2 and the others must not run on this runtime (they would pick up causal-conv1d).
+#   uv run --group modal s1 submit configs/roofline_sweep_granite_fused_lengths.toml              (all five GPUs)
+#   uv run --group modal s1 submit configs/roofline_sweep_granite_fused_lengths.toml --gpu H100   (one of them)
+benchmarks = ["roofline"]
+
+[launch]
+orchestrator = "modal"
+gpu = ["L4", "A100-80GB", "H100", "H200", "B200"]  # one container per GPU, run concurrently; require_gpu is set per GPU by the launcher
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "02:00:00"
+
+[launch.modal]
+runtime = "granite"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+dtype = "bfloat16"
+measure_ceilings = true
+max_prompt_tokens = 16384
+semif_max_options = 16
+
+[params]
+roofline_limit = 200
+roofline_seed = 0
+roofline_max_tokens = 1024
+roofline_max_options = 16
+roofline_warmup = 8
+roofline_counted = 8
+roofline_per_length = 40
+roofline_tokenizer_file = "$MODELS_DIR/Qwen3.5-4B-Base/tokenizer.json"
+
+[sweep]
+model = ["granite4-h-tiny.zeroshot"]
+
+[grid]
+roofline_state_tokens = [32, 128, 512, 1024, 2048]

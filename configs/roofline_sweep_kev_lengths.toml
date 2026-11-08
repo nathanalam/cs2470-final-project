@@ -1,0 +1,43 @@
+# M4 GPU sweep: the two Kev variants (upstream code in $MODELS_DIR/kev-code). STATE-LENGTH AXIS.
+# roofline_sweep_kev.toml plus [grid] roofline_state_tokens: the same 40 seeded JEVal questions with their state
+# fitted to exactly 32, 128, 512, 1024 and 2048 reference tokens (200 forwards per model, as in the
+# natural runs), so every model crosses each GPU's ridge (A100 153, H200 206, B200 292, H100 295,
+# L4 403 FLOP/byte). Timing and roofline only: accuracy at fitted lengths is not meaningful.
+# configs/roofline_l4_kev.toml (Nathan's cluster L4 settings: 200 questions, seed 0, same warmup and counted)
+# unchanged except where it runs: [launch] fans out across five Modal GPUs, gpu_metrics is detailed
+# (every Modal GPU run), and require_gpu comes from the launcher, one per GPU.
+#   uv run --group modal s1 submit configs/roofline_sweep_kev_lengths.toml              (all five GPUs)
+#   uv run --group modal s1 submit configs/roofline_sweep_kev_lengths.toml --gpu H100   (one of them)
+benchmarks = ["roofline"]
+
+[launch]
+orchestrator = "modal"
+gpu = ["L4", "A100-80GB", "H100", "H200", "B200"]  # one container per GPU, run concurrently; require_gpu is set per GPU by the launcher
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "02:00:00"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+dtype = "bfloat16"
+measure_ceilings = true
+max_prompt_tokens = 16384
+
+[params]
+roofline_limit = 200
+roofline_seed = 0
+roofline_max_tokens = 1024
+roofline_max_options = 16
+roofline_warmup = 200
+roofline_counted = 0
+roofline_per_length = 40
+roofline_tokenizer_file = "$MODELS_DIR/Qwen3.5-4B-Base/tokenizer.json"
+
+[sweep]
+model = ["kev-4b.hybrid", "kev-4b.qwen3"]
+
+[grid]
+roofline_state_tokens = [32, 128, 512, 1024, 2048]
