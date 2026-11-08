@@ -45,10 +45,9 @@ import math
 import random
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Protocol
 
-from .. import flops
+from .. import env, flops
 from ..record import Metrics, summarize
 from ..registry import Settings, benchmark, get_int, get_str
 from . import jeval
@@ -222,7 +221,7 @@ def forward(f: Mapping[str, object]) -> flops.Forward:
 
 def _counter(settings: Settings) -> TokenCounter:
     path = get_str(settings, "roofline_tokenizer_file", "")
-    return FileTokenCounter(str(Path(path).expanduser())) if path else WordCounter()
+    return FileTokenCounter(str(env.resolve_path(path))) if path else WordCounter()
 
 
 @benchmark("roofline")

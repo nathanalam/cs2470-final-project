@@ -20,7 +20,7 @@ tensor_parallel_size = 4
 quantization = "none"
 max_model_len = 16384
 state_tokenizer = "file"
-state_tokenizer_file = "/shared/home/$USER/models/openjev/tokenizer.json"
+state_tokenizer_file = "$MODELS_DIR/openjev/tokenizer.json"
 
 [params]
 model = "openjev"

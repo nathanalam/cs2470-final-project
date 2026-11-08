@@ -50,3 +50,22 @@ def test_git_commit_from_checkout() -> None:
 def test_resources_defaults() -> None:
     r = Resources(orchestrator="modal", gpu="H100")
     assert (r.gpus, r.cpus, r.mem, r.time, dict(r.extras)) == (1, 8, "32G", "01:00:00", {})
+
+
+def test_resolve_path_models_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`$MODELS_DIR` resolves on Modal (variable set) and on the cluster (unset: the default layout)."""
+    monkeypatch.setenv("MODELS_DIR", "/models")
+    assert env.resolve_path("$MODELS_DIR/openjev/tokenizer.json") == Path("/models/openjev/tokenizer.json")
+    assert env.resolve_path("${MODELS_DIR}/x.json") == Path("/models/x.json")
+    monkeypatch.delenv("MODELS_DIR")
+    monkeypatch.setenv("USER", "noa")
+    want = Path("/shared/home/noa/models/openjev/tokenizer.json")
+    assert env.resolve_path("$MODELS_DIR/openjev/tokenizer.json") == want
+
+
+def test_resolve_path_other_vars_and_home(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOME", "/home/noa")
+    monkeypatch.setenv("TOK", "/t")
+    assert env.resolve_path("~/models/a.json") == Path("/home/noa/models/a.json")
+    assert env.resolve_path("$TOK/a.json") == Path("/t/a.json")
+    assert env.resolve_path("$MODELS_DIRX/a.json") == Path("$MODELS_DIRX/a.json")  # not the same variable

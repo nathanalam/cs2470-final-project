@@ -11,6 +11,9 @@ Environment variables read:
     S1_LOG_DIR        where server logs go (vLLM, shim, ncu); default ./logs
     MODELS_DIR        model weights; default /shared/home/$USER/models (the cluster layout)
 
+File paths in configs (tokenizer files and the like) go through `resolve_path`, so a config can write
+`$MODELS_DIR/<model>/tokenizer.json` and run unchanged on Slurm and Modal.
+
 Record fields (names are fixed here so every workstream writes the same keys):
     meta[META_ORCHESTRATOR]       "slurm" | "modal" | "local", on every new record
     meta["slurm_job_id"]          unchanged: Slurm runs only
@@ -28,6 +31,7 @@ and putting it in invariants would split new Slurm runs from the existing ones i
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Literal
@@ -84,3 +88,14 @@ def log_dir() -> Path:
 def models_dir() -> Path:
     """$MODELS_DIR, default /shared/home/$USER/models."""
     return Path(os.environ.get("MODELS_DIR", f"/shared/home/{os.environ.get('USER', '')}/models"))
+
+
+_MODELS_VAR = re.compile(r"\$(?:MODELS_DIR\b|\{MODELS_DIR\})")
+
+
+def resolve_path(value: str) -> Path:
+    """A path from a config: `$MODELS_DIR` / `${MODELS_DIR}` become `models_dir()` (set or not), then
+    other `$VARS` and `~` are expanded. Write model files as `$MODELS_DIR/...` so one config runs on every
+    orchestrator."""
+    portable = _MODELS_VAR.sub(lambda _: str(models_dir()), value)
+    return Path(os.path.expandvars(portable)).expanduser()
