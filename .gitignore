@@ -4,3 +4,7 @@ __pycache__/
 .pytest_cache/
 logs/
 runtimes/elephant/OneJev/
+
+# autonomous-run state (docs/milestones/M1-M2.md)
+.claude/gpu-ledger.json
+.claude/worktrees/

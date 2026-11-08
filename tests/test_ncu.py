@@ -71,9 +71,63 @@ def test_summarize_without_run_numbers_is_nan_not_an_error():
 
 
 def test_ncu_profiles_children_from_a_range():
-    args = list(ncu.ARGS)
-    assert args[args.index("--profile-from-start") + 1] == "off"
-    assert args[args.index("--target-processes") + 1] == "all"  # elephant-1's worker is a child process
+    for clock in ncu.CLOCK_CONTROLS:
+        args = list(ncu.args(clock))
+        assert args[args.index("--profile-from-start") + 1] == "off"
+        assert args[args.index("--target-processes") + 1] == "all"  # elephant-1's worker is a child
+
+
+@pytest.fixture
+def on_slurm(monkeypatch):
+    monkeypatch.delenv("MODAL_TASK_ID", raising=False)
+    monkeypatch.setenv("SLURM_JOB_ID", "4233")
+
+
+@pytest.fixture
+def on_modal(monkeypatch):
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    monkeypatch.setenv("MODAL_TASK_ID", "ta-01TEST")
+
+
+def test_clock_control_default_is_unchanged_off_modal(on_slurm):
+    assert ncu.clock_control() == "base"
+    assert ncu.args() == ncu.BASE_ARGS  # no --clock-control flag: the cluster command line is as before
+    assert "--clock-control" not in ncu.ARGS  # tests import ncu off Modal
+
+
+def test_clock_control_is_none_on_modal(on_modal):
+    assert ncu.clock_control() == "none"
+    args = list(ncu.args())
+    assert args[args.index("--clock-control") + 1] == "none"
+    assert args[2:] == list(ncu.BASE_ARGS)
+
+
+def test_explicit_clock_control_wins(on_modal):
+    assert ncu.clock_control("base") == "base"
+    assert ncu.args("none")[:2] == ("--clock-control", "none")
+
+
+def test_explicit_none_off_modal(on_slurm):
+    assert ncu.args("none")[:2] == ("--clock-control", "none")
+
+
+def test_explicit_base_on_modal_adds_no_flag(on_modal):
+    assert ncu.args("base") == ncu.BASE_ARGS
+
+
+def test_bad_clock_control():
+    with pytest.raises(ValueError, match="ncu_clock_control"):
+        ncu.clock_control("boost")
+
+
+def test_clock_control_is_recorded_on_modal(on_modal):
+    kernels = ncu.parse(csv_text(BF16_GEMM))
+    assert ncu.summarize(kernels, {})["roofline_hw_clocks_locked"] == 0.0  # Modal default: none
+    assert ncu.summarize(kernels, {}, clock="base")["roofline_hw_clocks_locked"] == 1.0
+
+
+def test_clock_control_recorded_as_locked_on_slurm(on_slurm):
+    assert ncu.summarize(ncu.parse(csv_text(BF16_GEMM)), {})["roofline_hw_clocks_locked"] == 1.0
 
 
 @pytest.mark.parametrize(

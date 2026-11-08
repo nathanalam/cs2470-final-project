@@ -35,6 +35,8 @@ Settings (all optional):
     roofline_warmup        questions answered untimed first           default 8
     roofline_counted       questions re-run under FlopCounterMode     default 8
     roofline_ncu           questions re-run in a CUDA profiler range  default 0 (set by `s1 ncu` runs)
+    roofline_kernel_profile  1: note the CUDA kernels of one question in meta (roofline_kernels_top,
+                           roofline_attention_kernel), traced after timing; 0: skip     default 1
     roofline_tokenizer_file
 """
 
@@ -45,12 +47,11 @@ import math
 import random
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Protocol
 
-from .. import flops
+from .. import env, flops
 from ..record import Metrics, summarize
-from ..registry import Settings, benchmark, get_int, get_str
+from ..registry import Settings, benchmark, get_int, get_str, note
 from . import jeval
 from .shape_sweep import FileTokenCounter, TokenCounter, WordCounter
 
@@ -222,7 +223,7 @@ def forward(f: Mapping[str, object]) -> flops.Forward:
 
 def _counter(settings: Settings) -> TokenCounter:
     path = get_str(settings, "roofline_tokenizer_file", "")
-    return FileTokenCounter(str(Path(path).expanduser())) if path else WordCounter()
+    return FileTokenCounter(str(env.resolve_path(path))) if path else WordCounter()
 
 
 @benchmark("roofline")
@@ -269,11 +270,40 @@ def run(model: object, settings: Settings) -> Metrics:
         q = questions[i]
         questions[i] = Question(q.cost, q.forwards, q.outcome, counted, q.real_tokens)
 
+    # skipped under `s1 ncu`: torch.profiler's CUPTI tracing and Nsight Compute must not share a process
+    if rows and get_int(settings, "roofline_kernel_profile", 1) and not get_int(settings, "roofline_ncu", 0):
+        record_kernels(prof, rows[0])
+
     gpu = str(settings.get("gpu", ""))
     m = metrics(questions, arch, ceilings, gpu, wall_s)
     if n_hw := get_int(settings, "roofline_ncu", 0):
         m |= hardware_region(prof, rows[:n_hw], questions[:n_hw], arch, sizes)
     return m
+
+
+def record_kernels(prof: Profiled, row: jeval.Row, top: int = 10) -> None:
+    """Answer `row` once more under torch.profiler and note which CUDA kernels ran (after the timed passes, so
+    tracing overhead never reaches a timing). PyTorch picks attention kernels per GPU, so compare these before
+    comparing GPUs. Best effort: a backend whose kernels run in another process (elephant-1) notes
+    "none seen"."""
+    from .. import profiling  # noqa: PLC0415 — imports torch lazily inside
+
+    try:
+        events = profiling.profile_kernels(lambda: jeval.ask(prof, row))
+    except Exception as e:  # a profiler failure must not lose the run
+        note("roofline_kernels_error", f"{type(e).__name__}: {e}"[:300])
+        return
+    finally:
+        prof.take_forwards()
+    every = profiling.kernel_shares(
+        events, top=None
+    )  # attention can sit below the top 10 (MoE: expert GEMMs)
+    note("roofline_kernels_seen", len(every))
+    note("roofline_kernels_top", "; ".join(f"{s:.1%} {name[:120]}" for name, s in every[:top]) or "none seen")
+    attention = profiling.attention_kernel(every)
+    note("roofline_attention_kernel", attention or "none seen")
+    if attention is not None:
+        note("roofline_attention_share", round(dict(every)[attention], 4))
 
 
 def hardware_region(

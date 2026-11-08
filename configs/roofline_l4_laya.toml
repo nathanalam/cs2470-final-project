@@ -18,7 +18,7 @@ roofline_max_tokens = 1024
 roofline_max_options = 16
 roofline_warmup = 8
 roofline_counted = 8
-roofline_tokenizer_file = "~/models/Qwen3.5-4B-Base/tokenizer.json"
+roofline_tokenizer_file = "$MODELS_DIR/Qwen3.5-4B-Base/tokenizer.json"
 
 [sweep]
 model = ["laya.english", "laya.multilingual"]

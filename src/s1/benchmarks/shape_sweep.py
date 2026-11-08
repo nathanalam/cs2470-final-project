@@ -23,7 +23,7 @@ Settings (all optional):
     shape_min_point_s  keep repeating a point until this many seconds passed     default 2.0
     shape_unique_states  a fresh state for every repetition (see above)          default true
     state_tokenizer    name of the token counter (see TOKENIZERS)                default "approx_words"
-    state_tokenizer_file  tokenizer.json for state_tokenizer = "file"; ~ and $VARS are expanded
+    state_tokenizer_file  tokenizer.json for state_tokenizer = "file"; $MODELS_DIR, ~ and $VARS are expanded
     state_seed         seed of the synthetic state text                          default 0
 
 The state length is measured by a `TokenCounter`, and the ACTUAL count of every point is recorded
@@ -45,15 +45,14 @@ from __future__ import annotations
 import contextlib
 import itertools
 import math
-import os
 import random
 import statistics
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Protocol
 
+from .. import env
 from ..gpu_stats import GpuSampler, sample_point
 from ..record import Metrics
 from ..registry import Settings, benchmark, get_bool, get_float, get_int, get_str
@@ -174,7 +173,7 @@ class FileTokenCounter:
             from tokenizers import Tokenizer  # noqa: PLC0415 — heavy and optional
         except ImportError as e:
             raise ImportError("state_tokenizer = 'file' needs the `tokenizers` package") from e
-        self.path = Path(os.path.expandvars(path)).expanduser()
+        self.path = env.resolve_path(path)
         self._tokenizer = Tokenizer.from_file(str(self.path))
 
     def count(self, text: str) -> int:
