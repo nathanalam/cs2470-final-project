@@ -3,7 +3,9 @@
 runs changes nothing; the pre-commit hook (scripts/hooks/pre-commit) runs `s1 report` every commit.
 
 Benchmark-agnostic: a benchmark's columns are its first metric (the headline) plus whichever of the
-conventional `<bench>_<suffix>` keys it reports (see AGENTS.md "Adding a benchmark").
+conventional `<bench>_<suffix>` keys it reports (see AGENTS.md "Adding a benchmark"). Every table names the
+platform a run was on ("cluster" when `invariants.platform` is absent, else e.g. "Modal"), and run details add
+a telemetry digest (`telemetry()`) for records that carry the newer hardware fields.
 """
 
 from __future__ import annotations
@@ -83,6 +85,11 @@ def model_of(r: RunRecord) -> str:
     return str(r.params.get("model", "?"))
 
 
+def platform(r: RunRecord) -> str:
+    """ "cluster" (no `invariants.platform`: the HUIT cluster) or "Modal"."""
+    return report_roofline.platform(r.invariants)
+
+
 def hardware(r: RunRecord, bench: str) -> str:
     gpu = str(r.invariants.get("gpu", "?")).removeprefix("NVIDIA ")
     count = r.results.get(f"{bench}/nvidia_smi", {}).get("gpu_count")
@@ -130,9 +137,15 @@ def leaderboard(bench: str, recs: Sequence[RunRecord]) -> Table:
     for r in best_per_model(bench, recs):
         m = r.results[bench]
         rows.append(
-            [model_of(r), *(fmt(k, m[k]) if k in m else DASH for k in keys), hardware(r, bench), r.run_id]
+            [
+                model_of(r),
+                *(fmt(k, m[k]) if k in m else DASH for k in keys),
+                platform(r),
+                hardware(r, bench),
+                r.run_id,
+            ]
         )
-    return Table(["Model", *(label(bench, k) for k in keys), "Hardware", "Run"], rows)
+    return Table(["Model", *(label(bench, k) for k in keys), "Platform", "Hardware", "Run"], rows)
 
 
 def all_runs(bench: str, recs: Sequence[RunRecord]) -> Table:
@@ -147,16 +160,94 @@ def all_runs(bench: str, recs: Sequence[RunRecord]) -> Table:
                 other_params(r),
                 *(fmt(k, m[k]) if k in m else DASH for k in keys),
                 *(fmt(k, g[k]) if k in g else DASH for k, _ in GPU_COLS),
+                platform(r),
                 hardware(r, bench),
                 str(r.meta.get("git_commit", "?")),
             ]
         )
     header = ["Run", "Model", "Params", *(label(bench, k) for k in keys), *(n for _, n in GPU_COLS)]
-    return Table([*header, "Hardware", "Commit"], rows)
+    return Table([*header, "Platform", "Hardware", "Commit"], rows)
 
 
 def run_detail(r: RunRecord) -> list[tuple[str, Metrics]]:
     return sorted(r.results.items())
+
+
+def _num(v: float, unit: str = "", digits: int = 0) -> str:
+    return f"{v:,.{digits}f}{unit}"
+
+
+def _gpu_line(m: Metrics, g: str) -> str:
+    """One GPU's detailed (schema-1) means; `g` is "" for the pooled keys or "<index>" per GPU."""
+    k = f"gpu{g}_"
+    parts = []
+    if (v := m.get(f"{k}util_pct")) is not None and g:
+        parts.append(f"util {_num(v, '%', 1)}")
+    if (v := m.get(f"{k}mem_util_pct")) is not None:
+        parts.append(f"memory controller busy {_num(v, '%', 1)}")
+    if (v := m.get(f"{k}clock_sm_mhz")) is not None:
+        low = m.get(f"{k}clock_sm_mhz_min")
+        parts.append(f"SM {_num(v, ' MHz')}" + (f" (min {_num(low, ' MHz')})" if low is not None else ""))
+    if (v := m.get(f"{k}clock_mem_mhz")) is not None:
+        parts.append(f"memory {_num(v, ' MHz')}")
+    if (v := m.get(f"{k}throttle_frac")) is not None:
+        mask = m.get(f"{k}throttle_mask_seen")
+        seen = f", reasons 0x{int(mask):x}" if mask is not None and mask > 0 else ""
+        parts.append(f"throttled {v:.0%} of samples{seen}")
+    total = "_total_mean" if not g else ""
+    rx, tx = m.get(f"{k}pcie_rx_mb_s{total}"), m.get(f"{k}pcie_tx_mb_s{total}")
+    if rx is not None or tx is not None:
+        rate = [DASH if v is None else _num(v, " MB/s") for v in (rx, tx)]
+        parts.append(f"PCIe rx {rate[0]}, tx {rate[1]}")
+    if not g and (v := m.get("gpu_util_pct_spread")) is not None:
+        parts.append(f"util spread across GPUs {_num(v, ' pts', 1)}")
+    return "; ".join(parts)
+
+
+def telemetry(r: RunRecord) -> list[tuple[str, str, bool]]:
+    """Readable digest of the hardware telemetry newer records carry: (label, value, value is code).
+    Empty for records without any of it, so older records render as before. Covers the CPU (meta
+    cpu_model, cpus_requested, cpu_count), the detailed GPU metrics (`gpu_metrics = "detailed"`), and the
+    CUDA kernels a roofline run noted (meta roofline_kernels_top / roofline_attention_kernel)."""
+    rows: list[tuple[str, str, bool]] = []
+    cpu = r.meta.get("cpu_model")
+    if cpu is not None and str(cpu) not in ("", "unknown"):  # "unknown": early Modal records' placeholder
+        rows.append(("CPU", str(cpu), False))
+    cpus = [
+        f"{r.meta[k]} {what}" for k, what in (("cpus_requested", "requested"), ("cpu_count", "visible"))
+        if k in r.meta
+    ]  # fmt: skip
+    if cpus:
+        rows.append(("CPUs", ", ".join(cpus), False))
+    for name, m in run_detail(r):
+        if not name.endswith("/nvidia_smi"):
+            continue
+        where = (
+            f" ({name.removesuffix('/nvidia_smi')})"
+            if sum(n.endswith("/nvidia_smi") for n in r.results) > 1
+            else ""
+        )
+        indices = sorted(
+            {int(i) for k in m if k.startswith("gpu") and (i := k[3:].partition("_")[0]).isdigit()}
+        )
+        if line := _gpu_line(m, ""):
+            rows.append((f"{'GPUs, pooled' if len(indices) > 1 else 'GPU'}{where}", line, False))
+        if len(indices) > 1:
+            rows += [(f"GPU {i}{where}", line, False) for i in indices if (line := _gpu_line(m, str(i)))]
+    if (seen := r.meta.get("roofline_kernels_seen")) is not None:
+        rows.append(("CUDA kernels seen", str(seen), False))
+    if (top := r.meta.get("roofline_kernels_top")) is not None:
+        if str(top) == "none seen":
+            rows.append(("Top CUDA kernels", "none seen", False))
+        for i, item in enumerate((k for k in str(top).split("; ") if k and str(top) != "none seen"), 1):
+            share, _, name = item.partition(" ")  # "41.2% <kernel name>"
+            rows.append((f"Kernel {i} ({share} of GPU time)", name, True))
+    if (att := r.meta.get("roofline_attention_kernel")) is not None:
+        share = r.meta.get("roofline_attention_share")
+        rows.append(("Attention kernel", str(att), str(att) != "none seen"))
+        if share is not None:
+            rows.append(("Attention kernel share", f"{float(share):.1%}", False))
+    return rows
 
 
 # ---------------------------------------------------------------- markdown
@@ -184,14 +275,28 @@ def to_markdown(recs: Sequence[RunRecord], results_dir: Path = RESULTS_DIR) -> s
         if bench == report_roofline.BENCH:
             if text := report_roofline.findings(results_dir):
                 out += ["### Findings", "", text, ""]
-            for gpu, pts in report_roofline.points_by_gpu(recs).items():
+            panels = report_roofline.panels(recs)
+            out += ["### Roofs", "", _md_table(Table(*report_roofline.roofs(panels))), ""]
+            if len(panels) > 1:
                 out += [
-                    f"### Decision recipes on {gpu}",
+                    "### Achieved TFLOP/s by GPU (% of that GPU's roof)",
                     "",
-                    _md_table(Table(*report_roofline.recipes(pts))),
+                    _md_table(Table(*report_roofline.by_gpu(panels))),
                     "",
                 ]
-                out += [f"### Roofline on {gpu}", "", _md_table(Table(*report_roofline.table(pts))), ""]
+            for panel in panels:
+                out += [
+                    f"### Decision recipes on {panel.label}",
+                    "",
+                    _md_table(Table(*report_roofline.recipes(panel.points))),
+                    "",
+                ]
+                out += [
+                    f"### Roofline on {panel.label}",
+                    "",
+                    _md_table(Table(*report_roofline.table(panel.points))),
+                    "",
+                ]
         out += [
             "### Leaderboard (each model's largest run)",
             "",
@@ -207,6 +312,9 @@ def to_markdown(recs: Sequence[RunRecord], results_dir: Path = RESULTS_DIR) -> s
         out += [
             _md_table(Table(["Setting", "Value"], [[k, str(v)] for k, v in sorted(r.invariants.items())]))
         ]
+        if tele := telemetry(r):
+            rows = [[k, f"`{v}`" if code else v] for k, v, code in tele]
+            out += ["", "**Telemetry**", "", _md_table(Table(["Telemetry", "Value"], rows))]
         for name, metrics in run_detail(r):
             out += [
                 "",
@@ -324,12 +432,26 @@ def to_html(recs: Sequence[RunRecord], results_dir: Path = RESULTS_DIR) -> str:
                     report_roofline.markdown_to_html(text),
                     "</div>",
                 ]
-            for gpu, pts in report_roofline.points_by_gpu(recs).items():
-                rh, rr = report_roofline.recipes(pts)
-                parts += [f"<h3>Decision recipes on {html.escape(gpu)}</h3>", '<div class="card recipes">',
+            panels = report_roofline.panels(recs)
+            scale = report_roofline.shared_scale(panels)
+            fh, fr = report_roofline.roofs(panels)
+            parts += [
+                "<h3>Roofs</h3>",
+                '<div class="card">',
+                _html_table(Table(fh, fr), 1, len(fh)),
+                "</div>",
+            ]
+            if len(panels) > 1:
+                gh, gr = report_roofline.by_gpu(panels)
+                parts += ["<h3>Achieved TFLOP/s by GPU (% of that GPU's roof)</h3>", '<div class="card">',
+                          _html_table(Table(gh, gr), 1, len(gh)), "</div>"]  # fmt: skip
+            for panel in panels:
+                rh, rr = report_roofline.recipes(panel.points)
+                name = html.escape(panel.label)
+                parts += [f"<h3>Decision recipes on {name}</h3>", '<div class="card recipes">',
                           _html_table(Table(rh, rr), 5, len(rh)), "</div>"]  # fmt: skip
-                header, rows = report_roofline.table(pts)
-                parts += [report_roofline.chart(gpu, pts), '<div class="card">',
+                header, rows = report_roofline.table(panel.points)
+                parts += [report_roofline.chart(panel, scale), '<div class="card">',
                           _html_table(Table(header, rows), 2, len(header)), "</div>"]  # fmt: skip
         parts += ["<h3>Leaderboard (each model's largest run)</h3>", '<div class="card">',
                   _html_table(leaderboard(bench, recs), 1, 1 + n_keys), "</div>"]  # fmt: skip
@@ -338,6 +460,7 @@ def to_html(recs: Sequence[RunRecord], results_dir: Path = RESULTS_DIR) -> str:
     parts.append("<h2>Run details</h2>")
     for r in sorted(recs, key=lambda r: r.run_id, reverse=True):
         rows = [[k, str(v)] for k, v in sorted(r.invariants.items())]
+        rows += [[f"telemetry · {k}", v] for k, v, _ in telemetry(r)]
         rows += [[f"{name} · {k}", f"{v:.6g}"] for name, m in run_detail(r) for k, v in m.items()]
         rows += [[f"meta · {k}", str(v)] for k, v in r.meta.items()]
         parts += [
