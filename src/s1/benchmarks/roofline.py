@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 import math
 import random
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
@@ -57,9 +58,31 @@ from .shape_sweep import FileTokenCounter, TokenCounter, WordCounter
 
 BINS = (128, 256, 512, 1024, 4096)  # prompt tokens a question processed (all its forwards)
 TYPES = ("choice", "noul")
-# Datasheet peaks: dense bf16 tensor TFLOP/s, fp32 TFLOP/s, DRAM GB/s (NVIDIA L4: "242 TFLOPS BF16" is with
-# 2:4 sparsity, so 121 dense; 30.3 FP32; 300 GB/s GDDR6).
-SPEC = {"L4": (121.0, 30.3, 300.0)}
+# Datasheet peaks: dense bf16 tensor TFLOP/s, fp32 (non-tensor) TFLOP/s, DRAM GB/s. NVIDIA quotes bf16 with
+# 2:4 sparsity (2x the dense figure used here). bf16 and bandwidth: the selection doc's ridge-point appendix.
+SPEC = {
+    # L4: 242 TFLOPS BF16 is sparse, so 121 dense; 30.3 FP32; 300 GB/s GDDR6.
+    # https://www.nvidia.com/en-us/data-center/l4/
+    "L4": (121.0, 30.3, 300.0),
+    # A100 80GB SXM: FP32 19.5 (datasheet), 2,039 GB/s. https://www.nvidia.com/en-us/data-center/a100/
+    "A100-80GB": (312.0, 19.5, 2039.0),
+    # H100 SXM: FP32 67 (datasheet), 3.35 TB/s. https://www.nvidia.com/en-us/data-center/h100/
+    "H100": (989.0, 67.0, 3350.0),
+    # H200 SXM: FP32 67 (datasheet), 4.8 TB/s. https://www.nvidia.com/en-us/data-center/h200/
+    "H200": (989.0, 67.0, 4800.0),
+    # HGX B200 (1,000 W): the datasheet gives no per-GPU FP32, only 600 TFLOPS for the 8-GPU board, so 75.0
+    # is that divided by 8 (derived, not quoted). https://www.nvidia.com/en-us/data-center/hgx/
+    "B200": (2250.0, 75.0, 7700.0),
+}
+# nvidia-smi names -> SPEC key. Anchored so lookalikes (A100 40GB/PCIe, H100 PCIe/NVL, H200 NVL, L40S, A10G)
+# match nothing.
+_SPEC_NAMES = (
+    (re.compile(r"^(NVIDIA )?L4$"), "L4"),
+    (re.compile(r"^(NVIDIA )?A100-SXM4-80GB$"), "A100-80GB"),
+    (re.compile(r"^(NVIDIA )?H100 80GB HBM3$"), "H100"),
+    (re.compile(r"^(NVIDIA )?H200$"), "H200"),
+    (re.compile(r"^(NVIDIA )?B200$"), "B200"),
+)
 
 
 class Profiled(Protocol):
@@ -99,7 +122,8 @@ def subset(rows: Sequence[jeval.Row], counter: TokenCounter, settings: Settings)
 
 
 def spec_peaks(gpu: str) -> tuple[float, float, float] | None:
-    return next((v for k, v in SPEC.items() if k in gpu.split()), None)
+    name = gpu.strip()
+    return next((SPEC[key] for rx, key in _SPEC_NAMES if rx.match(name)), None)
 
 
 def _ratio(num: float, den: float) -> float:

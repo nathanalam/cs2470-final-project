@@ -26,13 +26,16 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Spec-sheet peaks, dense bf16 tensor FLOP/s and DRAM bytes/s, by substring of the GPU name.
-# H100 is the SXM5 80 GB part Modal rents ("NVIDIA H100 80GB HBM3"); the PCIe card is lower (756e12, 2.0e12).
+# Spec-sheet peaks, dense bf16 tensor FLOP/s and DRAM bytes/s, by exact nvidia-smi name (without "NVIDIA ").
+# Same figures as roofline.SPEC. Lookalikes (A100 40GB/PCIe, H100 PCIe/NVL) are absent on purpose:
+# no row beats a wrong one.
 PEAKS = {
     "L4": (121e12, 300e9),
     "A10G": (70e12, 600e9),
-    "A100": (312e12, 1555e9),
-    "H100": (989e12, 3350e9),
+    "A100-SXM4-80GB": (312e12, 2039e9),
+    "H100 80GB HBM3": (989e12, 3350e9),
+    "H200": (989e12, 4800e9),
+    "B200": (2250e12, 7700e9),
 }
 GEMM = re.compile(r"gemm|cutlass|xmma|nvjet|cublas|sm\d\d_", re.IGNORECASE)
 MARKER = re.compile(r"spin", re.IGNORECASE)
@@ -95,7 +98,7 @@ def cmd_time(sizes: list[int]) -> None:
 
 
 def peak_for(device: str) -> tuple[float, float] | None:
-    return next((v for k, v in PEAKS.items() if k in device), None)
+    return PEAKS.get(device.strip().removeprefix("NVIDIA "))
 
 
 def metric_value(raw: str) -> float:
