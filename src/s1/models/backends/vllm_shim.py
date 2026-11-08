@@ -6,7 +6,8 @@ flags and calibration from the model card's serve/SERVE.md, and waits until they
 stops them. Set `openjev_endpoint` to use an already-running helper instead.
 
 Settings (all optional):
-    openjev_dir             model directory           default /shared/home/$USER/models/openjev
+    openjev_dir             model directory           default <s1.env.models_dir()>/openjev ($MODELS_DIR,
+                                                      else the cluster's shared models directory)
     openjev_endpoint        existing helper URL       default "" (start our own)
     tensor_parallel_size    GPUs to shard across      default 1 (use 4 on gpu-parallel's 4x A10G)
     quantization            vLLM --quantization       default "fp8" (the card's measured recipe; needs
@@ -16,7 +17,10 @@ Settings (all optional):
                                                       (vLLM V1 would otherwise turn it on by default).
                                                       For this hybrid model the cache works in blocks of 784
                                                       tokens (see the vLLM log), so shorter prompts never hit.
-    openjev_startup_s       readiness timeout         default 1800 (loading 54 GB from /shared is slow)
+    openjev_startup_s       readiness timeout         default 1800 (loading 54 GB over the network is slow)
+
+vLLM and shim logs go to $S1_LOG_DIR (s1.env.log_dir(), default ./logs) as `vllm-<job>-<port>.log` and
+`shim-<job>-<port>.log`, where <job> is s1.env.job_id() (Slurm job id, Modal task id, or "local").
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ... import env
 from ...record import Scalar
 from ...registry import get_bool, get_float, get_int, get_str
 from ..spec import ModelSpec
@@ -47,7 +52,16 @@ SHIM_ENV = {
     "READOUT_INSTR_STYLE": "pyrepr",
     "SHIM_STAGGER": "1",
 }
-LOG_DIR = Path("logs")
+LOG_DIR: Path | None = None  # override for tests; None means env.log_dir(), resolved when used
+
+
+def log_dir() -> Path:
+    return LOG_DIR if LOG_DIR is not None else env.log_dir()
+
+
+def model_dir(settings: dict[str, Scalar]) -> Path:
+    """Setting `openjev_dir` if given, else $MODELS_DIR/openjev."""
+    return Path(get_str(settings, "openjev_dir", str(env.models_dir() / "openjev")))
 
 
 def _free_port() -> int:
@@ -106,7 +120,7 @@ class OpenJev:
 
 
 def _spawn(cmd: list[str], log: Path, env: dict[str, str] | None = None) -> subprocess.Popen[bytes]:
-    LOG_DIR.mkdir(exist_ok=True)
+    log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("ab") as fh:
         # own process group, so close() also takes down vLLM's tensor-parallel workers
         return subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, env=env, start_new_session=True)
@@ -146,25 +160,26 @@ def build(settings: dict[str, Scalar]) -> OpenJev:
     if endpoint := get_str(settings, "openjev_endpoint", ""):
         return OpenJev(endpoint.rstrip("/"))
 
-    model_dir = Path(get_str(settings, "openjev_dir", f"/shared/home/{os.environ['USER']}/models/openjev"))
-    shim = model_dir / "helper" / "shim.py"
+    mdir = model_dir(settings)
+    shim = mdir / "helper" / "shim.py"
     if not shim.exists():
         raise FileNotFoundError(f"{shim} missing: sbatch scripts/download_model.sh openjev/openjev")
     vllm_port, shim_port = _free_port(), _free_port()
-    tag = f"{os.environ.get('SLURM_JOB_ID', 'local')}-{vllm_port}"
+    tag = f"{env.job_id()}-{vllm_port}"
+    logs = log_dir()
 
-    vllm = _spawn(serve_args(settings, model_dir, vllm_port), LOG_DIR / f"vllm-{tag}.log")
+    vllm = _spawn(serve_args(settings, mdir, vllm_port), logs / f"vllm-{tag}.log")
     jev = OpenJev(f"http://127.0.0.1:{shim_port}", procs=[vllm])
     try:
         deadline = time.monotonic() + get_float(settings, "openjev_startup_s", 1800)
-        _wait_ready(f"http://127.0.0.1:{vllm_port}/health", vllm, LOG_DIR / f"vllm-{tag}.log", deadline)
+        _wait_ready(f"http://127.0.0.1:{vllm_port}/health", vllm, logs / f"vllm-{tag}.log", deadline)
 
-        env = (
-            os.environ | SHIM_ENV | {"VLLM": f"http://127.0.0.1:{vllm_port}/v1", "TOKENIZER": str(model_dir)}
+        shim_env = (
+            os.environ | SHIM_ENV | {"VLLM": f"http://127.0.0.1:{vllm_port}/v1", "TOKENIZER": str(mdir)}
         )
         cmd = [sys.executable, str(shim), "--host", "127.0.0.1", "--port", str(shim_port)]
-        jev.procs.append(_spawn(cmd, LOG_DIR / f"shim-{tag}.log", env))
-        _wait_ready(f"{jev.endpoint}/v1/version", jev.procs[-1], LOG_DIR / f"shim-{tag}.log", deadline)
+        jev.procs.append(_spawn(cmd, logs / f"shim-{tag}.log", shim_env))
+        _wait_ready(f"{jev.endpoint}/v1/version", jev.procs[-1], logs / f"shim-{tag}.log", deadline)
     except BaseException:
         jev.close()
         raise

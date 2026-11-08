@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import time
@@ -9,7 +10,7 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
-from . import models, registry
+from . import env, models, registry
 from .config import RunSpec
 from .gpu_stats import SCHEMA, GpuSampler, metrics_mode, resolve_mode
 from .record import RESULTS_DIR, RunRecord, Scalar, new_run_id
@@ -30,20 +31,60 @@ def detect_gpu() -> str:
     return ",".join(names) or "cpu"
 
 
-def _git_commit() -> str:
+def _run(cmd: list[str]) -> str | None:
+    """stdout of `cmd`, or None if the tool is missing, fails or hangs: a missing tool never fails a run."""
     try:
-        sha = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=True
-        ).stdout.strip()
-        dirty = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=no"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError):
-        return "unknown"
-    return sha + ("-dirty" if dirty else "")
+        return subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def cpu_model() -> str | None:
+    """Host CPU model: /proc/cpuinfo "model name" (Linux), else sysctl's brand string (macOS), else None."""
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            key, _, val = line.partition(":")
+            if key.strip() == "model name" and val.strip():
+                return val.strip()
+    except OSError:
+        pass
+    out = _run(["sysctl", "-n", "machdep.cpu.brand_string"])
+    return (out or "").strip() or None
+
+
+def hardware_meta() -> dict[str, Scalar]:
+    """CPU model, GPU 0's driver and power limit, saved `nvidia-smi -q` path; absent fields omitted."""
+    meta: dict[str, Scalar] = {}
+    if (cpu := cpu_model()) is not None:
+        meta[env.META_CPU_MODEL] = cpu
+    out = _run(["nvidia-smi", "--query-gpu=driver_version,power.limit", "--format=csv,noheader,nounits"])
+    if out is not None and (rows := [r for r in out.splitlines() if r.strip()]):
+        driver, _, power = (f.strip() for f in rows[0].partition(","))
+        if driver and driver != "[N/A]":
+            meta[env.META_GPU_DRIVER] = driver
+        with contextlib.suppress(ValueError):  # "[N/A]" or empty
+            meta[env.META_GPU_POWER_LIMIT_W] = float(power)
+    if (q := _run(["nvidia-smi", "-q"])) is not None:
+        path = env.log_dir() / f"nvidia-smi-q-{env.job_id()}.txt"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(q)
+        except OSError:
+            pass
+        else:
+            meta[env.META_NVIDIA_SMI_Q_LOG] = str(path)
+    return meta
+
+
+def orchestrator_meta() -> dict[str, Scalar]:
+    """Who ran this: orchestrator on every record, `slurm_job_id` (as before) or the Modal task id."""
+    orch = env.orchestrator()
+    meta: dict[str, Scalar] = {env.META_ORCHESTRATOR: orch}
+    if orch == "slurm":
+        meta["slurm_job_id"] = env.job_id()
+    elif orch == "modal":
+        meta[env.META_MODAL_TASK_ID] = env.job_id()
+    return meta
 
 
 def grid_settings(grid: dict[str, list[Scalar]]) -> dict[str, Scalar]:
@@ -68,16 +109,18 @@ def run(
     )
     if gpu_mode == "detailed":  # basic records stay byte-identical; detailed ones state their key set
         invariants.setdefault("gpu_metrics_schema", SCHEMA)
+    # absent means the HUIT cluster, so Slurm and local runs keep exactly today's invariants
+    if env.orchestrator() == "modal":
+        invariants[env.INV_PLATFORM] = "modal"
 
     meta: dict[str, Scalar] = {
         "started": datetime.now().isoformat(timespec="seconds"),
-        "git_commit": _git_commit(),
+        "git_commit": env.git_commit(),
         "host": os.uname().nodename,
     }
     if config_path is not None:
         meta["config"] = str(config_path)
-    if (job := os.environ.get("SLURM_JOB_ID")) is not None:
-        meta["slurm_job_id"] = job
+    meta |= orchestrator_meta() | hardware_meta()
 
     rec = RunRecord(
         run_id=new_run_id(),
