@@ -7,6 +7,7 @@ import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
+from typing import Annotated
 
 import typer
 from rich.console import Console
@@ -59,11 +60,16 @@ def ncu_cmd(
     questions: int = typer.Option(4, "--questions", help="Questions profiled per model."),
     results_dir: Path = ResultsDir,
     ncu_bin: str = typer.Option("/usr/local/cuda/bin/ncu", "--ncu", help="Nsight Compute CLI."),
+    clock_control: Annotated[
+        str | None,
+        typer.Option("--clock-control", help="ncu --clock-control: base (default; none on Modal) or none."),
+    ] = None,
 ) -> None:
     """Run each model of CONFIG under Nsight Compute (use inside an allocation): the roofline benchmark
     re-answers `--questions` questions in a CUDA profiler range, and the summed hardware counters (FLOPs,
     DRAM bytes) are added to that run's record as roofline_hw_*. See s1/ncu.py."""
     specs = config.load(cfg)
+    clock = ncu.clock_control(clock_control)
     job = env.job_id()
     Path("logs").mkdir(exist_ok=True)
     for i in range(len(specs)):
@@ -71,12 +77,13 @@ def ncu_cmd(
         before = set(results_dir.glob("*.json"))
         child = [sys.executable, "-m", "s1.cli", "run", str(cfg), "--index", str(i)]
         child += ["--results-dir", str(results_dir), "--set", f"roofline_ncu={questions}"]
-        subprocess.run([ncu_bin, *ncu.ARGS, "--log-file", str(log), *child], check=True)
+        subprocess.run([ncu_bin, *ncu.args(clock), "--log-file", str(log), *child], check=True)
         (path,) = set(results_dir.glob("*.json")) - before
         rec = RunRecord.load(path)
-        hw = ncu.summarize(ncu.parse(log.read_text()), rec.results["roofline"])
+        hw = ncu.summarize(ncu.parse(log.read_text()), rec.results["roofline"], clock)
         rec.results["roofline"] |= hw
         rec.meta["ncu_log"] = str(log)
+        rec.meta[ncu.META_CLOCK_CONTROL] = clock
         rec.save(results_dir)
         console.print(f"[{rec.run_id}] hardware counters: {hw}")
 
@@ -142,6 +149,20 @@ def submit(
     )
     s1 = ["ncu", str(cfg), "--questions", str(ncu_questions)] if ncu_questions else ["run", str(cfg)]
     get_launcher(res.orchestrator).submit(cfg, res, s1, dry_run=dry_run)
+
+
+@app.command()
+def download(
+    repo: str,
+    revision: str | None = typer.Argument(None, help="Pin a revision (use the catalog's)."),
+    dirname: str | None = typer.Argument(None, help="Directory under MODELS_DIR (default: repo name)."),
+    hf_secret: str | None = typer.Option(None, "--hf-secret", help="Modal secret with HF_TOKEN."),
+) -> None:
+    """Download a Hub model into the Modal `s1-models` volume (/models/<dir>) on a CPU container, with the
+    SHA256SUMS check of scripts/download_model.sh. For the cluster use `sbatch scripts/download_model.sh`."""
+    from .launch import modal_app  # noqa: PLC0415
+
+    modal_app.download(repo, revision, dirname, hf_secret=hf_secret)
 
 
 @app.command("ls")
