@@ -21,7 +21,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 
 from ..record import Scalar
 
@@ -45,4 +45,29 @@ class Launcher(Protocol):
     ) -> str:
         """Queue `s1 <s1_args>` (e.g. ["run", "configs/x.toml"]) and return a handle: the Slurm job id or
         the Modal function-call id. With dry_run, print what would run and return "" without queueing."""
+        ...
+
+
+# ---- fan-out (M3, additive): one config, several GPUs, each its own `Resources` ----
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """What one GPU of a fan-out produced. `error` is None on success; `call_id` is "" when nothing was
+    queued (dry run, or a failure before the call started)."""
+
+    gpu: str | None
+    call_id: str = ""
+    records: tuple[Path, ...] = ()
+    logs: tuple[Path, ...] = ()
+    error: str | None = None
+
+
+@runtime_checkable
+class FanOutLauncher(Protocol):
+    def submit_many(
+        self, cfg: Path, resources: Sequence[Resources], s1_args: Sequence[str], *, dry_run: bool = False
+    ) -> list[Outcome]:
+        """Run `s1 <s1_args>` once per `Resources`, concurrently, and wait for all of them. One failing
+        does not stop the others; each failure is reported in its `Outcome`, in the order given."""
         ...

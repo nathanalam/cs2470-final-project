@@ -349,3 +349,153 @@ def test_ncu_log_name_uses_env_job_id(tmp_path: Path, monkeypatch: pytest.Monkey
         cli.ncu_cmd(cfg, questions=1, results_dir=tmp_path, ncu_bin="ncu")
     log = seen[0][seen[0].index("--log-file") + 1]
     assert log == str(Path("logs") / "ncu-ta-9-exp-0.csv")
+
+
+# --- fan-out: [launch] gpu as a list (M3) -----------------------------------------------------------
+
+SWEEP5 = '["L4", "A100-80GB", "H100", "H200", "B200"]'
+
+
+def _fan(tmp_path: Path, gpu: str = SWEEP5, extra: str = "", orchestrator: str = "modal") -> Path:
+    return _cfg(tmp_path, f'{extra}[launch]\norchestrator = "{orchestrator}"\ngpu = {gpu}\ncpus = 4\n')
+
+
+def test_load_launches_one_per_gpu_in_order(tmp_path: Path) -> None:
+    got = config.load_launches(_fan(tmp_path))
+    assert [r.gpu for r in got] == ["L4", "A100-80GB", "H100", "H200", "B200"]
+    assert all(r.orchestrator == "modal" and r.cpus == 4 for r in got)
+
+
+def test_load_launches_string_and_none(tmp_path: Path) -> None:
+    assert config.load_launches(_cfg(tmp_path)) == []
+    one = _cfg(tmp_path, '[launch]\norchestrator = "modal"\ngpu = "H100"\n', name="one")
+    assert config.load_launches(one) == [Resources("modal", gpu="H100")]
+    assert config.load_launch(one) == Resources("modal", gpu="H100")
+    cpu = _cfg(tmp_path, '[launch]\norchestrator = "modal"\n', name="cpu")
+    assert config.load_launches(cpu) == [Resources("modal")]
+
+
+def test_single_element_list_is_a_single_gpu(tmp_path: Path) -> None:
+    path = _fan(tmp_path, '["H100"]', extra='[invariants]\nrequire_gpu = "H100"\n', orchestrator="slurm")
+    assert config.load_launch(path) == Resources("slurm", gpu="H100", cpus=4)
+
+
+def test_load_launch_rejects_a_list(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match=r"use config\.load_launches"):
+        config.load_launch(_fan(tmp_path))
+
+
+@pytest.mark.parametrize(
+    ("gpu", "error", "match"),
+    [
+        ("[]", TypeError, "gpu must be a non-empty string or a non-empty list"),
+        ('["L4", 3]', TypeError, "gpu must be"),
+        ('["L4", ""]', TypeError, "gpu must be"),
+        ('["L4", "H100", "h100"]', ValueError, "h100 more than once"),
+    ],
+)
+def test_gpu_list_validation(tmp_path: Path, gpu: str, error: type[Exception], match: str) -> None:
+    with pytest.raises(error, match=match):
+        config.load_launches(_fan(tmp_path, gpu))
+
+
+def test_gpu_list_on_slurm_is_an_error(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match='fan-out needs orchestrator = "modal"'):
+        config.load_launches(_fan(tmp_path, orchestrator="slurm"))
+    with pytest.raises(ValueError, match="fan-out needs"):  # --on slurm overriding a Modal list
+        config.load_launches(_fan(tmp_path), "slurm")
+    with pytest.raises(ValueError, match="fan-out needs"):
+        cli.launch_resources_all(_fan(tmp_path), on="slurm")
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        '[invariants]\nrequire_gpu = "H100"\n',
+        '[params]\nrequire_gpu = "H100"\n',
+        '[sweep]\nrequire_gpu = ["H100", "L4"]\n',
+    ],
+)
+def test_gpu_list_forbids_require_gpu(tmp_path: Path, extra: str) -> None:
+    path = tmp_path / "x.toml"
+    path.write_text(f'benchmarks = ["jeval"]\n{extra}[launch]\norchestrator = "modal"\ngpu = {SWEEP5}\n')
+    if "[params]" not in extra:
+        path.write_text(path.read_text().replace("[launch]", '[params]\nmodel = "echo"\n[launch]', 1))
+    else:
+        path.write_text(path.read_text().replace("[params]\n", '[params]\nmodel = "echo"\n', 1))
+    with pytest.raises(ValueError, match="must not set `require_gpu`"):
+        config.load_launches(path)
+
+
+def test_gpu_flag_narrows_a_list(tmp_path: Path) -> None:
+    path = _fan(tmp_path)
+    (res,) = cli.launch_resources_all(path, gpu="h200", mem="64G")
+    assert (res.gpu, res.mem, res.cpus) == ("H200", "64G", 4)
+    assert cli.launch_resources(path, gpu="B200").gpu == "B200"
+    with pytest.raises(ValueError, match="not one of the config's"):
+        cli.launch_resources_all(path, gpu="T4")
+    with pytest.raises(ValueError, match="pick one with --gpu"):
+        cli.launch_resources(path)
+    assert [r.gpu for r in cli.launch_resources_all(path, time="00:05:00")] == [
+        "L4",
+        "A100-80GB",
+        "H100",
+        "H200",
+        "B200",
+    ]
+
+
+class FakeFanOutLauncher(FakeModalLauncher):
+    many: ClassVar[list[tuple[list[str | None], list[str], bool]]] = []
+    fail: ClassVar[set[str]] = set()
+
+    def submit_many(
+        self, cfg: Path, resources: Sequence[Resources], s1_args: Sequence[str], *, dry_run: bool = False
+    ) -> list[launch.Outcome]:
+        FakeFanOutLauncher.many.append(([r.gpu for r in resources], list(s1_args), dry_run))
+        return [
+            launch.Outcome(r.gpu, f"fc-{r.gpu}", (Path(f"results/{r.gpu}.json"),), error="boom")
+            if r.gpu in self.fail
+            else launch.Outcome(r.gpu, "" if dry_run else f"fc-{r.gpu}", (Path(f"results/{r.gpu}.json"),))
+            for r in resources
+        ]
+
+
+@pytest.fixture
+def fake_fan_out(monkeypatch: pytest.MonkeyPatch) -> type[FakeFanOutLauncher]:
+    module = types.ModuleType(launch.MODAL_MODULE)
+    module.__dict__["ModalLauncher"] = FakeFanOutLauncher
+    monkeypatch.setitem(sys.modules, launch.MODAL_MODULE, module)
+    FakeFanOutLauncher.many, FakeFanOutLauncher.fail, FakeModalLauncher.calls = [], set(), []
+    return FakeFanOutLauncher
+
+
+def test_submit_list_fans_out(tmp_path: Path, fake_fan_out: type[FakeFanOutLauncher]) -> None:
+    path = _fan(tmp_path)
+    result = CliRunner().invoke(cli.app, ["submit", str(path)], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    assert fake_fan_out.many == [(["L4", "A100-80GB", "H100", "H200", "B200"], ["run", str(path)], False)]
+    assert FakeModalLauncher.calls == []  # never the one-GPU path
+    for gpu in ("L4", "A100-80GB", "H100", "H200", "B200"):
+        assert f"fc-{gpu}" in result.output
+    assert "failed" not in result.output
+
+
+def test_submit_list_exits_nonzero_when_a_gpu_fails(
+    tmp_path: Path, fake_fan_out: type[FakeFanOutLauncher]
+) -> None:
+    fake_fan_out.fail = {"H200"}
+    result = CliRunner().invoke(cli.app, ["submit", str(_fan(tmp_path))], catch_exceptions=False)
+    assert result.exit_code == 1
+    assert "FAILED" in result.output and "boom" in result.output
+    assert "1 of 5 GPU(s) failed: H200" in result.output
+    assert "fc-B200" in result.output  # the others are still reported
+
+
+def test_submit_list_dry_run_and_narrowing(tmp_path: Path, fake_fan_out: type[FakeFanOutLauncher]) -> None:
+    path = _fan(tmp_path)
+    out = _submit(str(path))
+    assert "5 GPU(s) would run concurrently" in out
+    assert fake_fan_out.many == [(["L4", "A100-80GB", "H100", "H200", "B200"], ["run", str(path)], True)]
+    _submit(str(path), "--gpu", "H100")  # narrowed: the ordinary one-GPU submit
+    assert [(r.gpu, dry) for _, r, _, dry in FakeModalLauncher.calls] == [("H100", True)]

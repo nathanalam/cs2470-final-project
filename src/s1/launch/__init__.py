@@ -1,6 +1,7 @@
 """Launchers for `s1 submit`: the [launch] table of a config picks Slurm or Modal (see base.py).
 
-`s1.config.load_launch` parses [launch] into `Resources`; `get_launcher` picks the orchestrator.
+`s1.config.load_launches` parses [launch] into one `Resources` per GPU; `get_launcher` picks the
+orchestrator. A `gpu` list fans out on Modal: `ModalLauncher.submit_many` (a `FanOutLauncher`).
 The Modal launcher is imported lazily, so the cluster and the tests never need the `modal` package.
 """
 
@@ -9,10 +10,10 @@ from __future__ import annotations
 import importlib
 from typing import cast
 
-from .base import Launcher, LaunchTarget, Resources
+from .base import FanOutLauncher, Launcher, LaunchTarget, Outcome, Resources
 from .slurm import SlurmLauncher
 
-__all__ = ["LaunchTarget", "Launcher", "Resources", "get_launcher"]
+__all__ = ["FanOutLauncher", "LaunchTarget", "Launcher", "Outcome", "Resources", "get_launcher"]
 
 MODAL_MODULE = "s1.launch.modal_app"
 
