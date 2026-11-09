@@ -117,7 +117,9 @@ def nsys_cmd(
         rec = RunRecord.load(path)
         api = nsys.parse(Path(f"{base}_cuda_api_sum.csv").read_text())
         kernels = nsys.parse(Path(f"{base}_cuda_gpu_kern_sum.csv").read_text())
-        split = nsys.summarize(api, kernels, rec.results["batch"])
+        sqlite_file = Path(f"{base}.sqlite")  # nsys stats exports it next to the report
+        graphs = nsys.graph_trace(sqlite_file) if sqlite_file.is_file() else (0, 0.0)
+        split = nsys.summarize(api, kernels, rec.results["batch"], graphs)
         rec.results["batch"] = split | rec.results["batch"]
         rec.meta["nsys_report"] = report_file
         rec.meta[nsys.META_SAMPLE] = sample

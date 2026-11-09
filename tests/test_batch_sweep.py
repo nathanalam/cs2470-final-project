@@ -4,6 +4,7 @@ parts of the Laya batch path. No torch."""
 from __future__ import annotations
 
 import math
+import sqlite3
 from typing import override
 
 import pytest
@@ -57,6 +58,40 @@ def test_nsys_summarize_splits_wall_time_per_decision():
     with pytest.raises(ValueError, match="no nsys region"):
         nsys.summarize([], [], {})
     assert nsys.top_kernels(nsys.parse(KERN_CSV), top=1) == "70.0% x500 ampere_bf16_s16816gemm_bf16_128x64"
+
+
+def _graph_db(path, graphs, runtime):
+    db = sqlite3.connect(path)
+    db.execute(f"CREATE TABLE {nsys.GRAPH_TABLE} (start INTEGER, end INTEGER, graphId INTEGER)")
+    db.execute(f"CREATE TABLE {nsys.RUNTIME_TABLE} (start INTEGER, end INTEGER)")
+    db.executemany(f"INSERT INTO {nsys.GRAPH_TABLE} VALUES (?, ?, 1)", graphs)
+    db.executemany(f"INSERT INTO {nsys.RUNTIME_TABLE} VALUES (?, ?)", runtime)
+    db.commit()
+    db.close()
+
+
+def test_nsys_graph_trace_counts_only_replays_inside_the_range(tmp_path):
+    f = tmp_path / "r.sqlite"
+    # one replay before the capture range (negative time, as nsys reports earlier ones), two inside
+    _graph_db(
+        f, [(-500, -100), (1_000, 3_000_000), (4_000_000, 6_000_000)], [(900, 1_100), (5_000, 6_000_100)]
+    )
+    assert nsys.graph_trace(f) == (2, 4_999_000.0)
+    empty = tmp_path / "none.sqlite"
+    sqlite3.connect(empty).close()
+    assert nsys.graph_trace(empty) == (0, 0.0)
+
+
+def test_nsys_summarize_adds_graph_time_to_kernel_time():
+    run = {"batch_nsys_n": 10.0, "batch_nsys_wall_ms": 20.0}
+    m = nsys.summarize(nsys.parse(API_CSV), nsys.parse(KERN_CSV), run, graphs=(20, 10e6))
+    assert m["batch_nsys_graph_ms"] == pytest.approx(1.0)  # 10 ms of graphs / 10 decisions
+    assert m["batch_nsys_graph_launches"] == 2
+    assert m["batch_nsys_kernel_ms"] == pytest.approx(1.5)  # 0.5 eager + 1.0 graphs
+    assert m["batch_nsys_gpu_share"] == pytest.approx(0.75)
+    assert m["batch_nsys_kernels"] == 120  # eager kernels only
+    plain = nsys.summarize(nsys.parse(API_CSV), nsys.parse(KERN_CSV), run)
+    assert plain["batch_nsys_graph_ms"] == 0 and plain["batch_nsys_kernel_ms"] == pytest.approx(0.5)
 
 
 def test_nsys_command_lines():
