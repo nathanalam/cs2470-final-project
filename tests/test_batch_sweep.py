@@ -254,6 +254,23 @@ def test_nsys_mode_runs_only_the_profiled_region(tmp_path, monkeypatch):
     assert m["batch_nsys_wall_ms"] >= 0
     assert model.calls == 8  # 3 warm-up + 5 profiled, no sweep
     assert model.profiled == [True, False]
+    assert model.warmups == 1  # after_warmup runs before the region (kev's pending graph captures)
+
+
+def test_nsys_region_at_a_chosen_grid_length(tmp_path, monkeypatch):
+    widths: list[int] = []
+
+    class Widths(FakeBatched):
+        @override
+        def decide_batch(self, requests):
+            widths.extend(len(s.split()) for s, _ in requests)
+            return super().decide_batch(requests)
+
+    rec = _run(tmp_path, monkeypatch, Widths(), batch_nsys=2, batch_warmup=1, batch_nsys_state_tokens=64)
+    assert rec.results["batch"]["batch_nsys_state_tokens"] == 64
+    assert widths and max(widths) <= 64 and min(widths) > 16  # every request cut to 64 words, not 16
+    with pytest.raises(ValueError, match="not in"):
+        _run(tmp_path, monkeypatch, FakeBatched(), batch_nsys=2, batch_nsys_state_tokens=32)
 
 
 def test_benchmark_rejects_models_without_decide_batch():

@@ -1,0 +1,38 @@
+# Laya attention-kernel A/B on an H100, STATE-LENGTH AXIS: configs/roofline_sweep_laya_lengths.toml (40 questions
+# per length, the same questions at every length) on the H100 only, laya.english only, sdpa_backend swept
+# "default" vs "efficient" in one container (one host). See configs/sdpa_ab_laya_h100.toml for the hypothesis.
+# Confirmed if below 512 tokens "efficient" drops to ~25 ms while "default" stays at 64-122 ms; refuted if both
+# stay slow. The default arm should reproduce 20261108-215238-88368189 (s32 77, s128 75, s256 112, s512+ ~25 ms).
+#   uv run --group modal s1 submit configs/sdpa_ab_laya_h100_lengths.toml
+benchmarks = ["roofline"]
+
+[launch]
+orchestrator = "modal"
+gpu = "H100"
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "00:45:00"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+measure_ceilings = false
+
+[params]
+model = "laya.english"
+roofline_limit = 200
+roofline_seed = 0
+roofline_max_tokens = 1024
+roofline_max_options = 16
+roofline_warmup = 8
+roofline_counted = 8
+roofline_per_length = 40
+roofline_tokenizer_file = "$MODELS_DIR/Qwen3.5-4B-Base/tokenizer.json"
+
+[sweep]
+sdpa_backend = ["default", "efficient"]
+
+[grid]
+roofline_state_tokens = [32, 128, 256, 512, 768, 1024, 1536, 2048]

@@ -1,0 +1,37 @@
+# Smoke for the laya attention-kernel A/B (sdpa_backend, backends/gpu.py) on one Modal L4: a few length-axis
+# questions with the SDPA backend forced to the CUTLASS memory-efficient kernel (what the L4 picks by itself)
+# and to cuDNN (what the H100/H200/B200 pick). Checks the setting reaches every forward and is recorded as
+# env_sdpa_backend; if cuDNN on the L4 also shows the per-shape cost below 512 tokens, that is a bonus data point.
+#   uv run --group modal s1 submit configs/sdpa_ab_laya_smoke.toml
+benchmarks = ["roofline"]
+
+[launch]
+orchestrator = "modal"
+gpu = "L4"
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "00:30:00"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+measure_ceilings = false
+
+[params]
+model = "laya.english"
+roofline_limit = 200
+roofline_seed = 0
+roofline_max_tokens = 1024
+roofline_max_options = 16
+roofline_warmup = 4
+roofline_counted = 4
+roofline_per_length = 8
+roofline_tokenizer_file = "$MODELS_DIR/Qwen3.5-4B-Base/tokenizer.json"
+
+[sweep]
+sdpa_backend = ["efficient", "cudnn"]  # one container: both arms on the same host
+
+[grid]
+roofline_state_tokens = [128, 512]

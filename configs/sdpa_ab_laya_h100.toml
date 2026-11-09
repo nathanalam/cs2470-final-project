@@ -1,0 +1,37 @@
+# Laya attention-kernel A/B on an H100, natural lengths. Hypothesis (results/roofline_findings.md): on sm90+
+# PyTorch's default SDPA dispatch picks cuDNN, whose per-(q, kv)-shape execution-plan setup makes laya take
+# 64-122 ms per question below its 512-token limit (every question a new width) but ~25 ms at it (one width).
+# configs/roofline_sweep_laya.toml (same 200 questions, seed, warm-up and counted) on the H100 only, laya.english
+# only, with sdpa_backend swept: "default" (PyTorch's choice, reproduces 20261108-213216-62c0958e) and
+# "efficient" (the CUTLASS memory-efficient kernel the A100 and L4 pick; flash is out: ModernBERT passes an
+# attention mask, which PyTorch's flash backend does not take). Both arms run in one container, so on one host.
+# measure_ceilings is off (it does not change the timings; it saves a minute per arm).
+#   uv run --group modal s1 submit configs/sdpa_ab_laya_h100.toml
+benchmarks = ["roofline"]
+
+[launch]
+orchestrator = "modal"
+gpu = "H100"
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "00:45:00"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+measure_ceilings = false
+
+[params]
+model = "laya.english"
+roofline_limit = 200
+roofline_seed = 0
+roofline_max_tokens = 1024
+roofline_max_options = 16
+roofline_warmup = 8
+roofline_counted = 8
+roofline_tokenizer_file = "$MODELS_DIR/Qwen3.5-4B-Base/tokenizer.json"
+
+[sweep]
+sdpa_backend = ["default", "efficient"]

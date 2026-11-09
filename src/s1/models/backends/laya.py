@@ -12,7 +12,8 @@ pass. Apache-2.0.
 Weights: `scripts/download_model.sh convaiinnovations/laya <revision> laya` holds both checkpoints:
     laya_dir   the repo                         default $MODELS_DIR/laya
     checkpoint subdirectory of the checkpoint    from the spec ("" English, "multilingual")
-Settings: require_gpu (see backends/gpu.py). Weights stay fp32 under bf16 autocast, as upstream.
+Settings: require_gpu and sdpa_backend (see backends/gpu.py; sdpa_backend wraps every forward, decide and
+decide_batch, and is recorded as env_sdpa_backend). Weights stay fp32 under bf16 autocast, as upstream.
 measure_ceilings (default false) measures the GPU's roofline ceilings before loading.
 
 Roofline (benchmarks/roofline.py): the encoder's forwards are recorded by hooks on `model.encoder` (the
@@ -93,12 +94,13 @@ class Laya:
     recorder: profiling.ForwardRecorder | None = None
     mode: str = "eager"
     pad_multiple: int = 1
+    sdpa: str = gpu.SDPA_DEFAULT
     _compiled: object = None
     _graphs: dict[tuple[int, int, int], tuple[object, list[object], object]] = field(default_factory=dict)
     _pool: object = None
 
     def decide(self, state: str, questions: Mapping[str, object]) -> dict[str, object]:
-        with self.lock:
+        with self.lock, gpu.sdpa_kernel(self.sdpa):
             out = self.agent.system_one(state, dict(questions))  # ty: ignore[unresolved-attribute]
         answers = out["answers"]
         return {str(k): v for k, v in answers.items()}
@@ -130,6 +132,7 @@ class Laya:
         env: dict[str, Scalar] = {f"env_{k}": v for k, v in profiling.kernel_env(self._encoder()).items()}
         env["env_laya_mode"] = self.mode
         env["env_laya_graphs"] = len(self._graphs)
+        env["env_sdpa_backend"] = self.sdpa
         return env
 
     def _items(self, requests: Sequence[tuple[str, Mapping[str, object]]]) -> list[dict[str, object]]:
@@ -214,7 +217,7 @@ class Laya:
         rl = sys.modules["rl_common"]
         agent = self.agent
         device = agent.device  # ty: ignore[unresolved-attribute]
-        with self.lock, torch.no_grad():
+        with self.lock, torch.no_grad(), gpu.sdpa_kernel(self.sdpa):
             items = self._items(requests)
             b = rl.collate_items([items], agent.tok.pad_token_id)  # ty: ignore[unresolved-attribute]
             ids, att = b["input_ids"], b["attention_mask"]
@@ -258,6 +261,7 @@ def build(spec: ModelSpec, settings: dict[str, Scalar]) -> Laya:
     checkpoint = code_dir / get_str(settings, "checkpoint", "")
     if not (checkpoint / "model.safetensors").is_file():
         raise FileNotFoundError(f"{checkpoint}/model.safetensors missing")
+    sdpa = gpu.sdpa_backend(settings)  # validated before anything loads
     device = gpu.cuda_device(settings, spec.name)
     ceilings = (
         profiling.measure_ceilings(str(device)) if get_bool(settings, "measure_ceilings", False) else {}
@@ -268,7 +272,7 @@ def build(spec: ModelSpec, settings: dict[str, Scalar]) -> Laya:
         raise ValueError(f"laya_mode must be one of {MODES}, got {mode!r}")
     pad = get_int(settings, "laya_pad_multiple", 1)
     padded_width(1, pad)  # validates
-    return Laya(agent, spec.max_state_tokens, ceilings=ceilings, mode=mode, pad_multiple=pad)
+    return Laya(agent, spec.max_state_tokens, ceilings=ceilings, mode=mode, pad_multiple=pad, sdpa=sdpa)
 
 
 class LayaBackend:
