@@ -2,7 +2,9 @@
 
     [launch]
     orchestrator = "modal"
-    gpu = "H100"          # -> Modal "H100!" (no silent H200 upgrade); omit for a CPU-only container
+    gpu = "H100"          # -> Modal "H100!" (no silent H200 upgrade); omit for a CPU-only container.
+                          # A list (["L4", "H100", ...]) fans out: `s1 submit` runs one app and container
+                          # per GPU concurrently (ModalLauncher.submit_many); `--gpu X` picks one of them
     gpus = 1              # -> "H100!:2" when > 1
     cpus = 8              # -> cpu=8
     mem = "32G"           # -> memory=32768 (MiB)
@@ -10,12 +12,15 @@
     [launch.modal]        # optional, see EXTRAS
     openjev = true        # install the openjev extra (vLLM, transformers); default: true iff gpu is set
     echo = true           # register a built-in fake model "echo" (tests' EchoModel) for a CPU round trip
+    runtime = "default"   # which image (s1/launch/modal_images.py RUNTIMES): default, elephant, granite
     hf_secret = "hf"      # a Modal secret holding HF_TOKEN, for gated repos
 
 What runs where:
     image    Python 3.12 + `uv sync --frozen` of this repo's uv.lock (with `--extra openjev` for GPU runs),
              then src/ and configs/ copied in. tests/ is not shipped.
-    volumes  s1-models -> /models (MODELS_DIR), s1-hf-cache -> /hf-cache (HF_HOME), s1-runs -> /runs.
+    volumes  s1-models -> /models (MODELS_DIR), s1-hf-cache -> /hf-cache (HF_HOME), s1-runs -> /runs, and on
+             a GPU s1-triton-<gpu> -> /triton-cache (TRITON_CACHE_DIR: compiled Triton kernels, e.g.
+             flash-linear-attention's, survive between runs; one volume per GPU type).
     command  the same `s1 <args>` Slurm's --wrap runs; `run` gets `--results-dir /runs/<call>/results`, and
              `--set require_gpu=<name>` so a wrong card fails fast (unless the config already sets it).
     output   /runs/<call>/{results,logs}/ stay on the volume (a copy of everything); the records are written
@@ -39,7 +44,9 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
@@ -47,28 +54,25 @@ from typing import Any, TypedDict
 
 from .. import config, env
 from ..record import RESULTS_DIR, RunRecord, Scalar
-from .base import Resources
+from . import modal_images
+from .base import Outcome, Resources
+from .modal_images import (
+    HF_MOUNT,
+    IMAGE_ENV,
+    MODELS_MOUNT,
+    PYTHON,
+    REPO_ROOT,
+    WORKDIR,
+)
 
 APP_NAME = "s1"
-PYTHON = "3.12"
-UV_VERSION = "0.13.5"  # uv.lock is lock revision 5; pin the uv that reads it
-CUDA_DEVEL_IMAGE = "nvidia/cuda:13.0.3-devel-ubuntu24.04"  # GPU image base: nvcc for FlashInfer's JIT
-REPO_ROOT = Path(__file__).resolve().parents[3]
-WORKDIR = "/root/s1"  # container cwd: src/, configs/ and the submitted config live here
 VENV_PYTHON = "/.uv/.venv/bin/python"  # where Image.uv_sync puts the environment
-MODELS_MOUNT = "/models"
-HF_MOUNT = "/hf-cache"
 RUNS_MOUNT = "/runs"
+TRITON_MOUNT = "/triton-cache"  # per-GPU volume (triton_volume), only for GPU runs
 VOLUMES: Mapping[str, str] = {MODELS_MOUNT: "s1-models", HF_MOUNT: "s1-hf-cache", RUNS_MOUNT: "s1-runs"}
-IMAGE_ENV: Mapping[str, str] = {
-    "PYTHONPATH": f"{WORKDIR}/src",
-    "MODELS_DIR": MODELS_MOUNT,
-    "HF_HOME": HF_MOUNT,
-    "PYTHONUNBUFFERED": "1",
-}
 RUN_DIR = "{run_dir}"  # placeholder in planned args, filled in the container with /runs/<function call id>
 MAX_TIMEOUT_S = 24 * 3600
-EXTRAS = {"openjev", "echo", "hf_secret"}
+EXTRAS = {"openjev", "echo", "hf_secret", "runtime"}
 DOWNLOAD_CPU, DOWNLOAD_MEMORY_MIB, DOWNLOAD_TIMEOUT_S = 8.0, 16 * 1024, 4 * 3600  # as download_model.sh
 
 
@@ -92,12 +96,23 @@ GPUS: Mapping[str, GpuKind] = {
 }
 
 
+def gpu_key(name: str) -> str:
+    """The canonical portable name ("h100" -> "H100"); unknown names are an error."""
+    for key in GPUS:
+        if key.lower() == name.strip().lower():
+            return key
+    raise ValueError(f"unknown GPU {name!r} for Modal; use one of {', '.join(GPUS)}")
+
+
 def gpu_kind(name: str) -> GpuKind:
     """The Modal mapping of a portable GPU name (case-insensitive); unknown names are an error."""
-    for key, kind in GPUS.items():
-        if key.lower() == name.strip().lower():
-            return kind
-    raise ValueError(f"unknown GPU {name!r} for Modal; use one of {', '.join(GPUS)}")
+    return GPUS[gpu_key(name)]
+
+
+def triton_volume(gpu: str) -> str:
+    """The per-GPU Triton kernel cache volume ("H100" -> "s1-triton-h100"). Per GPU because compiled
+    kernels are specific to the architecture, and so that concurrent fan-out containers never share one."""
+    return f"s1-triton-{gpu_key(gpu).lower()}"
 
 
 def modal_gpu(gpu: str | None, gpus: int = 1) -> str | None:
@@ -160,14 +175,20 @@ class ModalPlan:
     cfg_text: str
     s1_args: tuple[str, ...]  # contains RUN_DIR, filled in remotely
     env: Mapping[str, str] = field(default_factory=dict)  # passed to the remote command
+    runtime: str = "default"  # [launch.modal] runtime: which modal_images image
+    triton_volume: str | None = None  # s1-triton-<gpu> at TRITON_MOUNT; None for CPU runs
+
+    @property
+    def volumes(self) -> dict[str, str]:
+        """mount -> volume name: the shared VOLUMES plus this GPU's Triton cache."""
+        extra = {} if self.triton_volume is None else {TRITON_MOUNT: self.triton_volume}
+        return {**VOLUMES, **extra}
 
     def describe(self) -> str:
-        extra = "--extra openjev" if self.openjev else "(base dependencies)"
-        vols = ", ".join(f"{name} -> {mount}" for mount, name in VOLUMES.items())
+        vols = ", ".join(f"{name} -> {mount}" for mount, name in self.volumes.items())
         cmd = shlex.join(["s1", *(a.replace(RUN_DIR, f"{RUNS_MOUNT}/CALL_ID") for a in self.s1_args)])
         lines = [
-            f"modal app {APP_NAME!r}, image: python {PYTHON} + uv {UV_VERSION} sync --frozen {extra}"
-            f" + src/ configs/ at {WORKDIR}",
+            f"modal app {APP_NAME!r}, image: {modal_images.describe(self.runtime, openjev=self.openjev)}",
             f"  gpu={self.gpu!r} cpu={self.cpu:g} memory={self.memory_mib} MiB timeout={self.timeout_s} s",
             f"  volumes: {vols}",
             f"  env: {', '.join(f'{k}={v}' for k, v in {**IMAGE_ENV, **self.env}.items())}",
@@ -231,6 +252,7 @@ def plan(
         timeout_s=timeout_s(resources.time),
         openjev=bool(extras.get("openjev", kind is not None)),
         echo=bool(extras.get("echo", False)),
+        runtime=modal_images.check_runtime(str(extras.get("runtime", "default"))),
         hf_secret=None if hf_secret is None else str(hf_secret),
         cfg_remote=cfg_remote,
         cfg_text=cfg.read_text(),
@@ -238,7 +260,9 @@ def plan(
         env={
             "S1_GIT_COMMIT": env.git_commit() if git_commit is None else git_commit,
             "S1_CPUS_REQUESTED": str(resources.cpus),
+            **({} if resources.gpu is None else {"TRITON_CACHE_DIR": TRITON_MOUNT}),
         },
+        triton_volume=None if resources.gpu is None else triton_volume(resources.gpu),
     )
 
 
@@ -276,26 +300,40 @@ def write_back(
     results_dir: Path = RESULTS_DIR,
     logs_dir: Path | None = None,
 ) -> tuple[list[Path], list[Path]]:
-    """Save the remote records with RunRecord.save and download each log (`fetch(path in s1-runs)`)."""
+    """Save the remote records with RunRecord.save and download each log (`fetch(path in s1-runs)`).
+
+    Safe when several fan-out calls return at once: write-backs run one at a time, a record never replaces
+    a different record with the same run id (run ids are unique, so that means something is wrong), and a
+    log whose name is already taken is saved as `<call id>-<name>` instead of overwriting it."""
     logs_dir = env.log_dir() if logs_dir is None else logs_dir
-    records: list[Path] = []
-    with tempfile.TemporaryDirectory() as tmp:
-        for name, text in sorted(result["records"].items()):
-            staged = Path(tmp) / Path(name).name
-            staged.write_text(text)
-            records.append(RunRecord.load(staged).save(results_dir))
-    logs: list[Path] = []
-    for rel in result["logs"]:
-        parts = Path(rel).parts
-        dest = logs_dir.joinpath(*(parts[1:] if parts[:1] == ("logs",) else parts))
-        if ".." in parts:
-            raise ValueError(f"refusing log path {rel!r}")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        with dest.open("wb") as out:
-            for chunk in fetch(f"{result['call_id']}/{rel}"):
-                out.write(chunk)
-        logs.append(dest)
+    with _WRITE_BACK_LOCK:
+        records: list[Path] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, text in sorted(result["records"].items()):
+                staged = Path(tmp) / Path(name).name
+                staged.write_text(text)
+                rec = RunRecord.load(staged)
+                existing = results_dir / f"{rec.run_id}.json"
+                if existing.exists() and RunRecord.load(existing) != rec:
+                    raise FileExistsError(f"{existing} exists with different contents; not overwriting")
+                records.append(rec.save(results_dir))
+        logs: list[Path] = []
+        for rel in result["logs"]:
+            parts = Path(rel).parts
+            if ".." in parts:
+                raise ValueError(f"refusing log path {rel!r}")
+            dest = logs_dir.joinpath(*(parts[1:] if parts[:1] == ("logs",) else parts))
+            if dest.exists():
+                dest = dest.with_name(f"{result['call_id']}-{dest.name}")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with dest.open("wb") as out:
+                for chunk in fetch(f"{result['call_id']}/{rel}"):
+                    out.write(chunk)
+            logs.append(dest)
     return records, logs
+
+
+_WRITE_BACK_LOCK = threading.Lock()
 
 
 # ---- talking to Modal (imports modal lazily) ----
@@ -314,30 +352,12 @@ def _check_python() -> None:
         raise RuntimeError(f"launch from Python {PYTHON} (this is {here}): uv run --python {PYTHON} ...")
 
 
-def _image(modal: ModuleType, *, openjev: bool) -> object:
-    if openjev:
-        # GPU runs need a CUDA toolkit at /usr/local/cuda, as on the cluster nodes: FlashInfer JIT-compiles
-        # its sampling kernel with nvcc during vLLM's warmup (debian_slim has no nvcc: vLLM failed to start).
-        # 13.0 matches torch 2.13.0's CUDA build and the cluster's toolkit. Triton needs gcc for its launcher.
-        base = (
-            modal.Image.from_registry(CUDA_DEVEL_IMAGE, add_python=PYTHON)
-            .apt_install("gcc", "libc6-dev")
-            .env({"CUDA_HOME": "/usr/local/cuda"})
-        )
-    else:
-        base = modal.Image.debian_slim(python_version=PYTHON)
-    return (
-        base.uv_sync(
-            str(REPO_ROOT), extras=["openjev"] if openjev else [], frozen=True, uv_version=UV_VERSION
-        )
-        .env(dict(IMAGE_ENV))
-        .add_local_dir(REPO_ROOT / "src", f"{WORKDIR}/src", ignore=["**/__pycache__", "**/*.pyc"])
-        .add_local_dir(REPO_ROOT / "configs", f"{WORKDIR}/configs")
-    )
+def _image(modal: ModuleType, *, openjev: bool, runtime: str = "default") -> object:
+    return modal_images.image(modal, runtime=runtime, openjev=openjev)
 
 
-def _volumes(modal: ModuleType) -> dict[str, object]:
-    return {mount: modal.Volume.from_name(name, create_if_missing=True) for mount, name in VOLUMES.items()}
+def _volumes(modal: ModuleType, volumes: Mapping[str, str] = VOLUMES) -> dict[str, object]:
+    return {mount: modal.Volume.from_name(name, create_if_missing=True) for mount, name in volumes.items()}
 
 
 def _secrets(modal: ModuleType, name: str | None) -> list[object]:
@@ -354,9 +374,18 @@ def build_image(*, openjev: bool = False) -> None:
         image.build(app)  # instance method: Image.build(self, app)
 
 
+class _Failed(RuntimeError):
+    """A run that failed after its function call started: carries what was written back."""
+
+    def __init__(self, message: str, call_id: str, records: Sequence[Path], logs: Sequence[Path]) -> None:
+        super().__init__(message)
+        self.call_id, self.records, self.logs = call_id, tuple(records), tuple(logs)
+
+
 @dataclass
 class ModalLauncher:
-    """`Launcher` for Modal: an ephemeral app per submit; blocks until the run ends, then writes back."""
+    """`Launcher` for Modal: an ephemeral app per submit; blocks until the run ends, then writes back.
+    `submit_many` (fan-out) does the same for several GPUs at once, one app and container per GPU."""
 
     results_dir: Path = RESULTS_DIR
     logs_dir: Path | None = None
@@ -371,44 +400,155 @@ class ModalLauncher:
             return ""
         _check_python()
         modal = _modal()
+        with modal.enable_output():
+            call_id, _, _ = self._run(modal, p, self.log)
+        return call_id
+
+    def submit_many(
+        self, cfg: Path, resources: Sequence[Resources], s1_args: Sequence[str], *, dry_run: bool = False
+    ) -> list[Outcome]:
+        """Every GPU at once, each in its own ephemeral app and container (inside, `s1 run` walks the
+        config's sweep in sequence). All plans are made first, so a bad GPU name or config fails before
+        anything starts; after that a failing GPU is reported in its `Outcome` and the rest carry on."""
+        plans = [plan(cfg, r, s1_args) for r in resources]
+        names = [r.gpu or "cpu" for r in resources]
+        for name, p in zip(names, plans, strict=True):
+            self.log(f"=== {name} ===\n{p.describe()}")
+        if dry_run:
+            return [Outcome(gpu=r.gpu) for r in resources]
+        _check_python()
+        modal = _modal()
+        # ONE app holding one named function per GPU, started once: Modal's output display is process-global
+        # and not thread-safe, so starting an app per thread broke every app but the first (2026-11-08:
+        # "'NoneType' object has no attribute 'label'" on 4 of 5 GPUs). The waits run in parallel threads.
         app = modal.App(APP_NAME)
-        volumes = _volumes(modal)
-        fn = app.function(
-            image=_image(modal, openjev=p.openjev),
+        fns = [
+            self._function(modal, app, p, name=f"run-{_slug(n)}") for n, p in zip(names, plans, strict=True)
+        ]
+        logs = [self._tagged(n) for n in names]
+        outcomes: list[Outcome | None] = [None] * len(plans)
+        calls: list[Any] = [None] * len(plans)
+        write_lock = threading.Lock()
+
+        def finish(i: int, fut: Future[str]) -> Outcome:
+            """Wait for GPU i and write it back as soon as it finishes (one GPU at a time), so a GPU stuck
+            in Modal's queue never holds finished GPUs' records back (2026-11-08: an L4 queued 25 min)."""
+            res, p = resources[i], plans[i]
+            call_id = str(calls[i].object_id)
+            try:
+                result = remote_result(fut.result())
+            except Exception as e:
+                return Outcome(res.gpu, call_id, error=f"{type(e).__name__}: {e}")
+            with write_lock:
+                try:
+                    records, written = self._finish(modal, p, result, logs[i])
+                except _Failed as e:
+                    return Outcome(res.gpu, e.call_id, e.records, e.logs, error=str(e))
+            return Outcome(res.gpu, result["call_id"], tuple(records), tuple(written))
+
+        with modal.enable_output(), app.run():
+            for i, (res, fn, p) in enumerate(zip(resources, fns, plans, strict=True)):
+                try:
+                    calls[i] = fn.spawn(self._payload(p))
+                except Exception as e:  # one GPU failing must not stop the others
+                    outcomes[i] = Outcome(res.gpu, error=f"{type(e).__name__}: {e}")
+                    continue
+                logs[i](f"modal function call {calls[i].object_id}")
+            with ThreadPoolExecutor(max_workers=2 * len(plans)) as pool:
+                waits = {i: pool.submit(c.get) for i, c in enumerate(calls) if c is not None}
+                done = {i: pool.submit(finish, i, fut) for i, fut in waits.items()}
+                for i, fut in done.items():
+                    outcomes[i] = fut.result()
+        return [
+            o if o is not None else Outcome(r.gpu, error="not run")
+            for o, r in zip(outcomes, resources, strict=True)
+        ]
+
+    def _tagged(self, name: str) -> Callable[[str], None]:
+        def log(text: str) -> None:
+            self.log("\n".join(f"[{name}] {line}" for line in text.splitlines()))
+
+        return log
+
+    def _function(  # app and result are modal.App / modal.Function (modal is imported lazily)
+        self,
+        modal: ModuleType,
+        app: Any,  # noqa: ANN401
+        p: ModalPlan,
+        *,
+        name: str | None = None,
+    ) -> Any:  # noqa: ANN401
+        """The Modal function running plan `p` in `app` (named, so one app can hold one per GPU)."""
+        kw: dict[str, Any] = {} if name is None else {"name": name}
+        return app.function(
+            image=_image(modal, openjev=p.openjev, runtime=p.runtime),
             gpu=p.gpu,
             cpu=p.cpu,
             memory=p.memory_mib,
             timeout=p.timeout_s,
-            volumes=volumes,
+            volumes=_volumes(modal, p.volumes),
             secrets=_secrets(modal, p.hf_secret),
             serialized=True,
             include_source=False,
+            **kw,
         )(_remote_run)
-        payload = json.dumps(
+
+    @staticmethod
+    def _payload(p: ModalPlan) -> str:
+        return json.dumps(
             {
                 "cfg_remote": p.cfg_remote,
                 "cfg_text": p.cfg_text,
                 "s1_args": list(p.s1_args),
                 "env": dict(p.env),
                 "echo": p.echo,
+                "commit": [VOLUMES[RUNS_MOUNT], VOLUMES[HF_MOUNT], *filter(None, [p.triton_volume])],
             }
         )
-        with modal.enable_output(), app.run():
-            call = fn.spawn(payload)
-            self.log(f"modal function call {call.object_id}")
-            result = remote_result(call.get())
+
+    def _finish(
+        self, modal: ModuleType, p: ModalPlan, result: RemoteResult, log: Callable[[str], None]
+    ) -> tuple[list[Path], list[Path]]:
+        """Write a finished call's records and logs back; raise _Failed if the remote command failed."""
         runs = modal.Volume.from_name(VOLUMES[RUNS_MOUNT])
         records, logs = write_back(
             result, runs.read_file, results_dir=self.results_dir, logs_dir=self.logs_dir
         )
         for path in [*records, *logs]:
-            self.log(f"wrote {path}")
+            log(f"wrote {path}")
         if result["returncode"] != 0:
-            raise RuntimeError(
+            raise _Failed(
                 f"remote `s1 {' '.join(p.s1_args[:2])}` exited {result['returncode']}; "
-                f"see {logs[0] if logs else 'the s1-runs volume'}"
+                f"see {logs[0] if logs else 'the s1-runs volume'}",
+                result["call_id"],
+                records,
+                logs,
             )
-        return result["call_id"]
+        return records, logs
+
+    def _run(
+        self, modal: ModuleType, p: ModalPlan, log: Callable[[str], None]
+    ) -> tuple[str, list[Path], list[Path]]:
+        """Run one plan in its own ephemeral app, wait, write back; (call id, records, logs)."""
+        app = modal.App(APP_NAME)
+        fn = self._function(modal, app, p)
+        call_id = ""
+        try:
+            with app.run():
+                call = fn.spawn(self._payload(p))
+                call_id = str(call.object_id)
+                log(f"modal function call {call_id}")
+                result = remote_result(call.get())
+        except Exception as e:
+            if not call_id:
+                raise
+            raise _Failed(f"{type(e).__name__}: {e}", call_id, [], []) from e
+        records, logs = self._finish(modal, p, result, log)
+        return result["call_id"], records, logs
+
+
+def _slug(gpu: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", gpu.lower()).strip("-") or "cpu"
 
 
 class DownloadReport(TypedDict):
@@ -519,7 +659,7 @@ def _remote_run(payload_json: str) -> str:
         log.write(f"EXIT={code}\n")
     records = {p.name: p.read_text() for p in sorted((run_dir / "results").glob("*.json"))}
     logs = [p.relative_to(run_dir).as_posix() for p in sorted((run_dir / "logs").rglob("*")) if p.is_file()]
-    for name in (VOLUMES[RUNS_MOUNT], VOLUMES[HF_MOUNT]):
+    for name in payload.get("commit", [VOLUMES[RUNS_MOUNT], VOLUMES[HF_MOUNT]]):
         modal.Volume.from_name(name).commit()
     result: RemoteResult = {"call_id": call_id, "returncode": code, "records": records, "logs": logs}
     return json.dumps(result)

@@ -19,12 +19,22 @@
 #
 # Limitation: for pull requests from forks, GitHub runs the workflow definition from the base repo, so this
 # CI only runs on PRs after this file has been merged into the base branch's main.
+#
+# GPU smoke (job gpu-smoke, the only job that spends money, ~$0.03-0.05 a run): after `check` passes, run
+# configs/ci_gpu_smoke_modal.toml on Modal (5 fixed real JEVal questions, OLMoE-1B-7B, one L4) and require
+# 5 valid answers (scripts/check_gpu_smoke.py). It runs on
+#   * every push to any branch of the fork noas-ark/cs2470-final-project, and
+#   * every push to main (merges included) of any copy of the repo, e.g. nathanalam/cs2470-final-project,
+#   * by hand (Actions -> CI -> Run workflow).
+# Never on pull_request: GitHub gives fork PRs no secrets. It needs repo secrets MODAL_TOKEN_ID and
+# MODAL_TOKEN_SECRET (a Modal token); without them it skips with a warning instead of failing. Its spend is not
+# in .claude/gpu-ledger.json; cap it with a Modal workspace budget. The record it writes is not committed.
 name: CI
 
 on:
   pull_request:
   push:
-    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -72,3 +82,61 @@ jobs:
             echo "$changed"
             exit 1
           fi
+
+  gpu-smoke:
+    needs: check
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' &&
+       (github.repository == 'noas-ark/cs2470-final-project' || github.ref == 'refs/heads/main'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30 # the Modal function itself stops at 20 min ([launch] time)
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+    steps:
+      - name: Modal credentials present
+        id: creds
+        run: |
+          if [ -z "$MODAL_TOKEN_ID" ] || [ -z "$MODAL_TOKEN_SECRET" ]; then
+            echo "::warning::GPU smoke skipped: set repo secrets MODAL_TOKEN_ID and MODAL_TOKEN_SECRET"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v7.0.1
+        if: steps.creds.outputs.ok == 'true'
+
+      - uses: astral-sh/setup-uv@v10.3.2
+        if: steps.creds.outputs.ok == 'true'
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          python-version: "3.12"
+
+      - name: Install (core + modal group)
+        if: steps.creds.outputs.ok == 'true'
+        run: uv sync --locked --group modal
+
+      - name: 5 JEVal questions on a Modal L4
+        if: steps.creds.outputs.ok == 'true'
+        run: uv run --group modal s1 submit configs/ci_gpu_smoke_modal.toml
+
+      - name: All 5 answered validly
+        if: steps.creds.outputs.ok == 'true'
+        run: |
+          mkdir -p smoke
+          git ls-files --others --exclude-standard -- 'results/*.json' | xargs -r -I{} mv {} smoke/
+          uv run python scripts/check_gpu_smoke.py smoke
+
+      - name: Keep the run's logs
+        if: always() && steps.creds.outputs.ok == 'true'
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: gpu-smoke-logs
+          path: |
+            logs/
+            smoke/
+          if-no-files-found: ignore
+          retention-days: 14
