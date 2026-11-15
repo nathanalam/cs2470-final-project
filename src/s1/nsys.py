@@ -237,8 +237,14 @@ def gpu_metrics(sqlite_file: Path) -> tuple[Metrics, str]:
     for t, i, ts, v in rows:
         name = names.get((int(t), int(i)))
         if name is not None and v is not None:
-            series.setdefault(name, {})[int(ts)] = float(v)
+            series.setdefault(name, {})[int(ts)] = _unit(name, float(v))
     return summarize_gpu_metrics(series), "; ".join(sorted(series))
+
+
+def _unit(name: str, value: float) -> float:
+    """nsys 2025 on Modal stores the "[MHz]" clock metrics in Hz (an H100's GPC clock reads ~1.8e9): scale
+    those to MHz so the key means what its name says. Values already in MHz (< 1e5) are left alone."""
+    return value / 1e6 if "[mhz]" in name.lower() and value > 1e5 else value
 
 
 def summarize_gpu_metrics(series: Mapping[str, Mapping[int, float]]) -> Metrics:

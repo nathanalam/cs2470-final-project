@@ -445,3 +445,9 @@ def test_nsys_gpu_metrics_reads_the_export_inside_the_range(tmp_path):
     empty = tmp_path / "none.sqlite"
     sqlite3.connect(empty).close()
     assert nsys.gpu_metrics(empty) == ({}, "")
+
+
+def test_nsys_gpu_metrics_clocks_in_hz_read_as_mhz():
+    assert nsys._unit("GPC Clock Frequency [MHz]", 1_798_059_784.8) == pytest.approx(1798.06, abs=0.01)
+    assert nsys._unit("GPC Clock Frequency [MHz]", 1755.0) == 1755.0  # already MHz
+    assert nsys._unit("DRAM Read Bandwidth [Throughput %]", 2e6) == 2e6  # other units untouched
