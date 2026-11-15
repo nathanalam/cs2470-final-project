@@ -1,0 +1,33 @@
+# configs/d1_jeval_smoke.toml on one Modal L4 instead of the cluster: 200 random JEVal questions, one at a
+# time, d1-3b.eager and d1-3b.compiled in one container (the model reloads between them). Same questions,
+# seed and limits, so the two variants should agree on accuracy to bf16 noise. The compiled variant captures a
+# CUDA graph per new prompt length, so its latency here includes captures; the roofline configs warm every
+# timed row and are the ones to read for its speed.
+# Weights (once): uv run --group modal s1 download LiquidAI/d1-3B 05b80faf55536582ad5ffb2da7456f6a653acf71 d1-3B
+#   uv run --group modal s1 submit configs/d1_jeval_smoke_modal.toml
+benchmarks = ["jeval"]
+
+[launch]
+orchestrator = "modal"
+gpu = "L4"
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "01:00:00"   # hard stop: a hung run costs at most an hour of L4
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+require_gpu = "L4"
+dtype = "bfloat16"
+max_prompt_tokens = 16384  # the model reads 32,768; this matches the openjev runs
+
+[params]
+jeval_limit = 200
+jeval_seed = 0
+jeval_concurrency = 1
+jeval_warmup = true      # one untimed pass first: kernel compilation is not latency
+
+[sweep]
+model = ["d1-3b.eager", "d1-3b.compiled"]
