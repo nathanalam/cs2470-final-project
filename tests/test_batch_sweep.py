@@ -451,3 +451,20 @@ def test_nsys_gpu_metrics_clocks_in_hz_read_as_mhz():
     assert nsys._unit("GPC Clock Frequency [MHz]", 1_798_059_784.8) == pytest.approx(1798.06, abs=0.01)
     assert nsys._unit("GPC Clock Frequency [MHz]", 1755.0) == 1755.0  # already MHz
     assert nsys._unit("DRAM Read Bandwidth [Throughput %]", 2e6) == 2e6  # other units untouched
+
+
+def test_nsys_warmup_offset_profiles_rows_the_warmup_never_saw(tmp_path, monkeypatch):
+    seen: list[int] = []
+    build = batch_sweep.requests
+
+    def tracking(rows):
+        seen.extend(id(r) for r in rows)  # which pool row each batch-1 decision answers
+        return build(rows)
+
+    monkeypatch.setattr(batch_sweep, "requests", tracking)
+    _run(tmp_path, monkeypatch, FakeBatched(), batch_nsys=3, batch_warmup=3, batch_nsys_warmup_offset=4)
+    warm, profiled = seen[:3], seen[3:]
+    assert len(profiled) == 3 and not set(warm) & set(profiled)  # cold shapes in the profiled region
+    seen.clear()
+    _run(tmp_path, monkeypatch, FakeBatched(), batch_nsys=3, batch_warmup=3)
+    assert seen[:3] == seen[3:]  # default: the profiled rows were the warm-up rows

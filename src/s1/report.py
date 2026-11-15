@@ -16,7 +16,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import report_batch, report_lengths, report_qpr, report_roofline
+from . import report_batch, report_lengths, report_profiling, report_qpr, report_roofline
 from .record import RESULTS_DIR, Metrics, RunRecord, load_all
 
 SUFFIXES = ("accuracy", "ece", "brier", "invalid", "n", "latency_ms", "latency_ms_p99", "questions_per_s")
@@ -373,6 +373,62 @@ def _html_qpr(recs: Sequence[RunRecord]) -> list[str]:
     ]
 
 
+def _md_nsys_lengths(recs: Sequence[RunRecord]) -> list[str]:
+    h, rows = report_profiling.nsys_table(recs)
+    if not rows:
+        return []
+    title = "### Nsight Systems: kernel-time roofline and GPU counters by state length"
+    out = [report_profiling.NOTE, "", title,
+           "", _md_table(Table(h, rows)), ""]  # fmt: skip
+    rh, rrows = report_profiling.h200_table(recs)
+    if rrows:
+        out += ["### Nsight Systems: H100 over H200 by state length", "", _md_table(Table(rh, rrows)), ""]
+    return out
+
+
+def _md_ncu_sampled(recs: Sequence[RunRecord]) -> list[str]:
+    h, rows = report_profiling.ncu_table(recs)
+    if not rows:
+        return []
+    out = ["### Sampled Nsight Compute: kernel classes", "", _md_table(Table(h, rows)), ""]
+    rh, rrows = report_profiling.ncu_ratio_table(recs)
+    if rrows:
+        out += [
+            "### Sampled Nsight Compute: H100 over H200 per kernel class",
+            "",
+            _md_table(Table(rh, rrows)),
+            "",
+        ]
+    return out
+
+
+def _html_nsys_lengths(recs: Sequence[RunRecord]) -> list[str]:
+    h, rows = report_profiling.nsys_table(recs)
+    if not rows:
+        return []
+    parts = [f'<p class="sub">{html.escape(report_profiling.NOTE)}</p>',
+             "<h3>Nsight Systems: kernel-time roofline and GPU counters by state length</h3>",
+             '<div class="card">', _html_table(Table(h, rows), 5, len(h) - 1), "</div>"]  # fmt: skip
+    rh, rrows = report_profiling.h200_table(recs)
+    if rrows:
+        parts += ["<h3>Nsight Systems: H100 over H200 by state length</h3>", '<div class="card">',
+                  _html_table(Table(rh, rrows), 3, len(rh)), "</div>"]  # fmt: skip
+    return parts
+
+
+def _html_ncu_sampled(recs: Sequence[RunRecord]) -> list[str]:
+    h, rows = report_profiling.ncu_table(recs)
+    if not rows:
+        return []
+    parts = ["<h3>Sampled Nsight Compute: kernel classes</h3>", '<div class="card">',
+             _html_table(Table(h, rows), 6, len(h) - 1), "</div>"]  # fmt: skip
+    rh, rrows = report_profiling.ncu_ratio_table(recs)
+    if rrows:
+        parts += ["<h3>Sampled Nsight Compute: H100 over H200 per kernel class</h3>", '<div class="card">',
+                  _html_table(Table(rh, rrows), 4, len(rh)), "</div>"]  # fmt: skip
+    return parts
+
+
 def to_markdown(recs: Sequence[RunRecord], results_dir: Path = RESULTS_DIR) -> str:
     out = [
         "# Results",
@@ -410,8 +466,10 @@ def to_markdown(recs: Sequence[RunRecord], results_dir: Path = RESULTS_DIR) -> s
                 ]
             out += _md_lengths(recs)
             out += _md_qpr(recs)
+            out += _md_ncu_sampled(recs)
         if bench == report_batch.BENCH:
             out += _md_batch(recs)
+            out += _md_nsys_lengths(recs)
         out += [
             "### Leaderboard (each model's largest run)",
             "",
@@ -571,8 +629,10 @@ def to_html(recs: Sequence[RunRecord], results_dir: Path = RESULTS_DIR) -> str:
                           _html_table(Table(header, rows), 2, len(header)), "</div>"]  # fmt: skip
             parts += _html_lengths(recs)
             parts += _html_qpr(recs)
+            parts += _html_ncu_sampled(recs)
         if bench == report_batch.BENCH:
             parts += _html_batch(recs)
+            parts += _html_nsys_lengths(recs)
         parts += ["<h3>Leaderboard (each model's largest run)</h3>", '<div class="card">',
                   _html_table(leaderboard(bench, recs), 1, 1 + n_keys), "</div>"]  # fmt: skip
         parts += ["<h3>All runs</h3>", '<div class="card">',

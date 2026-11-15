@@ -49,6 +49,9 @@ batch_seed 0, batch_max_options 16, batch_max_question_tokens 512, batch_tokeniz
 words if unset), batch_trace 2 (batches traced per point; 0 = no trace), batch_nsys 0, batch_warmup 8,
 batch_min_state_tokens 0 (pool rows need a state at least this long, and at least max(L): configs with
 different longest lengths then share rows).
+batch_nsys_warmup_offset 0 (the nsys warm-up answers pool rows offset, offset+1, ...; with the pool at least
+offset + batch_nsys, the profiled rows 0..n-1 were never seen, so every question shape is new to the profiled
+region while the model, allocator and kernels are warm).
 """
 
 from __future__ import annotations
@@ -349,8 +352,9 @@ def nsys_region(
     profiler = getattr(m, "profiler", None)
     if not callable(profiler):
         raise TypeError(f"batch_nsys needs a model with .profiler(on); got {type(m).__name__}")
+    offset = get_int(settings, "batch_nsys_warmup_offset", 0)  # > 0: warm on other rows, profile cold shapes
     for i in range(get_int(settings, "batch_warmup", 8)):
-        m.decide_batch(requests([pool[i % len(pool)]]))
+        m.decide_batch(requests([pool[(i + offset) % len(pool)]]))
     if callable(after_warmup := getattr(m, "after_warmup", None)):
         after_warmup()
     m.take_forwards()

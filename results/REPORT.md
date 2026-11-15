@@ -77,6 +77,15 @@ Hypothesis H2 (docs/h2_batch_findings.md): B independent requests per forward, n
 | B200 (Modal) | Kev-4B (fused + graphs) | 192 | 272 | 360 | 381 | 425 | 446 | 444 | 2.3x |
 | B200 (Modal) | Qwen3-8B eager | 179 | 355 | 547 | 590 | 638 | 678 | 718 | 4.0x |
 
+Hardware profiling (2026-11-15 on): Nsight Systems length runs with GPU-metrics sampling, and sampled Nsight Compute. nsys wall time includes its own tracing, so compare kernel time across GPUs; GPU counters are means over samples where the SMs were active, in % of the GPU's peak. Kernel TFLOP/s and GB/s are cost-model work over kernel time (host time removed). Sampled ncu profiles the first N kernels of one question (about three decoder layers for N = 200), so its rates are per class, not whole-forward totals.
+
+### Nsight Systems: kernel-time roofline and GPU counters by state length
+
+| Model | GPU | Host CPU | State tokens | Warm-up | Wall ms | Kernel ms | GPU share | Kernel TFLOP/s | Kernel GB/s | DRAM read % | DRAM write % | Tensor % | SMs % | Run |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| qwen3-8b.zeroshot | H100 80GB HBM3 (Modal) | Sapphire Rapids | 512 | warm | 33.8 | 27.1 | 0.80 | 412 | 577 | 19 | 9 | 41 | 74 | 20261115-063935-108b5112 |
+| qwen3-8b.zeroshot | H100 80GB HBM3 (Modal) | Sapphire Rapids | 8,192 | warm | 318.0 | 299.0 | 0.94 | 470 | 68 | 26 | 13 | 57 | 96 | 20261115-064014-ab47e68f |
+
 ### Leaderboard (each model's largest run)
 
 | Model | b1_cpu_share | Platform | Hardware | Run |
@@ -711,6 +720,21 @@ Median GPU ms on the H100 80GB HBM3 over the H200, same questions at each length
 | semif.reranker | row, reranker | H200 (Modal) | 2048 | 1-32 | 240 | 160 | 0.666 | 0.64 | 279 | 309 |
 | semif.reranker | row, reranker | B200 (Modal) | 256 | 1-32 | 65.5 | 25.4 | 0.388 | 0.36 | 213 | 307 |
 | semif.reranker | row, reranker | B200 (Modal) | 2048 | 1-32 | 239 | 147 | 0.613 | 0.58 | 280 | 339 |
+
+### Sampled Nsight Compute: kernel classes
+
+| Model | GPU | Metrics | Kernels | State tokens | Class | Share | Kernel ms | TFLOP/s | DRAM GB/s | DRAM % | SM % | Run |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| qwen3-8b.zeroshot | H100 80GB HBM3 (Modal) | full | 199 | 2,048 | gemm | 53% | 3.67 | 795 | 861 | 26 | 90 | 20261115-064138-0fe7cdb8 |
+| qwen3-8b.zeroshot | H100 80GB HBM3 (Modal) | full | 199 | 2,048 | attention | 5% | 0.33 | 465 | 321 | 10 | 50 | 20261115-064138-0fe7cdb8 |
+| qwen3-8b.zeroshot | H100 80GB HBM3 (Modal) | full | 199 | 2,048 | routing | 0% | 0.01 | 0 | 552 | 17 | 19 | 20261115-064138-0fe7cdb8 |
+| qwen3-8b.zeroshot | H100 80GB HBM3 (Modal) | full | 199 | 2,048 | norm | 4% | 0.29 | 1 | 1,689 | 50 | 30 | 20261115-064138-0fe7cdb8 |
+| qwen3-8b.zeroshot | H100 80GB HBM3 (Modal) | full | 199 | 2,048 | elementwise | 38% | 2.63 | 2 | 1,542 | 46 | 39 | 20261115-064138-0fe7cdb8 |
+| qwen3-8b.zeroshot | H100 80GB HBM3 (Modal) | lean | 199 | 2,048 | gemm | 53% | 3.67 | 795 | 861 | 26 | 90 | 20261115-063935-3c96498f |
+| qwen3-8b.zeroshot | H100 80GB HBM3 (Modal) | lean | 199 | 2,048 | attention | 5% | 0.33 | 464 | 325 | 10 | 51 | 20261115-063935-3c96498f |
+| qwen3-8b.zeroshot | H100 80GB HBM3 (Modal) | lean | 199 | 2,048 | routing | 0% | 0.01 | 0 | 552 | 16 | 19 | 20261115-063935-3c96498f |
+| qwen3-8b.zeroshot | H100 80GB HBM3 (Modal) | lean | 199 | 2,048 | norm | 4% | 0.29 | 0 | 1,686 | 50 | 30 | 20261115-063935-3c96498f |
+| qwen3-8b.zeroshot | H100 80GB HBM3 (Modal) | lean | 199 | 2,048 | elementwise | 38% | 2.63 | 0 | 1,538 | 46 | 39 | 20261115-063935-3c96498f |
 
 ### Leaderboard (each model's largest run)
 
