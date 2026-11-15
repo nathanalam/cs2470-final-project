@@ -34,7 +34,8 @@ slows the host). Headline keys (first): the batch-1 CPU share at the shortest le
 B = 1 to the largest B that ran there. `batch_b1_*` repeat the shortest length's batch-1 point.
 
 `batch_nsys = N` (set by `s1 nsys`, see s1/nsys.py) replaces the sweep: N batch-1 decisions at the shortest
-length run inside one CUDA profiler range, after `batch_warmup` untimed ones, and the region's wall time is
+length (or at `batch_nsys_state_tokens`, one of the grid's lengths) run inside one CUDA profiler range, after
+`batch_warmup` untimed ones, and the region's wall time is
 recorded as batch_nsys_{n,wall_ms}; `s1 nsys` adds the Nsight Systems CPU/GPU split to the record.
 
 The model implements, besides roofline's `profile_info` / `take_forwards`:
@@ -240,7 +241,8 @@ def run(model: object, settings: Settings) -> Metrics:
     }
     lengths, sizes = sorted(parse_int_list(settings, LENGTHS)), sorted(parse_int_list(settings, SIZES))
     if n_nsys := get_int(settings, "batch_nsys", 0):
-        return nsys_region(m, pools(settings, lengths[:1], 1)[lengths[0]], n_nsys, settings)
+        at = nsys_length(settings, lengths)
+        return nsys_region(m, pools(settings, lengths, 1)[at], n_nsys, settings, at)
     pool = pools(settings, lengths, max(sizes))
     after_warmup = getattr(m, "after_warmup", None)
     traced_n = get_int(settings, "batch_trace", 2)
@@ -315,14 +317,26 @@ def trace_batches(m: Batched, plan: Sequence[Sequence[jeval.Row]]) -> Trace | No
         m.take_forwards()
 
 
-def nsys_region(m: Batched, pool: Sequence[jeval.Row], n: int, settings: Settings) -> Metrics:
-    """`batch_warmup` untimed batch-1 decisions, then `n` inside one CUDA profiler range (cudaProfilerStart/
-    Stop), the range Nsight Systems captures under `s1 nsys`."""
+def nsys_length(settings: Settings, lengths: Sequence[int]) -> int:
+    """The state length `batch_nsys` profiles: `batch_nsys_state_tokens` (one of the grid's lengths, so the
+    rows are the same at every length), else the shortest."""
+    at = get_int(settings, "batch_nsys_state_tokens", 0) or min(lengths)
+    if at not in lengths:
+        raise ValueError(f"batch_nsys_state_tokens {at} is not in [grid] {LENGTHS} {sorted(lengths)}")
+    return at
+
+
+def nsys_region(m: Batched, pool: Sequence[jeval.Row], n: int, settings: Settings, length: int) -> Metrics:
+    """`batch_warmup` untimed batch-1 decisions (then the model's `after_warmup`, as the sweep does), then `n`
+    inside one CUDA profiler range (cudaProfilerStart/Stop), the range Nsight Systems captures under
+    `s1 nsys`."""
     profiler = getattr(m, "profiler", None)
     if not callable(profiler):
         raise TypeError(f"batch_nsys needs a model with .profiler(on); got {type(m).__name__}")
     for i in range(get_int(settings, "batch_warmup", 8)):
         m.decide_batch(requests([pool[i % len(pool)]]))
+    if callable(after_warmup := getattr(m, "after_warmup", None)):
+        after_warmup()
     m.take_forwards()
     profiler(True)
     t0 = time.perf_counter()
@@ -333,9 +347,8 @@ def nsys_region(m: Batched, pool: Sequence[jeval.Row], n: int, settings: Setting
         wall = (time.perf_counter() - t0) * 1e3
         profiler(False)
     m.take_forwards()
-    lengths = sorted(parse_int_list(settings, LENGTHS))
     return {
         "batch_nsys_n": float(n),
         "batch_nsys_wall_ms": wall,
-        "batch_nsys_state_tokens": float(lengths[0]),
+        "batch_nsys_state_tokens": float(length),
     }

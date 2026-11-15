@@ -356,3 +356,29 @@ def test_d1_compiled_counts_no_flops():
     model, _ = make_d1()
     model.compiled = True
     assert math.isnan(model.count_flops("s", {"q": NOUL}))
+
+
+# --- sdpa_backend -------------------------------------------------------------------------------
+
+
+def test_sdpa_backend_setting():
+    assert gpu.sdpa_backend({}) == "default"
+    assert gpu.sdpa_backend({"sdpa_backend": "default"}) == "default"
+    for name in ("flash", "efficient", "cudnn", "math"):
+        assert gpu.sdpa_backend({"sdpa_backend": name}) == name
+    assert gpu.sdpa_backend({"sdpa_backend": " Efficient "}) == "efficient"
+    with pytest.raises(ValueError, match="sdpa_backend"):
+        gpu.sdpa_backend({"sdpa_backend": "flash2"})
+
+
+def test_sdpa_default_needs_no_torch(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch.nn.attention", None)  # any import of it now raises
+    with gpu.sdpa_kernel("default"):
+        pass
+    with pytest.raises(ImportError), gpu.sdpa_kernel("efficient"):  # a forced backend does import it
+        pass
+
+
+def test_laya_records_sdpa_backend():
+    assert laya.Laya(agent=object()).sdpa == "default"
+    assert laya.Laya(agent=object(), sdpa="efficient").sdpa == "efficient"

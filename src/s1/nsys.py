@@ -9,24 +9,35 @@ with `batch_nsys = N` set, so the benchmark answers N batch-1 decisions inside o
 (cudaProfilerStart/Stop) and records that region's host wall time. `nsys stats` then writes the
 `cuda_api_sum` and `cuda_gpu_kern_sum` reports as CSV, and `summarize` turns them into, per decision:
 
-    batch_nsys_kernel_ms        summed GPU kernel time (what the GPU spent computing)
-    batch_nsys_kernels          kernels launched (a CUDA graph's kernels count one by one)
+    batch_nsys_kernel_ms        summed GPU kernel time (what the GPU spent computing), CUDA graphs included
+    batch_nsys_kernels          kernels launched outside CUDA graphs
+    batch_nsys_graph_ms         GPU time of CUDA graph replays (part of kernel_ms)
+    batch_nsys_graph_launches   CUDA graph replays
     batch_nsys_launch_api_ms    host time in kernel and graph launch calls
     batch_nsys_sync_ms          host time blocked in synchronize calls (waiting for the GPU)
     batch_nsys_gpu_share        kernel time / wall time: the GPU's share of the latency
     batch_nsys_cpu_share        1 - gpu_share: host work, launch gaps and idle GPU between kernels
 
+nsys traces a CUDA graph as one unit by default (--cuda-graph-trace=graph): its kernels are missing from
+cuda_gpu_kern_sum, and each replay is one row of CUPTI_ACTIVITY_KIND_GRAPH_TRACE in the report's SQLite
+export (`graph_trace`). That row spans the graph's first kernel start to its last kernel end, so it also
+counts any small gaps inside the graph. Rows from before the capture range (earlier replays nsys still
+reports) are dropped.
+
 Kernel time on one stream never overlaps, so gpu_share <= 1 for these single-stream models. nsys adds a little
 host time to every API call it traces, so wall time under nsys is slightly above an untraced run's.
 
-Torch-free: only parses `nsys stats --format csv` output.
+Torch-free: only parses `nsys stats --format csv` output and reads its SQLite export.
 """
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import io
+import sqlite3
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 
 from .record import Metrics
 
@@ -107,16 +118,39 @@ def parse(text: str) -> list[tuple[str, float, int]]:
     return out
 
 
+GRAPH_TABLE = "CUPTI_ACTIVITY_KIND_GRAPH_TRACE"
+RUNTIME_TABLE = "CUPTI_ACTIVITY_KIND_RUNTIME"
+
+
+def graph_trace(sqlite_file: Path) -> tuple[int, float]:
+    """(CUDA graph replays, their summed GPU ns) inside the captured range, from the report's SQLite export.
+    The range is the CUDA runtime calls' span; (0, 0.0) when the run replayed no graph."""
+    with contextlib.closing(sqlite3.connect(f"file:{sqlite_file}?mode=ro", uri=True)) as db:
+        tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        if GRAPH_TABLE not in tables or RUNTIME_TABLE not in tables:
+            return 0, 0.0
+        n, total = db.execute(
+            f"SELECT COUNT(*), COALESCE(SUM(g.end - g.start), 0) FROM {GRAPH_TABLE} AS g, "
+            f"(SELECT MIN(start) AS s, MAX(end) AS e FROM {RUNTIME_TABLE}) AS r "
+            "WHERE g.start >= r.s AND g.end <= r.e"
+        ).fetchone()
+    return int(n), float(total)
+
+
 def summarize(
-    api: Sequence[tuple[str, float, int]], kernels: Sequence[tuple[str, float, int]], run: Mapping[str, float]
+    api: Sequence[tuple[str, float, int]],
+    kernels: Sequence[tuple[str, float, int]],
+    run: Mapping[str, float],
+    graphs: tuple[int, float] = (0, 0.0),
 ) -> Metrics:
     """Per-decision CPU/GPU split of the profiled region; `run` holds the benchmark's `batch_nsys_n` and
-    `batch_nsys_wall_ms` (the region's host wall time)."""
+    `batch_nsys_wall_ms` (the region's host wall time), `graphs` is `graph_trace`'s (replays, GPU ns)."""
     n = run.get("batch_nsys_n", 0.0)
     wall = run.get("batch_nsys_wall_ms", 0.0)
     if n <= 0 or wall <= 0:
         raise ValueError("the run recorded no nsys region (batch_nsys_n / batch_nsys_wall_ms)")
-    kernel_ms = sum(t for _, t, _ in kernels) / 1e6
+    graph_n, graph_ns = graphs
+    kernel_ms = (sum(t for _, t, _ in kernels) + graph_ns) / 1e6
     launches = sum(c for name, _, c in api if is_launch(name))
     launch_ms = sum(t for name, t, _ in api if is_launch(name)) / 1e6
     sync_ms = sum(t for name, t, _ in api if is_sync(name)) / 1e6
@@ -128,6 +162,8 @@ def summarize(
         "batch_nsys_wall_ms_per_decision": wall / n,
         "batch_nsys_kernel_ms": kernel_ms / n,
         "batch_nsys_kernels": sum(c for _, _, c in kernels) / n,
+        "batch_nsys_graph_ms": graph_ns / 1e6 / n,
+        "batch_nsys_graph_launches": graph_n / n,
         "batch_nsys_launches": launches / n,
         "batch_nsys_launch_api_ms": launch_ms / n,
         "batch_nsys_sync_ms": sync_ms / n,
