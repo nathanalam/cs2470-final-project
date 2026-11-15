@@ -263,11 +263,15 @@ def _md_table(t: Table) -> str:
 
 
 GRAPH_NOTE = (
-    "d1-3b.compiled replays one CUDA graph per exact prompt length; torch records a length's graph on its "
-    '2nd call and replays it only from the 3rd. Rows marked "graph recording timed" were warmed once, so '
-    "they time the recording (~24 ms extra per question on the L40S); the unmarked d1-3b.compiled row was "
-    "warmed twice (configs/roofline_d1_graph_warmup.toml) and times replays: on the L40S 11.7 ms vs eager "
-    "14.6 ms at 32 tokens, 62.2 vs 69.9 ms at 2048."
+    "d1-3b.compiled replays one CUDA graph per exact prompt length; torch records a length's graph on"
+    ' its 2nd call and replays it only from the 3rd. Rows marked "graph recording timed" were warmed '
+    "once and time the recording; unmarked d1-3b.compiled rows were warmed twice "
+    "(configs/roofline_d1_graph_warmup.toml, configs/roofline_d1_graph_replay_gpus.toml) and time "
+    "replays. At 32 tokens, replay vs eager: B200 3.1 vs 15.8 ms, H200 4.1 vs 23.8, H100 4.6 vs 23.2,"
+    " A100 9.8 vs 18.7, L40S 11.7 vs 14.6, L4 32.8 vs 34.6. Eager d1-3B on the big GPUs is host-"
+    "launch-bound: the GPU work is 3-5 ms of its 16-24 ms, and on the B200 eager stays near 16-17 ms "
+    "up to 2048 tokens while the replay rises from 3 to 14 ms. Host CPUs differ between the eager and"
+    " replay containers (meta.cpu_model), so the replays do not separate an AMD from an Intel host."
 )
 
 
