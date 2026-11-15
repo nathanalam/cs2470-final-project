@@ -335,3 +335,113 @@ def test_laya_graph_key():
 
 def test_laya_modes():
     assert laya.MODES == ("eager", "graphs", "compile", "compile_graphs")
+
+
+# ---- kernel-time roofline and GPU-metrics sampling (nsys_gpu_metrics) ----
+
+
+def test_nsys_region_records_work_per_decision(tmp_path, monkeypatch):
+    m = _run(tmp_path, monkeypatch, FakeBatched(), batch_nsys=4, batch_warmup=2).results["batch"]
+    assert (
+        m["batch_nsys_gflop"] > 0 and m["batch_nsys_mb"] > 0
+    )  # cost model of the 4 profiled decisions, each
+
+
+def test_nsys_summarize_kernel_time_roofline():
+    run = {"batch_nsys_n": 10.0, "batch_nsys_wall_ms": 20.0, "batch_nsys_gflop": 5.0, "batch_nsys_mb": 100.0}
+    m = nsys.summarize(nsys.parse(API_CSV), nsys.parse(KERN_CSV), run)
+    assert m["batch_nsys_kernel_ms"] == pytest.approx(0.5)
+    assert m["batch_nsys_kernel_tflops"] == pytest.approx(10.0)  # 5 GFLOP in 0.5 ms
+    assert m["batch_nsys_kernel_gbs"] == pytest.approx(200.0)  # 100 MB in 0.5 ms
+    bare = nsys.summarize(
+        nsys.parse(API_CSV), nsys.parse(KERN_CSV), {"batch_nsys_n": 10.0, "batch_nsys_wall_ms": 20.0}
+    )
+    assert "batch_nsys_kernel_tflops" not in bare and "batch_nsys_kernel_gbs" not in bare
+
+
+def test_nsys_gpu_metrics_flags_and_settings():
+    assert not any(a.startswith("--gpu-metrics") for a in nsys.profile_args("x"))
+    args = nsys.profile_args("x", "none", 20_000)
+    assert "--gpu-metrics-devices=all" in args and "--gpu-metrics-frequency=20000" in args
+    assert args.index("--gpu-metrics-devices=all") < args.index("--capture-range=cudaProfilerApi")
+    with pytest.raises(ValueError, match=">= 0"):
+        nsys.profile_args("x", "none", -1)
+    assert nsys.gpu_metrics_hz({}) == 0
+    assert nsys.gpu_metrics_hz({"nsys_gpu_metrics": False, "nsys_gpu_metrics_hz": 5}) == 0
+    assert nsys.gpu_metrics_hz({"nsys_gpu_metrics": True}) == nsys.DEFAULT_GPU_METRICS_HZ
+    assert nsys.gpu_metrics_hz({"nsys_gpu_metrics": "true", "nsys_gpu_metrics_hz": 2000}) == 2000
+    with pytest.raises(ValueError, match="> 0"):
+        nsys.gpu_metrics_hz({"nsys_gpu_metrics": True, "nsys_gpu_metrics_hz": 0})
+    with pytest.raises(TypeError):
+        nsys.gpu_metrics_hz({"nsys_gpu_metrics": True, "nsys_gpu_metrics_hz": True})
+
+
+def test_nsys_slug():
+    assert nsys.slug("DRAM Read Bandwidth [Throughput %]") == "dram_read_bandwidth_throughput"
+    assert nsys.slug("SMs Active [Throughput %]") == "sms_active_throughput"
+
+
+SMS, DRAM_R = "SMs Active [Throughput %]", "DRAM Read Bandwidth [Throughput %]"
+
+
+def test_summarize_gpu_metrics_means_and_active_samples():
+    series = {SMS: {1: 0.0, 2: 80.0, 3: 90.0, 4: 2.0}, DRAM_R: {1: 0.0, 2: 40.0, 3: 60.0, 4: 10.0}}
+    m = nsys.summarize_gpu_metrics(series)
+    assert m["batch_nsys_gm_samples"] == 4
+    assert m["batch_nsys_gm_active_share"] == pytest.approx(0.5)  # 2 of 4 samples above ACTIVE_MIN
+    assert m["batch_nsys_gm_dram_read_bandwidth_throughput"] == pytest.approx(27.5)
+    assert m["batch_nsys_gm_dram_read_bandwidth_throughput_active"] == pytest.approx(50.0)
+    assert m["batch_nsys_gm_sms_active_throughput_active"] == pytest.approx(85.0)
+    assert nsys.summarize_gpu_metrics({}) == {}
+    no_sm = nsys.summarize_gpu_metrics({DRAM_R: {1: 10.0, 2: 30.0}})  # no SMs Active metric: means only
+    assert no_sm["batch_nsys_gm_dram_read_bandwidth_throughput"] == pytest.approx(20.0)
+    assert not any(k.endswith("_active") or k.endswith("active_share") for k in no_sm)
+
+
+def _gm_db(path, samples, runtime=((150, 450),)):
+    db = sqlite3.connect(path)
+    db.execute(
+        f"CREATE TABLE {nsys.METRICS_TABLE} "
+        "(rawTimestamp INTEGER, timestamp INTEGER, typeId INTEGER, metricId INTEGER, value INTEGER)"
+    )
+    db.execute(
+        f"CREATE TABLE {nsys.METRIC_NAMES_TABLE} "
+        "(typeId INTEGER, sourceId INTEGER, typeName TEXT, metricId INTEGER, metricName TEXT)"
+    )
+    db.execute(f"CREATE TABLE {nsys.RUNTIME_TABLE} (start INTEGER, end INTEGER)")
+    db.executemany(
+        f"INSERT INTO {nsys.METRIC_NAMES_TABLE} VALUES (?, 0, 'GH100', ?, ?)", [(7, 1, SMS), (7, 2, DRAM_R)]
+    )
+    db.executemany(
+        f"INSERT INTO {nsys.METRICS_TABLE} VALUES (?, ?, 7, ?, ?)",
+        [(ts, ts, mid, v) for ts, mid, v in samples],
+    )
+    db.executemany(f"INSERT INTO {nsys.RUNTIME_TABLE} VALUES (?, ?)", runtime)
+    db.commit()
+    db.close()
+
+
+def test_nsys_gpu_metrics_reads_the_export_inside_the_range(tmp_path):
+    f = tmp_path / "r.sqlite"
+    # t=100 is before the capture range and t=500 after it: both dropped
+    samples = [
+        (100, 1, 99),
+        (100, 2, 99),
+        (200, 1, 80),
+        (200, 2, 40),
+        (300, 1, 0),
+        (300, 2, 0),
+        (400, 1, 90),
+        (400, 2, 60),
+        (500, 1, 99),
+        (500, 2, 99),
+    ]
+    _gm_db(f, samples)
+    m, names = nsys.gpu_metrics(f)
+    assert names == f"{DRAM_R}; {SMS}"
+    assert m["batch_nsys_gm_samples"] == 3
+    assert m["batch_nsys_gm_dram_read_bandwidth_throughput"] == pytest.approx(100 / 3)
+    assert m["batch_nsys_gm_dram_read_bandwidth_throughput_active"] == pytest.approx(50.0)
+    empty = tmp_path / "none.sqlite"
+    sqlite3.connect(empty).close()
+    assert nsys.gpu_metrics(empty) == ({}, "")

@@ -27,6 +27,28 @@ reports) are dropped.
 Kernel time on one stream never overlaps, so gpu_share <= 1 for these single-stream models. nsys adds a little
 host time to every API call it traces, so wall time under nsys is slightly above an untraced run's.
 
+Kernel-time roofline: the benchmark also records the cost-model work of the profiled decisions
+(`batch_nsys_gflop`, `batch_nsys_mb` per decision), so
+
+    batch_nsys_kernel_tflops    cost-model FLOPs / summed kernel time: achieved FLOP/s with host time removed
+    batch_nsys_kernel_gbs       cost-model bytes / summed kernel time
+
+place each decision on the roofline by what the GPU did while it was busy, the number end-to-end timing hides
+when most of a decision is host time.
+
+GPU metrics (`nsys_gpu_metrics = true` in a config): nsys samples the GPU's own counters
+(`--gpu-metrics-devices=all`, `nsys_gpu_metrics_hz` times a second, default 10 kHz), and `gpu_metrics` reads
+them from the SQLite export (tables GPU_METRICS and TARGET_INFO_GPU_METRICS) inside the captured range. Each
+metric nsys reports (names differ by GPU and nsys version, e.g. "DRAM Read Bandwidth [Throughput %]") becomes
+
+    batch_nsys_gm_<slug>            mean over every sample in the range
+    batch_nsys_gm_<slug>_active     mean over samples where the SMs were active (an "SMs Active" metric > 5),
+                                    i.e. what the GPU sustained while it had work, idle gaps left out
+
+plus batch_nsys_gm_samples and batch_nsys_gm_active_share. A metric that is missing stays absent, and the
+names seen are noted in meta (batch_nsys_gm_names), so a run on a GPU or nsys version with other names is
+still readable.
+
 Torch-free: only parses `nsys stats --format csv` output and reads its SQLite export.
 """
 
@@ -35,6 +57,7 @@ from __future__ import annotations
 import contextlib
 import csv
 import io
+import re
 import sqlite3
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -58,17 +81,24 @@ def is_sync(name: str) -> bool:
     return SYNC_HINT in name
 
 
-def profile_args(report: str, sample: str = "process-tree") -> tuple[str, ...]:
+def profile_args(report: str, sample: str = "process-tree", gpu_metrics_hz: int = 0) -> tuple[str, ...]:
     """`nsys profile` arguments (before the command): CUDA + OS runtime trace, CPU sampling, and only the
-    cudaProfilerStart/Stop range, written to `report` (.nsys-rep is appended by nsys)."""
+    cudaProfilerStart/Stop range, written to `report` (.nsys-rep is appended by nsys). `gpu_metrics_hz` > 0
+    also samples the GPU's hardware counters that many times a second."""
     if sample not in SAMPLES:
         raise ValueError(f"nsys sample must be one of {SAMPLES}, not {sample!r}")
+    if gpu_metrics_hz < 0:
+        raise ValueError(f"nsys_gpu_metrics_hz must be >= 0, not {gpu_metrics_hz}")
+    metrics = (
+        ("--gpu-metrics-devices=all", f"--gpu-metrics-frequency={gpu_metrics_hz}") if gpu_metrics_hz else ()
+    )
     return (
         "profile",
         "--trace=cuda,osrt",
         "--cuda-graph-trace=node",  # a graph's kernels one by one; the default traces a graph as one range
         f"--sample={sample}",
         f"--cpuctxsw={'process-tree' if sample != 'none' else 'none'}",
+        *metrics,
         "--capture-range=cudaProfilerApi",
         "--capture-range-end=stop",
         "--force-overwrite=true",
@@ -137,6 +167,105 @@ def graph_trace(sqlite_file: Path) -> tuple[int, float]:
     return int(n), float(total)
 
 
+DEFAULT_GPU_METRICS_HZ = 10_000
+
+
+def gpu_metrics_hz(settings: Mapping[str, object]) -> int:
+    """Samples per second for `--gpu-metrics-frequency` from a run's settings: `nsys_gpu_metrics_hz`
+    (default 10 kHz) when `nsys_gpu_metrics` is true, else 0 (no GPU metrics)."""
+    on = settings.get("nsys_gpu_metrics", False)
+    if isinstance(on, str):
+        on = on.strip().lower() in ("1", "true", "yes", "on")
+    if not on:
+        return 0
+    hz = settings.get("nsys_gpu_metrics_hz", DEFAULT_GPU_METRICS_HZ)
+    if isinstance(hz, bool) or not isinstance(hz, int | float | str):
+        raise TypeError(f"nsys_gpu_metrics_hz must be a number, not {hz!r}")
+    value = int(float(hz))
+    if value <= 0:
+        raise ValueError(f"nsys_gpu_metrics_hz must be > 0, not {value}")
+    return value
+
+
+METRICS_TABLE = "GPU_METRICS"
+METRIC_NAMES_TABLE = "TARGET_INFO_GPU_METRICS"
+ACTIVE_HINT = re.compile(r"\bSMs? Active\b", re.IGNORECASE)
+ACTIVE_MIN = 5.0  # an "SMs Active" sample above this (percent) counts as the GPU having work
+GM_PREFIX = "batch_nsys_gm_"
+META_GM_NAMES = "batch_nsys_gm_names"
+
+
+def slug(name: str) -> str:
+    """A metric name as a key fragment, e.g. 'DRAM Read Bandwidth [Throughput %]' ->
+    'dram_read_bandwidth_throughput'."""
+    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+
+def _columns(db: sqlite3.Connection, table: str) -> dict[str, str]:
+    """{lowercase column name: column name} of `table`."""
+    return {str(r[1]).lower(): str(r[1]) for r in db.execute(f"PRAGMA table_info({table})")}
+
+
+def gpu_metrics(sqlite_file: Path) -> tuple[Metrics, str]:
+    """(batch_nsys_gm_* means, '; '-joined metric names seen) from the SQLite export's GPU-metrics samples
+    inside the captured range (the CUDA runtime calls' span). ({}, "") when the run sampled no GPU metrics or
+    the export lacks the expected tables or columns."""
+    with contextlib.closing(sqlite3.connect(f"file:{sqlite_file}?mode=ro", uri=True)) as db:
+        tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        if METRICS_TABLE not in tables or METRIC_NAMES_TABLE not in tables:
+            return {}, ""
+        s, n = _columns(db, METRICS_TABLE), _columns(db, METRIC_NAMES_TABLE)
+        need_s, need_n = ("timestamp", "metricid", "value"), ("metricid", "metricname")
+        if any(c not in s for c in need_s) or any(c not in n for c in need_n):
+            return {}, ""
+        by_type = "typeid" in s and "typeid" in n
+        name_rows = db.execute(
+            f"SELECT {n['typeid'] if by_type else '0'}, {n['metricid']}, {n['metricname']} "
+            f"FROM {METRIC_NAMES_TABLE}"
+        ).fetchall()
+        names = {(int(t), int(i)): str(nm) for t, i, nm in name_rows}
+        where = ""
+        if RUNTIME_TABLE in tables:
+            lo, hi = db.execute(f"SELECT MIN(start), MAX(end) FROM {RUNTIME_TABLE}").fetchone()
+            if lo is not None and hi is not None:
+                where = f" WHERE {s['timestamp']} >= {int(lo)} AND {s['timestamp']} <= {int(hi)}"
+        rows = db.execute(
+            f"SELECT {s['typeid'] if by_type else '0'}, {s['metricid']}, {s['timestamp']}, {s['value']} "
+            f"FROM {METRICS_TABLE}{where}"
+        ).fetchall()
+    series: dict[str, dict[int, float]] = {}
+    for t, i, ts, v in rows:
+        name = names.get((int(t), int(i)))
+        if name is not None and v is not None:
+            series.setdefault(name, {})[int(ts)] = float(v)
+    return summarize_gpu_metrics(series), "; ".join(sorted(series))
+
+
+def summarize_gpu_metrics(series: Mapping[str, Mapping[int, float]]) -> Metrics:
+    """{metric name: {timestamp: value}} -> batch_nsys_gm_<slug> (mean of all samples) and, when an
+    "SMs Active" metric exists, batch_nsys_gm_<slug>_active (mean over the timestamps where it is above
+    ACTIVE_MIN) and batch_nsys_gm_active_share."""
+    if not series:
+        return {}
+    active_name = next((name for name in sorted(series) if ACTIVE_HINT.search(name)), None)
+    active = (
+        {ts for ts, v in series[active_name].items() if v > ACTIVE_MIN} if active_name is not None else None
+    )
+    m: Metrics = {f"{GM_PREFIX}samples": float(max(len(v) for v in series.values()))}
+    if active_name is not None and active is not None:
+        m[f"{GM_PREFIX}active_share"] = len(active) / len(series[active_name]) if series[active_name] else 0.0
+    for name, values in sorted(series.items()):
+        if not values:
+            continue
+        key = f"{GM_PREFIX}{slug(name)}"
+        m[key] = sum(values.values()) / len(values)
+        if active is not None and active:
+            busy = [v for ts, v in values.items() if ts in active]
+            if busy:
+                m[f"{key}_active"] = sum(busy) / len(busy)
+    return m
+
+
 def summarize(
     api: Sequence[tuple[str, float, int]],
     kernels: Sequence[tuple[str, float, int]],
@@ -156,7 +285,13 @@ def summarize(
     sync_ms = sum(t for name, t, _ in api if is_sync(name)) / 1e6
     api_ms = sum(t for _, t, _ in api) / 1e6
     share = kernel_ms / wall
-    return {
+    per_decision_ms = kernel_ms / n
+    work: Metrics = {}
+    if per_decision_ms > 0 and "batch_nsys_gflop" in run:
+        work["batch_nsys_kernel_tflops"] = run["batch_nsys_gflop"] / per_decision_ms  # GFLOP/ms = TFLOP/s
+    if per_decision_ms > 0 and "batch_nsys_mb" in run:
+        work["batch_nsys_kernel_gbs"] = run["batch_nsys_mb"] / per_decision_ms  # MB/ms = GB/s
+    return work | {
         "batch_nsys_cpu_share": 1.0 - share,
         "batch_nsys_gpu_share": share,
         "batch_nsys_wall_ms_per_decision": wall / n,

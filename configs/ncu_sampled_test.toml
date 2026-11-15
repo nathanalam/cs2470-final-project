@@ -1,0 +1,44 @@
+# Cheap test of sampled Nsight Compute before any long ncu run (2026-11-15: profiling every kernel took 3,508 s
+# for one qwen3-8b question at 32 tokens on an H100, and the run hit its cap with no data). One model, one H100,
+# one length (2,048 tokens), one question, and only the first 200 kernels of the profiled range (about three
+# decoder layers; the marker kernel counts as one). Two runs, which differ only in the metric list:
+#   lean  dram bytes, tensor-core ops, duration, speed-of-light %  (ncu_metrics = "lean")
+#   full  the same plus the CUDA-core SASS instruction counts, which ncu collects by instrumenting each kernel
+# The log line "roofline ncu: 2048 tokens, 1 question(s) in N s" gives seconds per 200 kernels for each, so
+# the sizes of later ncu runs can be planned from it. The 30 min cap bounds the spend if replay is still slow.
+#   uv run --group modal s1 submit configs/ncu_sampled_test.toml --ncu 1
+benchmarks = ["roofline"]
+
+[launch]
+orchestrator = "modal"
+gpu = ["H100"]  # require_gpu is set by the launcher
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "00:30:00"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+dtype = "bfloat16"
+measure_ceilings = false
+max_prompt_tokens = 20480
+semif_max_options = 16
+
+[params]
+model = "qwen3-8b.zeroshot"
+roofline_seed = 0
+roofline_max_options = 16
+roofline_warmup = 2
+roofline_counted = 0
+roofline_per_length = 2
+roofline_min_state_tokens = 16384  # the same questions as the ncu_lengths configs
+roofline_tokenizer_file = "$MODELS_DIR/Qwen3.5-4B-Base/tokenizer.json"
+ncu_launch_count = 200
+
+[sweep]
+ncu_metrics = ["lean", "full"]
+
+[grid]
+roofline_state_tokens = [2048]

@@ -46,7 +46,9 @@ and may implement `after_warmup()` (called after each point's warm-up; kev captu
 
 Settings (all optional): batch_pool (default max batch size), batch_min_decisions 32, batch_min_batches 4,
 batch_seed 0, batch_max_options 16, batch_max_question_tokens 512, batch_tokenizer_file (a tokenizer.json;
-words if unset), batch_trace 2 (batches traced per point; 0 = no trace), batch_nsys 0, batch_warmup 8.
+words if unset), batch_trace 2 (batches traced per point; 0 = no trace), batch_nsys 0, batch_warmup 8,
+batch_min_state_tokens 0 (pool rows need a state at least this long, and at least max(L): configs with
+different longest lengths then share rows).
 """
 
 from __future__ import annotations
@@ -198,6 +200,8 @@ def pools(settings: Settings, lengths: Sequence[int], size: int) -> dict[int, li
         "roofline_seed": get_int(settings, "batch_seed", 0),
         "roofline_max_options": get_int(settings, "batch_max_options", 16),
         "roofline_max_question_tokens": get_int(settings, "batch_max_question_tokens", 512),
+        # configs whose longest length differs still draw the same rows (roofline_min_state_tokens)
+        "roofline_min_state_tokens": get_int(settings, "batch_min_state_tokens", 0),
     }
     out: dict[int, list[jeval.Row]] = {n: [] for n in lengths}
     for n, row in roofline.length_rows(jeval.load_rows(), _counter(settings), keys, lengths):
@@ -242,7 +246,9 @@ def run(model: object, settings: Settings) -> Metrics:
     lengths, sizes = sorted(parse_int_list(settings, LENGTHS)), sorted(parse_int_list(settings, SIZES))
     if n_nsys := get_int(settings, "batch_nsys", 0):
         at = nsys_length(settings, lengths)
-        return nsys_region(m, pools(settings, lengths, 1)[at], n_nsys, settings, at)
+        return nsys_region(
+            m, pools(settings, lengths, 1)[at], n_nsys, settings, at, arch=arch, sizes_kw=sizes_kw
+        )
     pool = pools(settings, lengths, max(sizes))
     after_warmup = getattr(m, "after_warmup", None)
     traced_n = get_int(settings, "batch_trace", 2)
@@ -326,10 +332,20 @@ def nsys_length(settings: Settings, lengths: Sequence[int]) -> int:
     return at
 
 
-def nsys_region(m: Batched, pool: Sequence[jeval.Row], n: int, settings: Settings, length: int) -> Metrics:
+def nsys_region(
+    m: Batched,
+    pool: Sequence[jeval.Row],
+    n: int,
+    settings: Settings,
+    length: int,
+    *,
+    arch: flops.Arch | None = None,
+    sizes_kw: Mapping[str, int] | None = None,
+) -> Metrics:
     """`batch_warmup` untimed batch-1 decisions (then the model's `after_warmup`, as the sweep does), then `n`
     inside one CUDA profiler range (cudaProfilerStart/Stop), the range Nsight Systems captures under
-    `s1 nsys`."""
+    `s1 nsys`. With `arch`, also the cost-model GFLOP and MB per profiled decision (batch_nsys_gflop,
+    batch_nsys_mb), which `nsys.summarize` divides by kernel time."""
     profiler = getattr(m, "profiler", None)
     if not callable(profiler):
         raise TypeError(f"batch_nsys needs a model with .profiler(on); got {type(m).__name__}")
@@ -346,9 +362,14 @@ def nsys_region(m: Batched, pool: Sequence[jeval.Row], n: int, settings: Setting
     finally:
         wall = (time.perf_counter() - t0) * 1e3
         profiler(False)
-    m.take_forwards()
-    return {
+    forwards = m.take_forwards()
+    out: Metrics = {
         "batch_nsys_n": float(n),
         "batch_nsys_wall_ms": wall,
         "batch_nsys_state_tokens": float(length),
     }
+    if arch is not None and forwards and n > 0:
+        cost = flops.total(arch, [roofline.forward(f) for f in forwards], **(sizes_kw or {}))
+        out["batch_nsys_gflop"] = cost.flops / 1e9 / n
+        out["batch_nsys_mb"] = cost.bytes / 1e6 / n
+    return out

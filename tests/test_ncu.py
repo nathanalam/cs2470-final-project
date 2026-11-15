@@ -2,6 +2,7 @@
 (logs/probe3: a 4096^3 bf16 GEMM and a 1024^3 fp32 GEMM on an A10G)."""
 
 import math
+import re
 
 import pytest
 
@@ -252,3 +253,52 @@ def test_summarize_named_refuses_unattributable_kernels():
         ncu.summarize_named(
             ncu.parse_named(log), {"roofline_hw_s32_timed_ms": 1.0, "roofline_hw_s64_timed_ms": 1.0}
         )
+
+
+# ---- sampled profiling (ncu_launch_count, ncu_kernel_regex, ncu_metrics) ----
+
+
+def test_sampling_settings():
+    assert ncu.sampling({}) == ncu.Sampling()
+    assert not ncu.Sampling().sampled and not ncu.Sampling(lean=True).sampled
+    s = ncu.sampling({"ncu_launch_count": 200, "ncu_kernel_regex": "spin|gemm", "ncu_metrics": "Lean"})
+    assert s == ncu.Sampling(launch_count=200, kernel_regex="spin|gemm", lean=True) and s.sampled
+    with pytest.raises(ValueError, match="ncu_metrics"):
+        ncu.sampling({"ncu_metrics": "some"})
+    with pytest.raises(ValueError, match=">= 0"):
+        ncu.sampling({"ncu_launch_count": -1})
+    with pytest.raises(TypeError):
+        ncu.sampling({"ncu_launch_count": True})
+    with pytest.raises(re.error):
+        ncu.sampling({"ncu_kernel_regex": "("})
+
+
+def test_args_with_sampling():
+    assert ncu.args("base", ncu.Sampling()) == ncu.BASE_ARGS  # the default sampling leaves the line as before
+    lean = list(ncu.args("base", ncu.Sampling(launch_count=200, kernel_regex="spin|gemm", lean=True)))
+    metrics = lean[lean.index("--metrics") + 1].split(",")
+    assert metrics == list(ncu.METRICS_LEAN) and not any("sass" in m for m in metrics)
+    assert lean[lean.index("--launch-count") + 1] == "200"
+    assert lean[lean.index("--kernel-name") + 1] == "regex:spin|gemm"
+    full = list(ncu.args("none", ncu.Sampling(launch_count=50)))
+    assert full[:2] == ["--clock-control", "none"]
+    assert full[full.index("--metrics") + 1].split(",") == list(ncu.METRICS)
+    assert "--kernel-name" not in full
+
+
+def _k(name, ns=1000.0):
+    return (name, {ncu.TIME: ns, "dram__bytes_read.sum": 10.0, ncu.TENSOR[0]: 100.0})
+
+
+def test_summarize_named_sampled_drops_whole_run_keys_and_allows_cut_off_lengths():
+    kernels = [_k("spin"), _k("gemm_a"), _k("gemm_b")]  # only the first length's marker was reached
+    run = {"roofline_hw_timed_ms": 1.0, "roofline_hw_s32_timed_ms": 0.5, "roofline_hw_s512_timed_ms": 0.5}
+    m = ncu.summarize_named(kernels, run, "none", sampled=True)
+    assert m["roofline_hw_sampled"] == 1.0
+    assert not any(k in m for k in ncu.WHOLE_RUN_KEYS)
+    assert "roofline_hw_s32_busy" not in m and "roofline_hw_s32_tflops" not in m
+    assert m["roofline_hw_s32_kernels"] == 2 and m["roofline_hw_s32_gemm_kernels"] == 2
+    assert not any(k.startswith("roofline_hw_s512_") for k in m)  # its marker never came
+    assert m["roofline_hw_intensity"] == pytest.approx(10.0)  # 200 FLOP / 20 bytes: still per profiled kernel
+    with pytest.raises(ValueError, match="length markers"):
+        ncu.summarize_named(kernels, run, "none")  # unsampled: every length must be there

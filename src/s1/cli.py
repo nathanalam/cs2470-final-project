@@ -76,18 +76,26 @@ def ncu_cmd(
     job = env.job_id()
     logs = env.log_dir()  # $S1_LOG_DIR: on Modal the run's volume dir, so a timed-out run keeps its ncu log
     logs.mkdir(parents=True, exist_ok=True)
-    for i in range(len(specs)):
+    for i, spec in enumerate(specs):
         log = logs / f"ncu-{job}-{cfg.stem}-{i}.csv"
         before = set(results_dir.glob("*.json"))
         child = [sys.executable, "-m", "s1.cli", "run", str(cfg), "--index", str(i)]
         child += ["--results-dir", str(results_dir), "--set", f"roofline_ncu={questions}"]
-        subprocess.run([ncu_bin, *ncu.args(clock), "--log-file", str(log), *child], check=True)
+        sample = ncu.sampling(spec.invariants | spec.params)
+        subprocess.run([ncu_bin, *ncu.args(clock, sample), "--log-file", str(log), *child], check=True)
         (path,) = set(results_dir.glob("*.json")) - before
         rec = RunRecord.load(path)
-        hw = ncu.summarize_named(ncu.parse_named(log.read_text()), rec.results["roofline"], clock)
+        hw = ncu.summarize_named(
+            ncu.parse_named(log.read_text()), rec.results["roofline"], clock, sampled=sample.sampled
+        )
         rec.results["roofline"] |= hw
         rec.meta["ncu_log"] = str(log)
         rec.meta[ncu.META_CLOCK_CONTROL] = clock
+        if sample != ncu.Sampling():
+            rec.meta["ncu_sampling"] = (
+                f"launch_count={sample.launch_count} kernel_regex={sample.kernel_regex!r} "
+                f"metrics={'lean' if sample.lean else 'full'}"
+            )
         rec.save(results_dir)
         console.print(f"[{rec.run_id}] hardware counters: {hw}")
 
@@ -108,12 +116,13 @@ def nsys_cmd(
     job = env.job_id()
     logs = env.log_dir()  # S1_LOG_DIR on Modal, so the reports come back with the run's logs
     logs.mkdir(parents=True, exist_ok=True)
-    for i in range(len(specs)):
+    for i, spec in enumerate(specs):
         base = logs / f"nsys-{job}-{cfg.stem}-{i}"
         before = set(results_dir.glob("*.json"))
         child = [sys.executable, "-m", "s1.cli", "run", str(cfg), "--index", str(i)]
         child += ["--results-dir", str(results_dir), "--set", f"batch_nsys={decisions}"]
-        subprocess.run([nsys_bin, *nsys.profile_args(str(base), sample), *child], check=True)
+        hz = nsys.gpu_metrics_hz(spec.invariants | spec.params)
+        subprocess.run([nsys_bin, *nsys.profile_args(str(base), sample, hz), *child], check=True)
         report_file = f"{base}.nsys-rep"
         subprocess.run([nsys_bin, *nsys.stats_args(report_file, str(base))], check=True)
         (path,) = set(results_dir.glob("*.json")) - before
@@ -123,6 +132,11 @@ def nsys_cmd(
         sqlite_file = Path(f"{base}.sqlite")  # nsys stats exports it next to the report
         graphs = nsys.graph_trace(sqlite_file) if sqlite_file.is_file() else (0, 0.0)
         split = nsys.summarize(api, kernels, rec.results["batch"], graphs)
+        if hz and sqlite_file.is_file():
+            gm, names = nsys.gpu_metrics(sqlite_file)
+            split |= gm
+            rec.meta[nsys.META_GM_NAMES] = names or "none found in the export"
+            rec.meta["nsys_gpu_metrics_hz"] = str(hz)
         rec.results["batch"] = split | rec.results["batch"]
         rec.meta["nsys_report"] = report_file
         rec.meta[nsys.META_SAMPLE] = sample

@@ -40,6 +40,7 @@ import csv
 import io
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 from . import env
 from .record import Metrics
@@ -117,10 +118,61 @@ def clock_control(explicit: str | None = None) -> str:
     return value
 
 
-def args(clock: str | None = None) -> tuple[str, ...]:
-    """ncu's arguments for `s1 ncu`. "base" adds no flag: the cluster's command line is unchanged."""
+METRICS_LEAN = (*TENSOR, *DRAM, TIME, DRAM_PCT, SM_PCT)  # no SASS instruction counts (CORE)
+
+
+@dataclass(frozen=True)
+class Sampling:
+    """Which kernels `s1 ncu` profiles and with which metrics (config settings, all optional):
+
+    ncu_launch_count  profile only the first N kernels of the profiled range that pass the filter (0 = all;
+                      ncu --launch-count). The length-axis marker kernels count toward N.
+    ncu_kernel_regex  profile only kernels whose name matches (ncu --kernel-name regex:...); keep "spin" in
+                      it on the length axis, or the markers are filtered out.
+    ncu_metrics       "full" (default: METRICS) or "lean" (METRICS_LEAN: drops the CUDA-core SASS
+                      instruction counts, which ncu collects by instrumenting the kernel, so FLOPs are then
+                      tensor-core only)."""
+
+    launch_count: int = 0
+    kernel_regex: str = ""
+    lean: bool = False
+
+    @property
+    def sampled(self) -> bool:
+        """True when not every kernel is profiled, so totals and busy share would undercount."""
+        return self.launch_count > 0 or bool(self.kernel_regex)
+
+
+def sampling(settings: Mapping[str, object]) -> Sampling:
+    """The `Sampling` a run's settings ask for."""
+    count = settings.get("ncu_launch_count", 0)
+    if isinstance(count, bool) or not isinstance(count, int | float | str):
+        raise TypeError(f"ncu_launch_count must be a number, not {count!r}")
+    n = int(float(count))
+    if n < 0:
+        raise ValueError(f"ncu_launch_count must be >= 0, not {n}")
+    regex = str(settings.get("ncu_kernel_regex", "") or "")
+    if regex:
+        re.compile(regex)  # fail before booking a GPU
+    metrics = str(settings.get("ncu_metrics", "full")).strip().lower()
+    if metrics not in ("full", "lean"):
+        raise ValueError(f"ncu_metrics must be 'full' or 'lean', not {metrics!r}")
+    return Sampling(launch_count=n, kernel_regex=regex, lean=metrics == "lean")
+
+
+def args(clock: str | None = None, sample: Sampling | None = None) -> tuple[str, ...]:
+    """ncu's arguments for `s1 ncu`. "base" adds no flag: the cluster's command line is unchanged, and so
+    does no `sample` (or the default one)."""
     clock = clock_control(clock)
-    return BASE_ARGS if clock == "base" else ("--clock-control", clock, *BASE_ARGS)
+    base: tuple[str, ...] = BASE_ARGS
+    if sample is not None and sample != Sampling():
+        metrics = METRICS_LEAN if sample.lean else METRICS
+        base = (*BASE_ARGS[:-1], ",".join(metrics))  # BASE_ARGS ends with the metric list
+        if sample.launch_count:
+            base = (*base, "--launch-count", str(sample.launch_count))
+        if sample.kernel_regex:
+            base = (*base, "--kernel-name", f"regex:{sample.kernel_regex}")
+    return base if clock == "base" else ("--clock-control", clock, *base)
 
 
 ARGS = args()  # resolved for this process's orchestrator (with "none" inside a Modal container)
@@ -234,32 +286,52 @@ def summarize(
     }
 
 
+WHOLE_RUN_KEYS = (
+    "roofline_hw_tflops",
+    "roofline_hw_flop_ratio",
+    "roofline_hw_byte_ratio",
+    "roofline_hw_busy",
+)
+
+
 def summarize_named(
-    kernels: Sequence[tuple[str, Mapping[str, float]]], run: Mapping[str, float], clock: str | None = None
+    kernels: Sequence[tuple[str, Mapping[str, float]]],
+    run: Mapping[str, float],
+    clock: str | None = None,
+    *,
+    sampled: bool = False,
 ) -> Metrics:
     """`summarize` over every kernel except the length markers, plus `roofline_hw_busy` and the per-class
     `breakdown`; on the length axis (marker kernels in the log and `roofline_hw_s<L>_timed_ms` in `run`) the
     same again per state length as `roofline_hw_s<L>_*`, the i-th marker's kernels going to the i-th shortest
-    length. A marker count that does not match the lengths raises: the kernels could not be attributed."""
+    length. A marker count that does not match the lengths raises: the kernels could not be attributed.
+
+    `sampled` (only some kernels were profiled, see `Sampling`): the keys that compare the profiled kernels
+    with the whole questions (WHOLE_RUN_KEYS) are left out, since they would undercount, and
+    `roofline_hw_sampled` = 1 is set. Per-class rates and intensity stay: they are per profiled kernel. On the
+    length axis a length whose marker was not reached (the launch count ran out) gets no keys."""
     everything, segments = split_markers(kernels)
     m = summarize([k for _, k in everything], run, clock)
     m["roofline_hw_busy"] = _busy(m, run.get("roofline_hw_timed_ms", 0.0))
     m |= breakdown(everything)
     lengths = sorted(int(x.group(1)) for key in run if (x := LENGTH_KEY.match(key)))
-    if not segments and not lengths:
-        return m
-    if len(segments) != len(lengths):
-        raise ValueError(
-            f"{len(segments)} length markers in the ncu log but {len(lengths)} lengths in the run"
-        )
-    for n, seg in zip(lengths, segments, strict=True):
-        p = f"roofline_hw_s{n}_"
-        view = {key.replace(p, "roofline_hw_"): val for key, val in run.items() if key.startswith(p)}
-        part = summarize([k for _, k in seg], view, clock)
-        part.pop("roofline_hw_clocks_locked")
-        part["roofline_hw_busy"] = _busy(part, view.get("roofline_hw_timed_ms", 0.0))
-        m |= {key.replace("roofline_hw_", p, 1): val for key, val in part.items()}
-        m |= breakdown(seg, p)
+    if segments or lengths:
+        if len(segments) > len(lengths) or (not sampled and len(segments) != len(lengths)):
+            raise ValueError(
+                f"{len(segments)} length markers in the ncu log but {len(lengths)} lengths in the run"
+            )
+        for n, seg in zip(lengths, segments, strict=False):  # sampled: later lengths may be cut off
+            p = f"roofline_hw_s{n}_"
+            view = {key.replace(p, "roofline_hw_"): val for key, val in run.items() if key.startswith(p)}
+            part = summarize([k for _, k in seg], view, clock)
+            part.pop("roofline_hw_clocks_locked")
+            part["roofline_hw_busy"] = _busy(part, view.get("roofline_hw_timed_ms", 0.0))
+            if sampled:
+                part = {k: v for k, v in part.items() if k not in WHOLE_RUN_KEYS}
+            m |= {key.replace("roofline_hw_", p, 1): val for key, val in part.items()}
+            m |= breakdown(seg, p)
+    if sampled:
+        m = {k: v for k, v in m.items() if k not in WHOLE_RUN_KEYS} | {"roofline_hw_sampled": 1.0}
     return m
 
 
