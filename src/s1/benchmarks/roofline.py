@@ -49,6 +49,9 @@ Settings (all optional):
     roofline_max_tokens    reference tokens per question              default 1024
     roofline_max_options   options per question                       default 16
     roofline_warmup        questions answered untimed first           default 8
+    roofline_warmup_passes times the warm-up list is answered          default 1
+                           (CUDA graph trees warm a new input size on its 1st call, record it on the 2nd
+                           and replay from the 3rd: a per-size graphed model needs 2 to time replays)
     roofline_counted       questions re-run under FlopCounterMode     default 8
     roofline_ncu           questions re-run in a CUDA profiler range  default 0 (set by `s1 ncu` runs)
     roofline_kernel_profile  1: note the CUDA kernels of one question in meta (roofline_kernels_top,
@@ -400,8 +403,9 @@ def run(model: object, settings: Settings) -> Metrics:
     arch = flops.arch(config)
 
     rows, warm, row_lengths = select(settings)
-    for row in warm:
-        jeval.ask(prof, row)
+    for _ in range(get_int(settings, "roofline_warmup_passes", 1)):
+        for row in warm:
+            jeval.ask(prof, row)
     if callable(after_warmup := getattr(prof, "after_warmup", None)):
         after_warmup()
     prof.take_forwards()
