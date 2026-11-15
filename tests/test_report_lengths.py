@@ -43,10 +43,18 @@ def _lengths(ms: dict[int, float], *, mean_scale: float = 1.0, bw: float = 3000.
 
 
 def _rec(
-    run_id: str, gpu: str, model: str, m: Metrics, *, grid: bool = True, mamba: str = "absent"
+    run_id: str,
+    gpu: str,
+    model: str,
+    m: Metrics,
+    *,
+    grid: bool = True,
+    mamba: str = "absent",
+    params: dict[str, Scalar] | None = None,
 ) -> RunRecord:
     inv: dict[str, str | int | float | bool] = {"gpu": gpu, "platform": "modal", "env_mamba_ssm": mamba}
-    return RunRecord(run_id, inv, {"model": model}, {"roofline": m}, grid=GRID if grid else {})
+    p: dict[str, Scalar] = {"model": model} | (params or {})
+    return RunRecord(run_id, inv, p, {"roofline": m}, grid=GRID if grid else {})
 
 
 RECS = [
@@ -122,3 +130,25 @@ def test_a_length_where_every_question_failed_has_no_point():
     m = _lengths({32: 50.0, 2048: 0.0})
     m["roofline_s2048_tokens"] = 0.0
     assert [p.length for p in report_lengths.length_points(m)] == [32]
+
+
+def test_compiled_d1_warmed_once_is_its_own_recording_curve(tmp_path):
+    """Graphs record a size on its 2nd call: a once-warmed compiled run times recordings, never merged with
+    the twice-warmed replay run of the same model and GPU."""
+    recs = [
+        _rec("20261115-000001-a", H100, "d1-3b.compiled", _lengths({32: 36.0}), params={"d1_compile": True}),
+        _rec(
+            "20261115-000002-b",
+            H100,
+            "d1-3b.compiled",
+            _lengths({32: 12.0}),
+            params={"d1_compile": True, "roofline_warmup_passes": 2},
+        ),
+        _rec("20261115-000003-c", H100, "d1-3b.eager", _lengths({32: 15.0}), params={"d1_compile": False}),
+    ]
+    (panel,) = report_lengths.panels(recs)
+    by_name = {c.name: c for c in panel.curves}
+    assert sorted(by_name) == ["d1-3b.compiled", "d1-3b.compiled (graph recording timed)", "d1-3b.eager"]
+    assert by_name["d1-3b.compiled (graph recording timed)"].short == "d1-3b.compiled +recording"
+    assert by_name["d1-3b.compiled"].points[0].ms_median == 12.0
+    assert report.GRAPH_NOTE in report.to_markdown(recs, tmp_path)

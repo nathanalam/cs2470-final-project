@@ -510,13 +510,15 @@ favor of H3.
 | laya.english | decision model | Dense, attention only | 0.395 (0.343) | 211.8 | 150 | 105 | 2.24 | 444 | 0.5 | – | – | – | 67 | 43.0% |
 | laya.multilingual | decision model | Dense, attention only | 0.307 (0.11) | 212.3 | 49.7 | 106 | 0.771 | 444 | 0.17 | – | – | – | 64.4 | 35.0% |
 
+d1-3b.compiled replays one CUDA graph per exact prompt length; torch records a length's graph on its 2nd call and replays it only from the 3rd. Rows marked "graph recording timed" were warmed once, so they time the recording (~24 ms extra per question on the L40S); the unmarked d1-3b.compiled row was warmed twice (configs/roofline_d1_graph_warmup.toml) and times replays: on the L40S 11.7 ms vs eager 14.6 ms at 32 tokens, 62.2 vs 69.9 ms at 2048.
+
 ### H200 vs H100 80GB HBM3 speedup by state length (Modal)
 
 Median GPU ms on the H100 80GB HBM3 over the H200, same questions at each length. Memory-bound: ~1.41x (bandwidth ratio); compute- or overhead-bound: ~1.0x.
 
 | Model | 32 tok | 128 tok | 256 tok | 512 tok | 768 tok | 1024 tok | 1536 tok | 2048 tok | Mean |
 |---|---|---|---|---|---|---|---|---|---|
-| d1-3b.compiled | 1.12 | 1.1 | 1.11 | 1.05 | 1.02 | 1.09 | 1.14 | 1.14 | 1.09 |
+| d1-3b.compiled (graph recording timed) | 1.12 | 1.1 | 1.11 | 1.05 | 1.02 | 1.09 | 1.14 | 1.14 | 1.09 |
 | d1-3b.eager | 0.973 | 0.929 | 0.95 | 0.918 | 0.946 | 0.938 | 0.961 | 1.05 | 0.959 |
 | elephant-1 | 1.1 | 1.07 | 1.07 | 1.08 | 1.07 | 1.07 | 1.08 | 1.07 | 1.08 |
 | granite4-h-tiny.zeroshot | 1.05 | 1.05 | 1.04 | 1.05 | 1.05 | 1.05 | 1.05 | 1.05 | 1.05 |
@@ -535,7 +537,7 @@ Median GPU ms on the H100 80GB HBM3 over the H200, same questions at each length
 
 | Model | 32 tok | 128 tok | 256 tok | 512 tok | 768 tok | 1024 tok | 1536 tok | 2048 tok | Intensity (first → last) | Max / median, worst |
 |---|---|---|---|---|---|---|---|---|---|---|
-| d1-3b.compiled | 89.5 | 95.7 | 98.9 | 118 | 149 | 170 | 224 | 279 | 160 → 1.8e+03 | 6 |
+| d1-3b.compiled (graph recording timed) | 89.5 | 95.7 | 98.9 | 118 | 149 | 170 | 224 | 279 | 160 → 1.8e+03 | 6 |
 | d1-3b.eager | 34.6 | 39.9 | 54 | 76.9 | 112 | 131 | 195 | 252 | 160 → 1.8e+03 | 1.9 |
 | elephant-1 | 220 | 227 | 262 | 346 | 389 | 486 | 679 | 871 | 101 → 858 | 1.4 |
 | granite4-h-tiny.zeroshot | 2.14e+03 | 2.15e+03 | 2.17e+03 | 3.12e+03 | – | – | – | – | 58.2 → 137 | 1.5 |
@@ -554,7 +556,7 @@ Median GPU ms on the H100 80GB HBM3 over the H200, same questions at each length
 
 | Model | 32 tok | 128 tok | 256 tok | 512 tok | 768 tok | 1024 tok | 1536 tok | 2048 tok | Intensity (first → last) | Max / median, worst |
 |---|---|---|---|---|---|---|---|---|---|---|
-| d1-3b.compiled | 45.2 | 53.4 | 55.3 | 57.1 | 61.4 | 69 | 79.6 | 94.3 | 160 → 1.8e+03 | 2.1 |
+| d1-3b.compiled (graph recording timed) | 45.2 | 53.4 | 55.3 | 57.1 | 61.4 | 69 | 79.6 | 94.3 | 160 → 1.8e+03 | 2.1 |
 | d1-3b.eager | 18.7 | 18.8 | 19.8 | 24.2 | 31.9 | 37.3 | 51.8 | 67.4 | 160 → 1.8e+03 | 1.5 |
 | elephant-1 | 127 | 126 | 126 | 127 | 152 | 163 | 202 | 253 | 101 → 858 | 1 |
 | granite4-h-tiny.zeroshot (fused Mamba kernels) | 210 | 208 | 206 | 211 | 209 | 210 | 211 | 212 | 58.2 → 430 | 1.2 |
@@ -565,7 +567,7 @@ Median GPU ms on the H100 80GB HBM3 over the H200, same questions at each length
 
 | Model | 32 tok | 128 tok | 256 tok | 512 tok | 768 tok | 1024 tok | 1536 tok | 2048 tok | Intensity (first → last) | Max / median, worst |
 |---|---|---|---|---|---|---|---|---|---|---|
-| d1-3b.compiled | 51.5 | 54.6 | 56.7 | 57.2 | 58 | 63 | 70.1 | 74.6 | 160 → 1.8e+03 | 26 |
+| d1-3b.compiled (graph recording timed) | 51.5 | 54.6 | 56.7 | 57.2 | 58 | 63 | 70.1 | 74.6 | 160 → 1.8e+03 | 26 |
 | d1-3b.eager | 23.2 | 22.5 | 23 | 23.1 | 23.3 | 23.5 | 24 | 28.4 | 160 → 1.8e+03 | 1.4 |
 | elephant-1 | 108 | 103 | 103 | 103 | 102 | 104 | 113 | 130 | 101 → 858 | 1.1 |
 | granite4-h-tiny.zeroshot | 290 | 302 | 304 | 431 | 566 | 697 | 967 | 1.24e+03 | 58.2 → 430 | 1.8 |
@@ -584,7 +586,7 @@ Median GPU ms on the H100 80GB HBM3 over the H200, same questions at each length
 
 | Model | 32 tok | 128 tok | 256 tok | 512 tok | 768 tok | 1024 tok | 1536 tok | 2048 tok | Intensity (first → last) | Max / median, worst |
 |---|---|---|---|---|---|---|---|---|---|---|
-| d1-3b.compiled | 46.1 | 49.5 | 51.3 | 54.6 | 57 | 58 | 61.6 | 65.4 | 160 → 1.8e+03 | 26 |
+| d1-3b.compiled (graph recording timed) | 46.1 | 49.5 | 51.3 | 54.6 | 57 | 58 | 61.6 | 65.4 | 160 → 1.8e+03 | 26 |
 | d1-3b.eager | 23.8 | 24.2 | 24.2 | 25.2 | 24.6 | 25 | 25 | 27 | 160 → 1.8e+03 | 1.2 |
 | elephant-1 | 98.1 | 96 | 95.7 | 95.9 | 95.9 | 96.7 | 105 | 121 | 101 → 858 | 1.3 |
 | granite4-h-tiny.zeroshot | 278 | 287 | 292 | 409 | 539 | 663 | 920 | 1.18e+03 | 58.2 → 430 | 1.8 |
@@ -603,7 +605,7 @@ Median GPU ms on the H100 80GB HBM3 over the H200, same questions at each length
 
 | Model | 32 tok | 128 tok | 256 tok | 512 tok | 768 tok | 1024 tok | 1536 tok | 2048 tok | Intensity (first → last) | Max / median, worst |
 |---|---|---|---|---|---|---|---|---|---|---|
-| d1-3b.compiled | 30.3 | 30.3 | 30.9 | 35.8 | 33.1 | 36.4 | 41.7 | 44.3 | 160 → 1.8e+03 | 31 |
+| d1-3b.compiled (graph recording timed) | 30.3 | 30.3 | 30.9 | 35.8 | 33.1 | 36.4 | 41.7 | 44.3 | 160 → 1.8e+03 | 31 |
 | d1-3b.eager | 15.8 | 15.9 | 15.8 | 15.6 | 15.9 | 16.2 | 16.2 | 17.1 | 160 → 1.8e+03 | 1.2 |
 | elephant-1 | 113 | 109 | 107 | 107 | 105 | 104 | 102 | 103 | 101 → 858 | 1.2 |
 | granite4-h-tiny.zeroshot | 238 | 240 | 243 | 350 | 461 | 568 | 787 | 1e+03 | 58.2 → 430 | 1.9 |
@@ -636,6 +638,7 @@ Median GPU ms on the H100 80GB HBM3 over the H200, same questions at each length
 | Model | 32 tok | 128 tok | 256 tok | 512 tok | 768 tok | 1024 tok | 1536 tok | 2048 tok | Intensity (first → last) | Max / median, worst |
 |---|---|---|---|---|---|---|---|---|---|---|
 | d1-3b.compiled | 11.7 | 12.6 | 13.6 | 20.6 | 30 | 34.1 | 46.2 | 62.2 | 160 → 1.8e+03 | 1.6 |
+| d1-3b.compiled (graph recording timed) | 35.7 | 36.9 | 37.7 | 43.5 | 52 | 58.9 | 70.3 | 83.4 | 160 → 1.8e+03 | 11 |
 | d1-3b.eager | 14.6 | 15.7 | 16.8 | 24.2 | 33.8 | 38.8 | 52.1 | 69.9 | 160 → 1.8e+03 | 1.5 |
 
 ### Questions per request: GPU cost per question as questions share one state

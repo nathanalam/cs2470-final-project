@@ -262,10 +262,23 @@ def _md_table(t: Table) -> str:
     return "\n".join(lines)
 
 
+GRAPH_NOTE = (
+    "d1-3b.compiled replays one CUDA graph per exact prompt length; torch records a length's graph on its "
+    '2nd call and replays it only from the 3rd. Rows marked "graph recording timed" were warmed once, so '
+    "they time the recording (~24 ms extra per question on the L40S); the unmarked d1-3b.compiled row was "
+    "warmed twice (configs/roofline_d1_graph_warmup.toml) and times replays: on the L40S 11.7 ms vs eager "
+    "14.6 ms at 32 tokens, 62.2 vs 69.9 ms at 2048."
+)
+
+
+def _has_graph_rows(lpanels: Sequence[report_lengths.LengthPanel]) -> bool:
+    return any(c.model.startswith("d1-") and "compiled" in c.model for p in lpanels for c in p.curves)
+
+
 def _md_lengths(recs: Sequence[RunRecord]) -> list[str]:
     """The state-length axis: median GPU ms by length per panel, then the H200-vs-H100 speedups."""
     lpanels = report_lengths.panels(recs)
-    out: list[str] = []
+    out: list[str] = [GRAPH_NOTE, ""] if _has_graph_rows(lpanels) else []
     for sp in report_lengths.speedups(lpanels):
         name = f"{report_roofline.gpu_name(sp.other.gpu)} vs {report_roofline.gpu_name(sp.base.gpu)}"
         out += [
@@ -290,7 +303,7 @@ def _md_lengths(recs: Sequence[RunRecord]) -> list[str]:
 
 def _html_lengths(recs: Sequence[RunRecord]) -> list[str]:
     lpanels = report_lengths.panels(recs)
-    parts: list[str] = []
+    parts: list[str] = [f'<p class="sub">{html.escape(GRAPH_NOTE)}</p>'] if _has_graph_rows(lpanels) else []
     for sp in report_lengths.speedups(lpanels):
         h, rows = report_lengths.speedup_table(sp)
         parts += [report_lengths.speedup_chart(sp), '<div class="card">',

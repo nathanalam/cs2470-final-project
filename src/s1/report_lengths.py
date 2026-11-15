@@ -57,8 +57,9 @@ class Curve:
 
     @property
     def short(self) -> str:
-        """A chart label: without ".zeroshot", the variant as "+fused"."""
-        return self.model.removesuffix(".zeroshot") + (" +fused" if self.variant else "")
+        """A chart label: without ".zeroshot", the variant as "+fused" or "+recording"."""
+        tag = {"": "", rr.GRAPH_RECORDING: " +recording"}.get(self.variant, " +fused")
+        return self.model.removesuffix(".zeroshot") + tag
 
     @property
     def family(self) -> int:
