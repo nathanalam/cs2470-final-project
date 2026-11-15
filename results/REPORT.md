@@ -399,6 +399,8 @@ per length.
     0.80–1.01x, kev-4b.hybrid 0.95x past 1,024 tokens. A slower result on a strictly larger GPU means the
     hardware is not what sets the time.
   - laya is the only family above 1.2x (1.19–1.49x), and that is a kernel effect, not bandwidth (below).
+  - Nsight Systems and sampled Nsight Compute (next section) confirm this from kernel time and DRAM counters:
+    the H200's kernels are 1.02–1.11x faster at every length, because no kernel class reads DRAM near its peak.
 - **Where the hardware does bind, the roofline predicts.** On the L4, GPU time grows with the state: qwen3-8b
   137 → 796 ms from 32 to 2,048 tokens, kev-4b.qwen3 54 → 519 ms, at 29–43 TFLOP/s of a measured 57. The
   A100 (PCIe, for these models) is in between (qwen3-8b 43 → 221 ms, 155 TFLOP/s of 230 at 2,048 tokens). On the H100, H200 and B200
@@ -478,13 +480,72 @@ per length.
   hybrid ranking flips (kev-4b.qwen3 beat the hybrid on the L4, 66 vs 89 ms; the hybrid wins on the H100,
   14 vs 30 ms) and the MoE bases' L4 advantage over dense qwen3-8b (1.5–1.7x) shrinks to ~1.0x on the H100 (OLMoE 57 ms, LFM2 70 ms, qwen3-8b 62 ms).
 
+### Kernel time and GPU counters (Nsight Systems and sampled Nsight Compute, 2026-11-15)
+
+The roofline timings above are CUDA-event spans: they include the gaps where the GPU waits for the host. These
+runs separate the two. Nsight Systems records every kernel and samples the GPU's own counters at 10 kHz (DRAM
+read and write bandwidth, tensor-pipe and SM activity, as % of peak, averaged over the samples where SMs are
+active). Setup: batch 1, 8 warmed decisions per point, the same 8 rows at every length (each state >= 16,384
+reference tokens, cut to 32–16,384), qwen3-8b, qwen35-9b, lfm2-8b-a1b and olmoe-1b-7b, on a Modal H100, H200 and
+L4 (configs/nsys_lengths*.toml). "GPU share" is kernel time over wall time. Kernel TFLOP/s is the cost model's
+FLOPs over kernel time, so it is the roofline with the host gaps removed.
+
+- **H200 over H100 in kernel time: 1.02–1.11x for all four models at every length** (qwen3-8b 1.02–1.10,
+  qwen35-9b 1.04–1.11, lfm2 1.08–1.10, OLMoE 1.06–1.09). DRAM read sits at 12–27% of peak on the H100 and 7–20%
+  on the H200. No regime here is bandwidth-bound, which is why the extra 1.41x bandwidth buys so little.
+  - Wall time on the H200 is 0.71–0.89x of the H100's at short states for three of the four models: the
+    containers differ in host (H100 Emerald Rapids, H200 Sapphire Rapids; OLMoE's H100 had a Zen 3 host and
+    goes the other way, 1.47x at 32 tokens). It is the same per-launch host gap as kev-4b.qwen3, above.
+- **The host share fades with state length, and the GPU then runs near its compute roof.**
+  - GPU share on the H100 and H200: 0.20–0.39 at 32 tokens, 0.33–0.68 at 512, 0.67–0.90 at 2,048 and 0.80–0.95
+    at 16,384. qwen3-8b on the H100 at 32 tokens: 14.0 ms of kernels in 36.2 ms of wall time.
+  - Kernel TFLOP/s for the dense models: qwen3-8b 446 at 2,048 tokens and 485 / 495 at 16,384 (H100 / H200),
+    about 72% of the measured ~677 TFLOP/s, with the tensor pipe active 60–63% of the time and DRAM read ~20%.
+    qwen35-9b reaches 395 / 416. Measured with CUDA events, the same qwen3-8b point at 2,048 was 304 TFLOP/s:
+    the gap is host time.
+  - So the dense models are compute-bound once a state is a few thousand tokens long and overhead-bound
+    below that. Neither regime is memory-bound on an HBM GPU.
+- **MoE is not memory-bound at batch 1 either.** The cost model gives the MoE bases low intensity (49–60
+  FLOP/byte at decision lengths), so they were the best candidates for the H200. They gain the same 1.06–1.10x
+  in kernel time, and DRAM read peaks at 25–27%. Their expert GEMMs are small (few tokens per expert) and reach
+  only 23–33% tensor activity and 197–285 TFLOP/s at the longest lengths. Small kernels limited by launch
+  and occupancy cannot saturate DRAM, so more bandwidth does not help them.
+- **The L4 is the one card where the hardware sets the time.** GPU share is 0.94–0.99 for qwen3-8b and
+  0.87–0.99 for qwen35-9b at every length (0.57–0.90 for the MoE models), against 0.2–0.4 at 32 tokens on the
+  HBM cards. qwen3-8b holds 39–41 TFLOP/s from 512 tokens on, ~73% of the Modal L4's measured ~56. At short
+  states DRAM read is 50–61% of peak for every model, the most memory-bound point measured anywhere. It falls to
+  26–37% as the state grows and compute takes over. This is why the cost model predicts L4 times well.
+- **Cold question shapes cost ~35 ms of host time per decision** (configs/nsys_cold_warm.toml, qwen3-8b, H100,
+  512 tokens). The two runs differ only in which rows the warm-up answers. When the warm-up has seen the
+  profiled shapes, a decision takes 40.0 ms. When every profiled shape is new, it takes 75.0 ms, with the same
+  kernels and the same kernel time (25.5 vs 25.4 ms), on the same host CPU model. The extra time is on the host, outside the GPU. This is
+  consistent with cuDNN building a plan per new attention shape (the laya result above), and it is part of
+  why the natural-length roofline runs, where every question is a new shape, show larger short-state floors
+  (62 ms for qwen3-8b on the H100) than these warmed runs.
+- **Sampled Nsight Compute: the memory-bound kernels gain 1.13x, not 1.41x.** These runs profile the first 199
+  kernels of one qwen3-8b question at 2,048 tokens, on the H100 and H200, with lean metrics
+  (configs/ncu_sampled_test.toml, configs/ncu_sampled_h200.toml).
+  - On the H100, GEMMs and attention are 58% of kernel time (GEMM 795 TFLOP/s, SM 90%). Elementwise and norm
+    kernels are 42%, at 1,540–1,690 GB/s, 46–50% of DRAM peak.
+  - On the H200 the GEMMs and attention are 1.01x and the elementwise and norm kernels 1.13x, so 1.06x over all
+    profiled kernels. The 1.14x predicted from the H100 split assumed the memory-side kernels would scale with
+    bandwidth (1.41x). They run at under half of peak DRAM on either card, so they are limited by latency and
+    size, not bandwidth.
+  - This matches the Nsight Systems ratio at 2,048 tokens (1.05x).
+- One run per point, eight decisions each. Differences of a few percent are noise. nsys adds some wall time,
+  so read kernel time and ratios rather than absolute wall times.
+
 ### What this suggests for choosing hardware next
 
 - **Fix the software before buying a GPU.** Past an L4, a batch-1 decision model spends most of its time on
   overhead: CUDA graphs, fused kernels, fixed input shapes and several questions per forward move it toward
   its roof, and only then does the roof's memory-vs-compute split decide which GPU helps.
-- **More bandwidth alone buys ~1.1x** for these models (H100 → H200). It is not the lever the midterm's L4
-  analysis suggested.
+- **More bandwidth alone buys ~1.1x** for these models (H100 → H200), and the counters show why: no kernel
+  class reads DRAM near its peak at batch 1, MoE included. It is not the lever the midterm's L4 analysis
+  suggested. Long states are compute-bound (dense models ~72% of peak in kernel time), so compute is what
+  helps there.
+- **Warm the shapes.** A question shape the process has not seen costs ~35 ms of host time on sm90 GPUs. Fixed
+  or padded input shapes, or a warm-up over the shapes in use, remove it.
 - **Cheap GPUs are where the roofline binds.** On the L4 the cost model predicts time well, and its advice
   (bandwidth for two-pass, MoE and encoder recipes) applies there.
 - **Measure ceilings and check the card.** Measured peaks are 47–85% of the datasheet, and "A100-80GB" on
@@ -547,11 +608,15 @@ favor of H3.
   datasheet roof drawn for it). Plain-PyTorch granite on the L4 failed every question at >= 768 state tokens
   and some at 512 (178 of 320 invalid), so its curve stops at 512.
 - **Theoretical FLOPs and bytes.** Compulsory traffic is a lower bound; real intensities are if anything lower.
-  Hardware-counter (ncu) runs were not repeated on the Modal GPUs.
+  On the Modal GPUs, measured counters come from Nsight Systems GPU metrics (four models, three GPUs) and from
+  one sampled ncu point: the first 199 kernels of one qwen3-8b question at 2,048 tokens, H100 and H200. A
+  full-kernel ncu sweep is not feasible: replay costs ~0.4 s per kernel, so one question took ~1 h.
 - **What is confirmed and what is not.** Confirmed by controlled tests (2026-11-09): the laya cuDNN shape cost
   (SDPA backend A/B, same host), kev-4b.hybrid's 1,024-token cliff (nsys: graph range ends), and the B200's
   Qwen3.5 gain being mostly host time (nsys), and (2026-11-15, two runs per GPU) kev-4b.qwen3's H200 slowdown
-  being per-launch host cost, not GPU time. The 11-09 tests rest on one run per point. Still unexplained: what
+  being per-launch host cost, not GPU time. Also on 2026-11-15: the H200's ~1.1x being kernels that do not
+  saturate DRAM (nsys GPU metrics, sampled ncu), and cold shapes costing host time with unchanged kernels (nsys,
+  one model, one length). The 11-09 tests rest on one run per point. Still unexplained: what
   makes kernel launches slower on the H200 containers, and kev-4b.qwen3's own 1,024-token jump.
 
 ### Roofs
