@@ -136,3 +136,119 @@ def test_clock_control_recorded_as_locked_on_slurm(on_slurm):
 def test_set_values(text, val):
     assert _scalar(text) == val
     assert type(_scalar(text)) is type(val)
+
+
+# --- kernel classes and the length axis -----------------------------------------------------------------
+
+NAMED_HEADER = [*HEADER, ncu.DRAM_PCT, ncu.SM_PCT]
+NAMED_UNITS = [*UNITS, "%", "%"]
+
+
+def kernel(i, name, *, dram=0, ns=1000, bf16=0, dram_pct=0.0, sm_pct=0.0):
+    return [str(i), name, str(dram), "0", str(ns), str(bf16), "0", "0", str(dram_pct), str(sm_pct)]
+
+
+def named_csv(*rows):
+    lines = ["==PROF== Connected to process 1"]
+    lines += [",".join(f'"{v}"' for v in r) for r in (NAMED_HEADER, NAMED_UNITS, *rows)]
+    return "\n".join(lines) + "\n"
+
+
+@pytest.mark.parametrize(
+    ("name", "cls"),
+    [
+        ("cudnn_generated_fort_native_sdpa_sm90_flash_fprop_wgmma_f16_knob_7", "attention"),
+        ("fmha_cutlassF_bf16_aligned_64x128_rf_sm80(PyTorchMemEffAttention::AttentionKernel)", "attention"),
+        ("void pytorch_flash::flash_fwd_splitkv_kernel<Flash_fwd_kernel_traits>", "attention"),
+        ("nvjet_sm90_tst_128x224_64x4_2x1_v_bz_coopA_TNT", "gemm"),
+        ("ampere_bf16_s16816gemm_bf16_128x128_ldg8_f2f_stages_32x5_tn", "gemm"),
+        ("chunk_gated_delta_rule_fwd_kernel_h_blockdim64", "mixer"),
+        ("void at::native::conv_depthwise2d_forward_kernel_generic<c10::BFloat16, int>", "mixer"),
+        ("void at::native::(anonymous namespace)::indexSelectLargeIndex<c10::BFloat16>", "routing"),
+        ("void at::native::sbtopk::gatherTopK<float, unsigned int, 2, false>", "routing"),
+        ("void at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, MeanOps<float>>>", "norm"),
+        ("void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor>", "elementwise"),
+        ("some_unknown_kernel", "other"),
+    ],
+)
+def test_classify(name, cls):
+    assert ncu.classify(name) == cls
+
+
+def test_parse_named_keeps_names_in_launch_order():
+    named = ncu.parse_named(named_csv(kernel(0, "spin_kernel"), kernel(1, "nvjet_x", dram=10)))
+    assert [n for n, _ in named] == ["spin_kernel", "nvjet_x"]
+    assert ncu.NAME not in named[1][1]
+    assert named[1][1]["dram__bytes_read.sum"] == 10
+    assert ncu.parse(named_csv(kernel(0, "nvjet_x"))) == [named[1][1] | {"dram__bytes_read.sum": 0.0}]
+
+
+def test_breakdown_shares_rates_and_time_weighted_speed_of_light():
+    named = [
+        ("nvjet_a", {ncu.TIME: 3000.0, "dram__bytes_read.sum": 3000.0, TENSOR_BF16: 6e6, ncu.SM_PCT: 80.0}),
+        ("nvjet_b", {ncu.TIME: 1000.0, "dram__bytes_read.sum": 1000.0, ncu.SM_PCT: 40.0}),
+        (
+            "vectorized_elementwise_kernel",
+            {ncu.TIME: 4000.0, "dram__bytes_read.sum": 8000.0, ncu.DRAM_PCT: 90.0},
+        ),
+    ]
+    m = ncu.breakdown(named)
+    assert m["roofline_hw_gemm_share"] == pytest.approx(0.5)
+    assert m["roofline_hw_gemm_kernels"] == 2
+    assert m["roofline_hw_gemm_ms"] == pytest.approx(4e-3)
+    assert m["roofline_hw_gemm_dram_gbs"] == pytest.approx(1.0)  # 4000 B / 4000 ns
+    assert m["roofline_hw_gemm_tflops"] == pytest.approx(6e6 / 4000 / 1e3)
+    assert m["roofline_hw_gemm_sm_pct"] == pytest.approx(70.0)  # (80*3 + 40*1) / 4
+    assert m["roofline_hw_elementwise_dram_gbs"] == pytest.approx(2.0)
+    assert m["roofline_hw_elementwise_dram_pct"] == pytest.approx(90.0)
+    assert "roofline_hw_attention_share" not in m  # absent class: no keys, never zero-filled
+    assert "roofline_hw_elementwise_sm_pct" not in m  # metric missing from every kernel of the class
+
+
+TENSOR_BF16 = "sm__ops_path_tensor_src_bf16_dst_fp32.sum"
+
+
+def test_summarize_named_natural_mode_adds_busy_and_classes():
+    named = ncu.parse_named(
+        named_csv(kernel(0, "nvjet_x", ns=2_000_000), kernel(1, "rms_norm", ns=2_000_000))
+    )
+    m = ncu.summarize_named(named, {"roofline_hw_timed_ms": 10.0})
+    assert m["roofline_hw_kernel_ms"] == pytest.approx(4.0)
+    assert m["roofline_hw_busy"] == pytest.approx(0.4)
+    assert m["roofline_hw_gemm_share"] == pytest.approx(0.5)
+    assert not any(k.startswith("roofline_hw_s") and k[13].isdigit() for k in m)
+
+
+def test_summarize_named_splits_lengths_on_markers():
+    log = named_csv(
+        kernel(0, "spin_kernel", ns=999_999),
+        kernel(1, "nvjet_x", ns=1_000_000, dram=100),
+        kernel(2, "spin_kernel", ns=999_999),
+        kernel(3, "nvjet_x", ns=3_000_000, dram=300),
+        kernel(4, "cudnn_sdpa_fprop", ns=1_000_000),
+    )
+    run = {
+        "roofline_hw_timed_ms": 10.0,
+        "roofline_hw_s32_timed_ms": 2.0,
+        "roofline_hw_s32_theory_mb": 1e-4,
+        "roofline_hw_s2048_timed_ms": 8.0,  # sorted numerically, not as strings
+    }
+    m = ncu.summarize_named(ncu.parse_named(log), run)
+    assert m["roofline_hw_kernels"] == 3  # markers excluded from the totals
+    assert m["roofline_hw_kernel_ms"] == pytest.approx(5.0)
+    assert m["roofline_hw_s32_kernel_ms"] == pytest.approx(1.0)
+    assert m["roofline_hw_s32_busy"] == pytest.approx(0.5)
+    assert m["roofline_hw_s32_byte_ratio"] == pytest.approx(1.0)
+    assert m["roofline_hw_s2048_kernels"] == 2
+    assert m["roofline_hw_s2048_busy"] == pytest.approx(0.5)
+    assert m["roofline_hw_s2048_attention_share"] == pytest.approx(0.25)
+    assert "roofline_hw_s32_attention_share" not in m
+    assert "roofline_hw_s32_clocks_locked" not in m
+
+
+def test_summarize_named_refuses_unattributable_kernels():
+    log = named_csv(kernel(0, "spin_kernel"), kernel(1, "nvjet_x"))
+    with pytest.raises(ValueError, match="1 length markers"):
+        ncu.summarize_named(
+            ncu.parse_named(log), {"roofline_hw_s32_timed_ms": 1.0, "roofline_hw_s64_timed_ms": 1.0}
+        )

@@ -55,6 +55,8 @@ Settings (all optional):
                            roofline_attention_kernel), traced after timing; 0: skip     default 1
     roofline_per_length    questions per state length (with the [grid] axis)        default 40
     roofline_max_question_tokens  reference tokens of a length-axis question's JSON  default 512
+    roofline_min_state_tokens  length-axis questions need a state at least this long (and at least the
+                           longest length), so axes of different reach share questions   default 0
     roofline_tokenizer_file
 """
 
@@ -174,14 +176,15 @@ def length_rows(
     to its first `length` reference tokens, picked round-robin across datasets (`spread`; the per-dataset
     counts are noted as roofline_length_sources). Rows qualify when they are choice/noul with at most
     `roofline_max_options` options, their question JSON is at most `roofline_max_question_tokens` tokens, and
-    their own state is at least max(lengths) tokens, so every point is a prefix of one real state. Ordered
+    their own state is at least max(lengths) tokens (or `roofline_min_state_tokens`, if larger: configs with
+    shorter axes then draw the same questions), so every point is a prefix of one real state. Ordered
     length-major (all questions at one length, then the next). Raises if too few rows qualify."""
     if not lengths:
         raise ValueError(f"{LENGTH_AXIS} is empty")
     per = get_int(settings, "roofline_per_length", 40)
     max_options = get_int(settings, "roofline_max_options", 16)
     max_question = get_int(settings, "roofline_max_question_tokens", 512)
-    longest = max(lengths)
+    longest = max(*lengths, get_int(settings, "roofline_min_state_tokens", 0))
     keep = [
         r
         for r in rows
@@ -412,6 +415,7 @@ def run(model: object, settings: Settings) -> Metrics:
         cost = flops.total(arch, fwd, **sizes)
         questions.append(Question(cost, len(fwd), outcome, real_tokens=real_tokens(raw_fwd)))
     wall_s = time.perf_counter() - t0
+    print(f"roofline: {len(rows)} timed questions in {wall_s:.0f} s", flush=True)  # progress for long runs
 
     for i, row in enumerate(rows[: get_int(settings, "roofline_counted", 8)]):
         try:
@@ -431,8 +435,29 @@ def run(model: object, settings: Settings) -> Metrics:
     if row_lengths:
         m |= length_points(questions, row_lengths)
     if n_hw := get_int(settings, "roofline_ncu", 0):
-        m |= hardware_region(prof, rows[:n_hw], questions[:n_hw], arch, sizes)
+        m |= _hardware(prof, n_hw, rows, questions, row_lengths=row_lengths, arch=arch, sizes=sizes)
     return m
+
+
+def _hardware(
+    prof: Profiled,
+    n_hw: int,
+    rows: Sequence[jeval.Row],
+    questions: Sequence[Question],
+    *,
+    row_lengths: Sequence[int],
+    arch: flops.Arch,
+    sizes: Mapping[str, int],
+) -> Metrics:
+    """The `s1 ncu` region: `hardware_lengths` on the length axis, else `hardware_region`."""
+    if row_lengths:  # n_hw questions at every length, shortest first, each length after a marker kernel
+        groups = [
+            (n, [rows[i] for i in idx[:n_hw]], [questions[i] for i in idx[:n_hw]])
+            for n in sorted(set(row_lengths))
+            for idx in [[i for i, ln in enumerate(row_lengths) if ln == n]]
+        ]
+        return hardware_lengths(prof, groups, arch, sizes)
+    return hardware_region(prof, rows[:n_hw], questions[:n_hw], arch, sizes)
 
 
 def record_kernels(prof: Profiled, row: jeval.Row, top: int = 10) -> None:
@@ -489,3 +514,62 @@ def hardware_region(
         "roofline_hw_theory_mb": cost.bytes / 1e6,
         "roofline_hw_timed_ms": sum(q.cost.ms for q in timed),
     }
+
+
+def ncu_marker() -> None:
+    """Launch the marker kernel `s1 ncu` splits a length-axis log on (torch.cuda._sleep, named "spin")."""
+    from .. import profiling  # noqa: PLC0415 — imports torch lazily inside
+
+    profiling.ncu_marker()
+
+
+def hardware_lengths(
+    prof: Profiled,
+    groups: Sequence[tuple[int, Sequence[jeval.Row], Sequence[Question]]],
+    arch: flops.Arch,
+    sizes: Mapping[str, int],
+) -> Metrics:
+    """`hardware_region` on the length axis: inside one CUDA profiler range, for each (length, rows, timed)
+    group in ascending length order, a marker kernel and then the rows. Returns the totals of
+    `hardware_region` plus roofline_hw_s<L>_{questions,theory_gflop,theory_mb,timed_ms} per length, which
+    `ncu.summarize_named` pairs with the kernels after each marker."""
+    import time  # noqa: PLC0415
+
+    profiler = getattr(prof, "profiler", None)
+    if not callable(profiler):
+        raise TypeError(f"roofline_ncu needs a model with .profiler(on); got {type(prof).__name__}")
+    if [n for n, _, _ in groups] != sorted({n for n, _, _ in groups}):
+        raise ValueError(
+            "length groups must be distinct and in ascending order (markers map to sorted lengths)"
+        )
+    prof.take_forwards()
+    costs: list[flops.Cost] = []
+    profiler(True)
+    try:
+        for n, rows, _ in groups:
+            t0 = time.perf_counter()
+            ncu_marker()
+            for row in rows:
+                jeval.ask(prof, row)
+            costs.append(flops.total(arch, [forward(f) for f in prof.take_forwards()], **sizes))
+            # under ncu each kernel is replayed, so this is the profiling cost per length
+            print(
+                f"roofline ncu: {n} tokens, {len(rows)} question(s) in {time.perf_counter() - t0:.0f} s",
+                flush=True,
+            )
+    finally:
+        profiler(False)
+    m: Metrics = {
+        "roofline_hw_questions": float(sum(len(rows) for _, rows, _ in groups)),
+        "roofline_hw_theory_gflop": sum(c.flops for c in costs) / 1e9,
+        "roofline_hw_theory_mb": sum(c.bytes for c in costs) / 1e6,
+        "roofline_hw_timed_ms": sum(q.cost.ms for _, _, timed in groups for q in timed),
+    }
+    for (n, rows, timed), cost in zip(groups, costs, strict=True):
+        m |= {
+            f"roofline_hw_s{n}_questions": float(len(rows)),
+            f"roofline_hw_s{n}_theory_gflop": cost.flops / 1e9,
+            f"roofline_hw_s{n}_theory_mb": cost.bytes / 1e6,
+            f"roofline_hw_s{n}_timed_ms": sum(q.cost.ms for q in timed),
+        }
+    return m

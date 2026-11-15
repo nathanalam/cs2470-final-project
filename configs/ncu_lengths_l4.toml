@@ -1,0 +1,42 @@
+# ncu_lengths.toml on the L4, the reference GPU where the roofline binds (see that file for the experiment).
+# Capped at 8,192 state tokens: qwen35-9b (19.3 GB of weights) at 16k may not fit in 24 GB, and ncu-replayed
+# 16k forwards take minutes per question on an L4. Same questions as ncu_lengths.toml (roofline_min_state_tokens).
+# Run under ncu with N questions per length (queues `s1 ncu`; paid Modal GPU time):
+#   uv run --group modal s1 submit configs/ncu_lengths_l4.toml --ncu 3
+benchmarks = ["roofline"]
+
+[launch]
+orchestrator = "modal"
+gpu = ["L4"]  # require_gpu is set by the launcher
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "06:00:00"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+dtype = "bfloat16"
+measure_ceilings = true
+max_prompt_tokens = 20480  # same as ncu_lengths.toml
+semif_max_options = 16
+
+[params]
+roofline_seed = 0
+roofline_max_options = 16
+roofline_warmup = 4
+roofline_counted = 4
+roofline_per_length = 8
+roofline_min_state_tokens = 16384
+roofline_tokenizer_file = "$MODELS_DIR/Qwen3.5-4B-Base/tokenizer.json"
+
+[sweep]
+model = [
+    "qwen3-8b.zeroshot",
+    "qwen35-9b.zeroshot",
+    "lfm2-8b-a1b.zeroshot",
+]
+
+[grid]
+roofline_state_tokens = [32, 512, 2048, 4096, 8192]

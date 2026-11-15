@@ -196,6 +196,13 @@ def count_flops(fn: Callable[[], Any]) -> tuple[Any, float]:
     return out, float(counter.get_total_flops())
 
 
+def ncu_marker() -> None:
+    """A tiny kernel named "spin" (torch.cuda._sleep) that `s1 ncu` uses to split its log by state length."""
+    import torch  # noqa: PLC0415
+
+    torch.cuda._sleep(1000)
+
+
 def kernel_env(model: Any = None) -> dict[str, str]:  # noqa: ANN401
     """Which fast kernels this process can use; transformers falls back to plain torch without them."""
     import torch  # noqa: PLC0415

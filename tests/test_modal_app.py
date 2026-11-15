@@ -389,6 +389,7 @@ class FakeModal:
         self.files: dict[str, bytes] = {}
         self.payloads: dict[str, dict[str, Any]] = {}
         self.functions: list[dict[str, Any]] = []
+        self.detached: list[bool] = []
         self.lock = threading.Lock()
         modal = self
 
@@ -444,7 +445,8 @@ class FakeModal:
                     modal.functions.append(kw)
                 return lambda fn: Function(kw)
 
-            def run(self, detach=False):
+            def run(self, *, detach=False):
+                modal.detached.append(detach)
                 return contextlib.nullcontext()
 
         self.App, self.Volume = App, Volume
@@ -504,12 +506,14 @@ def test_submit_many_runs_concurrently_and_survives_failures(tmp_path, monkeypat
         assert payload["commit"] == ["s1-runs", "s1-hf-cache", ma.triton_volume(gpu)]
         assert f"require_gpu={ma.gpu_kind(gpu).require}" in payload["s1_args"]
     assert any(line.startswith("[H100] modal function call fc-H100") for line in lines)
+    assert fake.detached == [True]  # one detached app: a dropped local client must not stop the GPUs
 
 
 def test_single_submit_still_raises_on_remote_failure(tmp_path, monkeypatch):
     cfg = tmp_path / "x.toml"
     cfg.write_text(CPU_CFG)
-    monkeypatch.setattr(ma, "_modal", lambda: FakeModal(1, exits={"H100!"}))
+    fake = FakeModal(1, exits={"H100!"})
+    monkeypatch.setattr(ma, "_modal", lambda: fake)
     monkeypatch.setattr(ma, "_image", lambda modal, **kw: "image")
     launcher = ma.ModalLauncher(
         results_dir=tmp_path / "results", logs_dir=tmp_path / "logs", log=lambda _: None
@@ -517,6 +521,7 @@ def test_single_submit_still_raises_on_remote_failure(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="exited 1"):
         launcher.submit(cfg, modal_resources(gpu="H100"), ["run", str(cfg)])
     assert len(load_all(tmp_path / "results")) == 1
+    assert fake.detached == [True]
 
 
 def test_write_back_never_replaces_a_different_record(tmp_path):

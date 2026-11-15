@@ -5,6 +5,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 import random
+from typing import override
 
 import pytest
 
@@ -135,3 +136,58 @@ def test_without_the_axis_the_natural_mode_is_unchanged(tmp_path, monkeypatch):
     assert not any(
         k.startswith(("roofline_s", "roofline_lengths")) for k in m if not k.startswith("roofline_spec")
     )
+
+
+def test_min_state_tokens_lets_a_shorter_axis_draw_the_same_questions():
+    rows = [row(i, state_words=20 + 20 * i) for i in range(30)]  # states of 20 .. 600 words
+    counter = shape_sweep.WordCounter()
+    long_axis = roofline.length_rows(rows, counter, {"roofline_per_length": 4}, [8, 300])
+    short_axis = roofline.length_rows(
+        rows, counter, {"roofline_per_length": 4, "roofline_min_state_tokens": 300}, [8, 64]
+    )
+    unpinned = roofline.length_rows(rows, counter, {"roofline_per_length": 4}, [8, 64])
+    assert {r.id for _, r in short_axis} == {r.id for _, r in long_axis}
+    assert {r.id for _, r in unpinned} != {r.id for _, r in long_axis}
+
+
+class NcuProfiled(FakeProfiled):
+    """FakeProfiled with the CUDA-profiler hook `s1 ncu` needs; logs range edges and markers in order."""
+
+    def __init__(self, events):
+        super().__init__()
+        self.events = events
+
+    def profiler(self, on):
+        self.events.append("start" if on else "stop")
+
+    @override
+    def decide(self, state, questions):
+        if self.events and self.events[-1] != "stop":
+            self.events.append(len(state.split()))
+        return super().decide(state, questions)
+
+
+def test_ncu_on_the_length_axis_profiles_every_length_after_a_marker(monkeypatch):
+    rows = [row(i, state_words=300) for i in range(12)]
+    monkeypatch.setattr(jeval, "load_rows", lambda: rows)
+    events: list[object] = []
+    monkeypatch.setattr(roofline, "ncu_marker", lambda: events.append("marker"))
+    settings: registry.Settings = {
+        "roofline_per_length": 5,
+        "roofline_warmup": 0,
+        "roofline_counted": 0,
+        "roofline_kernel_profile": 0,
+        "roofline_ncu": 2,
+        f"grid_{roofline.LENGTH_AXIS}": "256,16",  # grid order is not length order
+        roofline.LENGTH_AXIS: "256,16",
+    }
+    model = NcuProfiled(events)
+    events.clear()
+    m = roofline.run(model, settings)
+    profiled = events[events.index("start") :]
+    assert profiled == ["start", "marker", 16, 16, "marker", 256, 256, "stop"]  # shortest length first
+    assert m["roofline_hw_questions"] == 4
+    assert m["roofline_hw_s16_questions"] == 2
+    assert m["roofline_hw_s16_timed_ms"] == pytest.approx(4.0)  # two timed questions at 2 ms
+    assert m["roofline_hw_s256_theory_gflop"] > m["roofline_hw_s16_theory_gflop"]
+    assert m["roofline_hw_timed_ms"] == pytest.approx(8.0)

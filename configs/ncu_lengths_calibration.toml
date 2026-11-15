@@ -1,0 +1,39 @@
+# Calibration for the ncu length axis (ncu_lengths.toml): one model on one H100, so the cost of ncu's kernel
+# replay is measured before the full sweep is booked, and the per-length marker split is checked on a real GPU.
+# Settings are ncu_lengths.toml's (same questions, same lengths), so the record doubles as that experiment's
+# H100 qwen3-8b point. The 1 h timeout caps the spend if replay turns out slow.
+# Run under ncu with one question per length (queues `s1 ncu`; paid Modal GPU time):
+#   uv run --group modal s1 submit configs/ncu_lengths_calibration.toml --ncu 1
+benchmarks = ["roofline"]
+
+[launch]
+orchestrator = "modal"
+gpu = ["H100"]  # require_gpu is set by the launcher
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "01:00:00"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+dtype = "bfloat16"
+measure_ceilings = true
+max_prompt_tokens = 20480  # same as ncu_lengths.toml
+semif_max_options = 16
+
+[params]
+roofline_seed = 0
+roofline_max_options = 16
+roofline_warmup = 4
+roofline_counted = 4
+roofline_per_length = 8
+roofline_min_state_tokens = 16384
+roofline_tokenizer_file = "$MODELS_DIR/Qwen3.5-4B-Base/tokenizer.json"
+
+[sweep]
+model = ["qwen3-8b.zeroshot"]
+
+[grid]
+roofline_state_tokens = [32, 512, 2048, 4096, 8192, 16384]

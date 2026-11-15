@@ -58,7 +58,9 @@ def run(
 @app.command("ncu")
 def ncu_cmd(
     cfg: Path,
-    questions: int = typer.Option(4, "--questions", help="Questions profiled per model."),
+    questions: int = typer.Option(
+        4, "--questions", help="Questions profiled per model (per state length on the length axis)."
+    ),
     results_dir: Path = ResultsDir,
     ncu_bin: str = typer.Option("/usr/local/cuda/bin/ncu", "--ncu", help="Nsight Compute CLI."),
     clock_control: Annotated[
@@ -72,16 +74,17 @@ def ncu_cmd(
     specs = config.load(cfg)
     clock = ncu.clock_control(clock_control)
     job = env.job_id()
-    Path("logs").mkdir(exist_ok=True)
+    logs = env.log_dir()  # $S1_LOG_DIR: on Modal the run's volume dir, so a timed-out run keeps its ncu log
+    logs.mkdir(parents=True, exist_ok=True)
     for i in range(len(specs)):
-        log = Path("logs") / f"ncu-{job}-{cfg.stem}-{i}.csv"
+        log = logs / f"ncu-{job}-{cfg.stem}-{i}.csv"
         before = set(results_dir.glob("*.json"))
         child = [sys.executable, "-m", "s1.cli", "run", str(cfg), "--index", str(i)]
         child += ["--results-dir", str(results_dir), "--set", f"roofline_ncu={questions}"]
         subprocess.run([ncu_bin, *ncu.args(clock), "--log-file", str(log), *child], check=True)
         (path,) = set(results_dir.glob("*.json")) - before
         rec = RunRecord.load(path)
-        hw = ncu.summarize(ncu.parse(log.read_text()), rec.results["roofline"], clock)
+        hw = ncu.summarize_named(ncu.parse_named(log.read_text()), rec.results["roofline"], clock)
         rec.results["roofline"] |= hw
         rec.meta["ncu_log"] = str(log)
         rec.meta[ncu.META_CLOCK_CONTROL] = clock
