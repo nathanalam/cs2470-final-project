@@ -173,6 +173,32 @@ def test_padding_and_after_warmup(monkeypatch):
     assert m["roofline_padding"] == pytest.approx(0.5)
 
 
+class CountingProfiled(FakeProfiled):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    @override
+    def decide(self, state, questions):
+        self.calls += 1
+        return super().decide(state, questions)
+
+
+@pytest.mark.parametrize(("passes", "warm_calls"), [(1, 3), (2, 6)])
+def test_warmup_passes_repeat_the_warm_list(monkeypatch, passes, warm_calls):
+    """Per-size CUDA graphs record on a size's 2nd call: 2 passes make every timed call a replay."""
+    monkeypatch.setattr(jeval, "load_rows", lambda: [row(i, "choice", state_words=10 + i) for i in range(12)])
+    model = CountingProfiled()
+    settings = {
+        "roofline_limit": 10,
+        "roofline_warmup": 3,
+        "roofline_counted": 0,
+        "roofline_kernel_profile": 0,
+    }
+    roofline.run(model, settings | {"roofline_warmup_passes": passes})
+    assert model.calls == warm_calls + 10
+
+
 def test_unpadded_forwards_have_no_padding(monkeypatch):
     monkeypatch.setattr(jeval, "load_rows", lambda: [row(i, "choice", state_words=10 + i) for i in range(12)])
     m = roofline.run(FakeProfiled(), {"roofline_limit": 10, "roofline_counted": 0})
