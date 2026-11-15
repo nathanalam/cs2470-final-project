@@ -53,7 +53,11 @@ per length.
   - **CUDA graphs:** kev-4b.hybrid (fused Triton DeltaNet kernels, graphs over padded shape buckets) is the
     fastest model on every big GPU (10–14 ms natural) and the only one that scales with the hardware (6.4x
     L4 → H100). Its time and kev-4b.qwen3's jump ~2.5–4x between 768 and 1,024 state tokens on the H100, H200
-    and B200 (H100: 25 → 67 ms and 28 → 68 ms), which looks like the end of the captured shape range (not checked in the kev code).
+    and B200 (H100: 25 → 67 ms and 28 → 68 ms). For kev-4b.hybrid, Nsight Systems on the H100 confirms this is the
+    end of the captured shape range: at 768 tokens a decision is 2 graph replays (27.7 ms wall, ~25 ms of it GPU
+    time); at 1,024 it is 1 replay plus ~994 eagerly launched kernels (80.4 ms wall, ~27 ms GPU). The GPU work
+    barely changes; the extra ~50 ms is launch overhead. kev-4b.qwen3 never uses graphs, so its jump has another
+    cause (not profiled).
   - **Fused kernels:** granite-4.0-H-tiny with mamba-ssm and causal-conv1d is 2.5x faster than its
     plain-PyTorch fallback on the H100 natural set (114 vs 276 ms) and ~11x at 2,048 tokens; the
     midterm's 1.7 s per question on the L4 was the fallback, not the architecture.
@@ -62,13 +66,46 @@ per length.
     SDPA kernel (H100, H200, B200) laya takes 64–122 ms per question below the limit and 13–26 ms at it,
     and the drop sits exactly at each checkpoint's limit (512 tokens English, 1,024 multilingual). On the GPUs
     where it picks the CUTLASS memory-efficient kernel (A100, L4) laya is flat at 27–33 ms at every length.
-    The likely cause is a per-shape setup cost in the cuDNN path; forcing the other SDPA backend would test
-    it (not run). It also explains laya being 3x slower on the H100 than on the cluster L4 at natural lengths.
+    **An A/B test confirms the kernel is the cause** (laya.english, same container and host, only the SDPA
+    backend changed): on the H100 at natural lengths cuDNN takes 112.7 ms per question (p99 696 ms) against
+    21.8 ms for CUTLASS, with the same accuracy (0.43 vs 0.44). On the H100 length axis cuDNN takes 72–105 ms
+    below the 512-token limit (a new width every question) and 23–24 ms at it (one width), where CUTLASS is
+    27.5–28.5 ms at every length; so at a fixed shape cuDNN is ~15% faster, and the whole penalty is the first
+    time each shape is seen. Forcing cuDNN on an L4 shows the same penalty (93 vs 34 ms at 128 tokens), so it is
+    the kernel, not the GPU. This also explains laya being 3x slower on the H100 than on the cluster L4 at
+    natural lengths. Where inside cuDNN the time goes (per-shape plan building on the host is the leading
+    explanation) is not traced.
 - **The B200 is the one big step, for one backbone.** qwen35-9b and jevk5-9b (Qwen3.5, Gated DeltaNet
   hybrid) take 21–24 ms on the B200 at short states against 53–65 ms on the H100, and reach ~600 TFLOP/s at
   2,048 tokens. Dense qwen3-8b gains 1.6x, the MoE bases ~1.5x, elephant-1 and fused granite ~1.0x, and kev-4b.qwen3 is
   slower (0.7x at short states). The Qwen3.5 gain is too large for bandwidth or compute alone (2.15x and 1.96x the H100's measured
-  ceilings); a lower-overhead kernel path for its mixer is the likely reason (not profiled).
+  ceilings). **Nsight Systems shows it is mostly host time, not a different kernel path.** At 256 tokens and batch
+  1, qwen35-9b takes 91.4 ms wall / 23.2 ms of GPU kernels on the H100 and 31.5 / 17.4 ms on the B200: 2.9x
+  faster end to end but only 1.33x in kernels, with the same kernel mix on both (same ops and counts). Host time
+  per request falls from ~68 to ~14 ms, and the CUDA launch call costs ~5.6 vs ~2.7 µs. The two containers had
+  different host CPUs (Sapphire Rapids vs Zen 5), so the B200 "step" is largely the faster host; host and GPU
+  changed together and this run cannot split them further. qwen3-8b, the dense control: 67.2 / 19.9 ms on the
+  H100, 35.6 / 14.6 ms on the B200.
+- **The host CPU is a hidden variable in every short-state comparison.** Modal places each container on whatever
+  host it gets (Skylake, Ice Lake, Sapphire Rapids, Emerald Rapids, Zen 3, Zen 5), and for eager models the flat
+  short-state floor tracks that host as much as the GPU. All B200 runs of the semif-backend models (qwen35-9b,
+  jevk5, qwen3-8b, OLMoE, LFM2) had Zen 5 hosts; B200 runs on Emerald Rapids (kev, elephant, fused granite) show
+  ~1.0x over the H100. The "slower on the H200" results are at least partly this: kev-4b.qwen3 (eager, cuDNN
+  attention, GPU 20–28% busy, same SM clocks on both cards) ran on an Emerald Rapids host on the H100 and a
+  Sapphire Rapids one on the H200. A later run with Sapphire Rapids on both still had the H200 slower (Q = 1 at
+  256 tokens, median 67 vs 56 ms), so the CPU model alone does not explain it.
+- **Nsight Systems settles the kev-4b.qwen3 case: the H200 GPU is faster, the H200 container's host is slower.**
+  configs/nsys_kev_qwen3_h100_h200.toml, 2026-11-15: batch 1, 256 tokens, 32 warmed decisions, two runs per GPU,
+  all four containers on the same host CPU model (Emerald Rapids). Per decision (GPU kernel time / wall time under
+  nsys / kernel-launch API time, 2,133 kernels launched on both):
+  - H100: 13.8 / 45.3 / 9.2 ms and 13.9 / 43.6 / 8.6 ms.
+  - H200: 13.0 / 53.1 / 12.0 ms and 13.0 / 50.4 / 11.3 ms.
+  - The H200 runs the identical kernels (same counts, same cuDNN SDPA kernel) 6% faster, yet the decision takes
+  ~16% longer, because 69–76% of each decision is host time and each kernel launch costs ~5.5 µs on the H200
+  containers against ~4.2 µs on the H100 ones. The two runs per GPU agree within 4%. So the slowdown is in the
+  host, but not in the CPU model: something else about the H200 instances (clock, virtualization, driver path)
+  makes launches slower, and these runs cannot say which. nsys inflates wall time, so read the ratios, not the
+  absolute wall times.
 - **OpenJev (27B, vLLM, TP=1) on four 80 GB GPUs.** Accuracy is 77–79% on every GPU (200 questions, noise
   ±6 points), 6 invalid everywhere (prompts over the 16,384-token limit). Questions/s at 8 in flight and at 1:
   A100 2.49 / 2.11, H100 6.68 / 5.45, H200 6.62 / 5.17, B200 10.31 / 6.49. The H200 equals the H100; the
@@ -141,8 +178,8 @@ favor of H3.
 
 - **One run per (model, GPU, mode).** No repeats, so differences of a few percent are noise. Platforms are
   never compared on one roof: the Modal L4 measured 3–18% slower than the cluster L4.
-- **Batch 1 only.** One question per request (OpenJev's shape sweep and 8-in-flight runs aside). Batching is
-  the measurement this analysis most needs next.
+- **Batch 1 in this section.** The roofline runs send one question per request. Batching is measured separately:
+  the batch-size sweep (H2, docs/h2_batch_findings.md) and the questions-per-request axis (H3, below).
 - **The short end of the length axis is not short.** At 32 state tokens each prompt is still ~150–300 tokens
   (instructions and question text), so curves start at 49–280 FLOP/byte, not near zero.
 - **The length-axis sample** is 40 questions from 9 datasets, most of them legal texts (the only JEVal states
@@ -152,5 +189,8 @@ favor of H3.
   and some at 512 (178 of 320 invalid), so its curve stops at 512.
 - **Theoretical FLOPs and bytes.** Compulsory traffic is a lower bound; real intensities are if anything lower.
   Hardware-counter (ncu) runs were not repeated on the Modal GPUs.
-- **Causes marked "likely" are hypotheses.** The laya cuDNN shape cost, kev's 1,024-token cliff and the B200's
-  Qwen3.5 gain are read from timings and kernel names, not profiled.
+- **What is confirmed and what is not.** Confirmed by controlled tests (2026-11-09): the laya cuDNN shape cost
+  (SDPA backend A/B, same host), kev-4b.hybrid's 1,024-token cliff (nsys: graph range ends), and the B200's
+  Qwen3.5 gain being mostly host time (nsys), and (2026-11-15, two runs per GPU) kev-4b.qwen3's H200 slowdown
+  being per-launch host cost, not GPU time. The 11-09 tests rest on one run per point. Still unexplained: what
+  makes kernel launches slower on the H200 containers, and kev-4b.qwen3's own 1,024-token jump.
