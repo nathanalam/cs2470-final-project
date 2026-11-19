@@ -219,6 +219,8 @@ def kernel_env(model: Any = None) -> dict[str, str]:  # noqa: ANN401
             env[pkg] = str(getattr(importlib.import_module(pkg), "__version__", "present"))
     if model is not None:
         env["attn_implementation"] = str(getattr(model.config, "_attn_implementation", "unknown"))
+        if (experts := getattr(model.config, "_experts_implementation", None)) is not None:
+            env["experts_implementation"] = str(experts)  # MoE dispatch (eager, grouped_mm, ...)
     return env
 
 

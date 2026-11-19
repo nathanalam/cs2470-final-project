@@ -1,0 +1,51 @@
+# Why does lfm2-8b-a1b.zeroshot stop short of 95% kernel_busy (0.87-0.94 on A100/H100/H200/B200 in the
+# 2026-11-19 steady-state sweep, configs/steady_state_batch_lfm2.toml)? That sweep's wall time per batch
+# includes the host's chat template, tokenizing and padding of every prompt (8-12% of wall at every B), and
+# the forward itself leaves 2-4.5% of the GPU span idle. A 2 x 2 on one H100, in one container so the host
+# CPU is the same for all four runs:
+#   batch_host_prep               inline (as every earlier sweep) | pretokenized (host prep outside the timing)
+#   semif_experts_implementation  "" (transformers' default, grouped_mm when available) | eager (per-expert loop)
+# Expected: pretokenized lifts kernel_busy past 0.95 (kernel / GPU span was 0.965 at B = 64); eager shows what
+# the grouped dispatch buys. env_experts_implementation records which dispatch actually ran.
+# Same rows and settings as steady_state_batch_lfm2.toml (pool 256), grid stopped at 64, where it plateaued.
+# Estimate: 4 model loads + 4 sweeps to B = 64, ~25-35 min on one H100, roughly $2-3 on Modal.
+#   uv run --group modal s1 submit configs/lfm2_host_prep_h100.toml
+benchmarks = ["batch"]
+
+[launch]
+orchestrator = "modal"
+gpu = "H100"
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "02:00:00"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+require_gpu = "H100"
+dtype = "bfloat16"
+measure_ceilings = true
+max_prompt_tokens = 16384
+semif_max_options = 16
+
+[params]
+model = "lfm2-8b-a1b.zeroshot"
+batch_seed = 0
+batch_pool = 256
+batch_min_decisions = 32
+batch_min_batches = 4
+batch_trace = 2
+batch_warmup = 8
+batch_max_options = 16
+batch_max_question_tokens = 512
+batch_tokenizer_file = "$MODELS_DIR/Qwen3.5-4B-Base/tokenizer.json"
+
+[sweep]
+batch_host_prep = ["inline", "pretokenized"]
+semif_experts_implementation = ["", "eager"]
+
+[grid]
+batch_state_tokens = [128, 1024]
+batch_sizes = [1, 2, 4, 8, 16, 32, 64]

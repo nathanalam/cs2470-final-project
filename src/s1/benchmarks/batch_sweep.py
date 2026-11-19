@@ -41,8 +41,16 @@ recorded as batch_nsys_{n,wall_ms}; `s1 nsys` adds the Nsight Systems CPU/GPU sp
 The model implements, besides roofline's `profile_info` / `take_forwards`:
     decide_batch(requests: [(state, {key: question})]) -> {"decisions": int, "real_tokens": int}
         one batched pass over every request's questions, end to end (scores on the host when it returns)
-and may implement `after_warmup()` (called after each point's warm-up; kev captures pending CUDA graphs) and
-`profiler(on)` (needed for batch_nsys).
+`batch_host_prep = "pretokenized"` (default "inline") times only the GPU side of a batch: the model must also
+implement
+    prepare_batch(requests) -> prepared      host work: prompt template, tokenize, pad, CPU tensors
+    run_batch(prepared) -> {"decisions": int, "real_tokens": int}   to the device, forward, scores on the host
+and decide_batch(r) must equal run_batch(prepare_batch(r)). Every batch of a point is prepared before its
+warm-up, outside the timed and traced passes (a server tokenizes in another process, overlapped with the
+GPU), and `batch_s<L>_b<B>_prep_ms` records the host preparation time per batch that wall_ms then leaves out.
+
+The model may implement `after_warmup()` (called after each point's warm-up; kev captures pending CUDA
+graphs) and `profiler(on)` (needed for batch_nsys).
 
 Settings (all optional): batch_pool (default max batch size), batch_min_decisions 32, batch_min_batches 4,
 batch_seed 0, batch_max_options 16, batch_max_question_tokens 512, batch_tokenizer_file (a tokenizer.json;
@@ -59,7 +67,7 @@ from __future__ import annotations
 import math
 import statistics
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -74,6 +82,8 @@ SIZES = "batch_sizes"
 LENGTHS = "batch_state_tokens"
 
 Request = tuple[str, Mapping[str, object]]
+Call = Callable[[], Mapping[str, int]]
+HOST_PREP = ("inline", "pretokenized")
 
 
 class Batched(Protocol):
@@ -219,6 +229,22 @@ def _model(model: object) -> Batched:
     return model  # ty: ignore[invalid-return-type]
 
 
+def plan_calls(m: Batched, plan: Sequence[Sequence[jeval.Row]], host_prep: str) -> tuple[list[Call], float]:
+    """One call per batch of `plan` and the mean host preparation ms per batch (nan when inline: then the
+    preparation runs inside each call)."""
+    if host_prep == "inline":
+        return [lambda b=b: m.decide_batch(requests(b)) for b in plan], math.nan
+    prepare, run_batch = getattr(m, "prepare_batch", None), getattr(m, "run_batch", None)
+    if not callable(prepare) or not callable(run_batch):
+        raise TypeError(
+            f"batch_host_prep = pretokenized needs .prepare_batch() and .run_batch(); got {type(m).__name__}"
+        )
+    t0 = time.perf_counter()
+    prepared = [prepare(requests(b)) for b in plan]
+    prep_ms = (time.perf_counter() - t0) * 1e3 / len(plan)
+    return [lambda p=p: run_batch(p) for p in prepared], prep_ms
+
+
 def _is_oom(e: BaseException) -> bool:
     return "out of memory" in str(e).lower() or type(e).__name__ == "OutOfMemoryError"
 
@@ -252,6 +278,9 @@ def run(model: object, settings: Settings) -> Metrics:
         return nsys_region(
             m, pools(settings, lengths, 1)[at], n_nsys, settings, at, arch=arch, sizes_kw=sizes_kw
         )
+    host_prep = get_str(settings, "batch_host_prep", "inline")
+    if host_prep not in HOST_PREP:
+        raise ValueError(f"batch_host_prep must be one of {', '.join(HOST_PREP)}, got {host_prep!r}")
     pool = pools(settings, lengths, max(sizes))
     after_warmup = getattr(m, "after_warmup", None)
     traced_n = get_int(settings, "batch_trace", 2)
@@ -261,15 +290,16 @@ def run(model: object, settings: Settings) -> Metrics:
             prefix = f"batch_s{length}_b{size}_"
             plan = batches(pool[length], size, settings)
             try:
-                for b in plan:  # warm-up: every shape once, untimed
-                    m.decide_batch(requests(b))
+                calls, prep_ms = plan_calls(m, plan, host_prep)
+                for call in calls:  # warm-up: every shape once, untimed
+                    call()
                 if callable(after_warmup):
                     after_warmup()
                 m.take_forwards()
-                timed = [time_batch(m, b, arch, sizes_kw) for b in plan]
+                timed = [time_batch(m, call, arch, sizes_kw) for call in calls]
                 trace = None
                 if traced_n:
-                    trace = trace_batches(m, plan[:traced_n])
+                    trace = trace_batches(m, calls[:traced_n])
             except Exception as e:
                 if not _is_oom(e):
                     raise
@@ -280,6 +310,8 @@ def run(model: object, settings: Settings) -> Metrics:
                 print(f"batch: L={length} B={size} out of memory", flush=True)
                 continue
             out |= point(prefix, timed, size, trace, min(traced_n, len(plan)))
+            if not math.isnan(prep_ms):
+                out[f"{prefix}prep_ms"] = prep_ms
             print(
                 f"batch: L={length} B={size} wall {out[f'{prefix}wall_ms']:.2f} ms, "
                 f"{out[f'{prefix}tflops_wall']:.2f} TFLOP/s, "
@@ -293,9 +325,9 @@ def run(model: object, settings: Settings) -> Metrics:
     )
 
 
-def time_batch(m: Batched, rows: Sequence[jeval.Row], arch: flops.Arch, sizes_kw: Mapping[str, int]) -> Timed:
+def time_batch(m: Batched, call: Call, arch: flops.Arch, sizes_kw: Mapping[str, int]) -> Timed:
     t0 = time.perf_counter()
-    done = m.decide_batch(requests(rows))
+    done = call()
     wall = (time.perf_counter() - t0) * 1e3
     fwd = [roofline.forward(f) for f in m.take_forwards()]
     return Timed(
@@ -303,17 +335,17 @@ def time_batch(m: Batched, rows: Sequence[jeval.Row], arch: flops.Arch, sizes_kw
         cost=flops.total(arch, fwd, **sizes_kw),
         forwards=len(fwd),
         real_tokens=int(done.get("real_tokens", 0)),
-        decisions=int(done.get("decisions", len(rows))),
+        decisions=int(done["decisions"]),
     )
 
 
-def trace_batches(m: Batched, plan: Sequence[Sequence[jeval.Row]]) -> Trace | None:
-    """torch.profiler over `plan` (best effort: a trace failure leaves the point's other keys)."""
+def trace_batches(m: Batched, calls: Sequence[Call]) -> Trace | None:
+    """torch.profiler over `calls` (best effort: a trace failure leaves the point's other keys)."""
     from .. import profiling  # noqa: PLC0415 — imports torch lazily inside
 
     def go() -> None:
-        for b in plan:
-            m.decide_batch(requests(b))
+        for call in calls:
+            call()
 
     try:
         return trace_split(profiling.trace_activity(go))

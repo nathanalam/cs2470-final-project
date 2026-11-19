@@ -309,6 +309,48 @@ def test_nsys_region_at_a_chosen_grid_length(tmp_path, monkeypatch):
         _run(tmp_path, monkeypatch, FakeBatched(), batch_nsys=2, batch_nsys_state_tokens=32)
 
 
+class FakePrepared(FakeBatched):
+    """decide_batch split into a host half and a device half, as semif's."""
+
+    def __init__(self):
+        super().__init__()
+        self.prepared = 0
+        self.log: list[str] = []
+
+    def prepare_batch(self, requests):
+        self.prepared += 1
+        self.log.append("prep")
+        return list(requests)
+
+    def run_batch(self, prepared):
+        self.log.append("run")
+        return super().decide_batch(prepared)
+
+
+def test_pretokenized_prepares_every_batch_before_the_point_runs(tmp_path, monkeypatch):
+    model = FakePrepared()
+    rec = _run(tmp_path, monkeypatch, model, batch_host_prep="pretokenized")
+    m = rec.results["batch"]
+    assert m["batch_s16_b1_prep_ms"] >= 0 and m["batch_s64_b8_prep_ms"] >= 0
+    assert model.prepared == 8 + 4 + 4 + 8 + 4 + 4  # one per batch of each point, never re-prepared
+    # each point: all its batches prepared, then warm-up, timed and traced runs (8 + 8 + 2 for B = 1)
+    assert model.log[:26] == ["prep"] * 8 + ["run"] * 18
+    assert m["batch_s16_b8_decisions_per_s"] > 0
+
+
+def test_inline_is_the_default_and_records_no_prep_time(tmp_path, monkeypatch):
+    model = FakePrepared()
+    m = _run(tmp_path, monkeypatch, model).results["batch"]
+    assert model.prepared == 0 and "batch_s16_b1_prep_ms" not in m
+
+
+def test_pretokenized_needs_the_split_methods(tmp_path, monkeypatch):
+    with pytest.raises(TypeError, match="prepare_batch"):
+        _run(tmp_path, monkeypatch, FakeBatched(), batch_host_prep="pretokenized")
+    with pytest.raises(ValueError, match="batch_host_prep"):
+        _run(tmp_path, monkeypatch, FakePrepared(), batch_host_prep="overlapped")
+
+
 def test_benchmark_rejects_models_without_decide_batch():
     with pytest.raises(TypeError, match="decide_batch"):
         batch_sweep.run(object(), {})
