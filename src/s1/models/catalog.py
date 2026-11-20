@@ -307,10 +307,13 @@ LFM25_2B6 = replace(
         revision="7141b56cd4650af95c7c7b86983443aed050c96a",
         size_bytes=5_394_427_456,
         group="control",
-        notes="Text twin of lfm25-vl-3b: the same base (LFM2.5-2.6B-Base) post-trained on text only. "
-        "Revision is a proposed pin (HEAD 2026-11-20).",
+        notes="Text twin of lfm25-vl-3b: the same base (LFM2.5-2.6B-Base) post-trained on text only, as a "
+        "pure reasoning model: its chat template opens every answer with <think> and ignores "
+        "enable_thinking, so the readout closes it with an empty thought (semif_close_think). Revision is a "
+        "proposed pin (HEAD 2026-11-20).",
     ),
     resolved_on=MM_RESOLVED,
+    options={**SEMIF_DIRECT.options, "semif_close_think": True},
     base_repo="LiquidAI/LFM2.5-2.6B-Base",
     base_revision="c57bdaed1ef166fe3095dda07f4a5e789ad5321e",
 )

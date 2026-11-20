@@ -9,7 +9,7 @@ import pytest
 from s1 import flops
 from s1.benchmarks import imajev, vl_batch
 from s1.models import catalog
-from s1.models.backends import d1
+from s1.models.backends import d1, semif
 from s1.registry import Settings
 from tests.conftest import EchoModel
 from tests.test_flops import D1_3B
@@ -348,3 +348,10 @@ def test_run_sweeps_arms_and_sizes_with_a_fake_model(tmp_path, monkeypatch):
     assert m["vl_batch_image_p384_b4_image_tokens"] == 4 * 256
     # the text arm's filler is the picture's 256 tokens: same LM length as the image arm
     assert m["vl_batch_text_p384_b4_tokens"] == m["vl_batch_image_p384_b4_tokens"]
+
+
+def test_close_think_gives_a_reasoning_template_an_empty_thought():
+    assert semif.close_think("<|im_start|>assistant\n<think>") == "<|im_start|>assistant\n<think></think>"
+    assert semif.close_think("<|im_start|>assistant\n") == "<|im_start|>assistant\n"
+    assert catalog.LFM25_2B6.options["semif_close_think"] is True
+    assert "semif_close_think" not in catalog.LFM25_VL_3B.options  # its template opens no thought
