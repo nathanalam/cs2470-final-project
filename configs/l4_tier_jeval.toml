@@ -1,0 +1,37 @@
+# L4 tier accuracy (paper methodology, 2026-11-19: on each GPU compare the largest models that fit, at their
+# steady-state batch). The L4 batch sweep (configs/steady_state_batch_l4.toml) put B* at 1-2 for qwen35-9b and
+# jevk5-9b and ~4 for lfm2-8b-a1b; speed comes from those batch records. This run adds accuracy, ECE and Brier:
+# 200 seeded JEVal questions per model, as every other smoke run (openjev, kev-4b, d1-3b), one in flight.
+# semif serializes forwards under a lock and batching only pads (it does not change the readout), so accuracy
+# does not depend on the batch size; concurrency 1 keeps latency comparable with the kev and d1 L4 runs.
+# Upstream SemIf caps a question at 16 options, so ~20% of JEVal (17-255 options) is invalid by construction,
+# as in configs/semif_jeval_smoke.toml.
+# Estimate: ~20-30 min per model on one L4, ~1.5 h in all, roughly $1-2 on Modal.
+#   uv run --group modal s1 submit configs/l4_tier_jeval.toml
+benchmarks = ["jeval"]
+
+[launch]
+orchestrator = "modal"
+gpu = "L4"
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "03:00:00"   # hard stop
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+require_gpu = "L4"
+dtype = "bfloat16"
+max_prompt_tokens = 16384  # matches the openjev runs
+semif_max_options = 16     # upstream's cap (letters A-P)
+
+[params]
+jeval_limit = 200
+jeval_seed = 0
+jeval_concurrency = 1
+jeval_warmup = true      # one untimed pass first: kernel compilation is not latency
+
+[sweep]
+model = ["lfm2-8b-a1b.zeroshot", "qwen35-9b.zeroshot", "jevk5-9b"]

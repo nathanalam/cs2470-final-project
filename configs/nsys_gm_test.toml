@@ -1,0 +1,41 @@
+# Cheap test of Nsight Systems GPU-metrics sampling on Modal (s1 nsys with nsys_gpu_metrics = true) before
+# the nsys length runs: qwen3-8b at batch 1 on one H100, at 512 and 8,192 state tokens (two runs), 8 decisions
+# each. Checks that the GPU_METRICS tables reach the SQLite export (meta.batch_nsys_gm_names lists the metric
+# names nsys reported; "none found in the export" means sampling is not available on this host), and that
+# the kernel-time roofline keys (batch_nsys_kernel_tflops, _gbs) look sane next to the M4 length axis.
+#   uv run --group modal s1 submit configs/nsys_gm_test.toml --nsys 8
+benchmarks = ["batch"]
+
+[launch]
+orchestrator = "modal"
+gpu = ["H100"]
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "00:30:00"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+dtype = "bfloat16"
+measure_ceilings = false
+max_prompt_tokens = 20480
+semif_max_options = 16
+nsys_gpu_metrics = true
+
+[params]
+model = "qwen3-8b.zeroshot"
+batch_seed = 0
+batch_pool = 8
+batch_warmup = 8  # = the pool: every profiled shape seen once before the range
+batch_max_options = 16
+batch_max_question_tokens = 512
+batch_tokenizer_file = "$MODELS_DIR/Qwen3.5-4B-Base/tokenizer.json"
+
+[sweep]
+batch_nsys_state_tokens = [512, 8192]
+
+[grid]
+batch_state_tokens = [512, 8192]
+batch_sizes = [1]

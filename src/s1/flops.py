@@ -22,10 +22,17 @@ work: causal attention counts the (n+1)/2 average keys a query sees, not the ful
 kernel computes, and padding rows are counted because the GPU executes them. Elementwise ops (norms, rotary,
 activations) are left out; they are well under 1% of the matmul FLOPs at these sizes.
 
-Supported `model_type`s: qwen3_5 / qwen3_5_text (Gated DeltaNet + gated attention), qwen3, olmoe, lfm2_moe
-(short conv + attention, MoE), granitemoehybrid (Mamba2 + attention, MoE) and modernbert (a bidirectional
-encoder: every query sees every key, or a `local_attention` window on its sliding layers; Laya).
+Supported `model_type`s: qwen3_5 / qwen3_5_text (Gated DeltaNet + gated attention), qwen3, olmoe, lfm2
+(short conv + attention, dense: d1-3B's text tower), lfm2_moe (the same, MoE), granitemoehybrid (Mamba2 +
+attention, MoE) and modernbert (a bidirectional encoder: every query sees every key, or a `local_attention`
+window on its sliding layers; Laya).
 `tests/test_flops.py` checks the derived parameter count of each against the Hub's safetensors total.
+
+An encoder-decoder (t5gemma2: Bongard-mini) has several stacks, each its own `Arch`: `stacks(config)`
+returns {"encoder", "cross_kv", "decoder"}, and a recorded forward names its stack (`Forward.stack`). Its
+decoder reads the encoded state as `past` keys (merged self + cross attention), one copy shared by every
+question row of the batch (`shared_past`). `arch(config)` refuses it: charging every pass to one stack
+would be silently wrong.
 """
 
 from __future__ import annotations
@@ -89,6 +96,8 @@ class Forward:
     kept: int = 1
     cached: bool = False  # the pass writes its K/V and states to a cache
     ms: float = math.nan
+    shared_past: bool = False  # every row attends to ONE copy of the past K/V (read once, not once per row)
+    stack: str = ""  # which of `stacks(config)` ran it ("" for a single-stack model)
 
 
 @dataclass(frozen=True)
@@ -191,6 +200,40 @@ def olmoe(cfg: Mapping[str, object]) -> Arch:
     return Arch("olmoe", d, vocab, tied, (layer,) * n, vocab * d * (1 if tied else 2) + d)
 
 
+def lfm2_ffn_dim(cfg: Mapping[str, object]) -> int:
+    """LFM2's SwiGLU width: `intermediate_size`, or HF's sizing rule from it when `block_auto_adjust_ff_dim`
+    (Lfm2Config's default) is on: 2/3 of it, times `block_ffn_dim_multiplier`, rounded up to
+    `block_multiple_of`."""
+    hidden = _int(cfg, "intermediate_size")
+    if not cfg.get("block_auto_adjust_ff_dim", True):
+        return hidden
+    hidden = int(2 * hidden / 3)
+    multiplier = cfg.get("block_ffn_dim_multiplier", 1.0)
+    if isinstance(multiplier, int | float) and not isinstance(multiplier, bool):
+        multiple = _int(cfg, "block_multiple_of", 256)
+        hidden = int(multiplier * hidden)
+        hidden = multiple * ((hidden + multiple - 1) // multiple)
+    return hidden
+
+
+def lfm2(cfg: Mapping[str, object]) -> Arch:
+    """Dense LFM2 (d1-3B's text tower): short-conv and GQA layers (per-head q/k norms), each with a SwiGLU."""
+    d, n, vocab = _int(cfg, "hidden_size"), _int(cfg, "num_hidden_layers"), _int(cfg, "vocab_size")
+    short_conv = d * 3 * d + d * _int(cfg, "conv_L_cache") + d * d  # in_proj, depthwise taps, out_proj
+    ffn = _swiglu(d, lfm2_ffn_dim(cfg)) + 2 * d  # + operator and ffn norms
+    layers: list[Layer] = []
+    for t in _layer_types(cfg, "layer_types", n):
+        if t == "full_attention":
+            mixer = _attention(cfg, d, gate=False, qk_norm="head")
+        elif t == "conv":
+            mixer = Layer("short_conv", short_conv)
+        else:
+            raise ValueError(f"unknown lfm2 layer type {t!r}")
+        layers.append(replace(mixer, dense_params=mixer.dense_params + ffn))
+    tied = bool(cfg.get("tie_word_embeddings", True))
+    return Arch("lfm2", d, vocab, tied, tuple(layers), vocab * d * (1 if tied else 2) + d)
+
+
 def lfm2_moe(cfg: Mapping[str, object]) -> Arch:
     d, n, vocab = _int(cfg, "hidden_size"), _int(cfg, "num_hidden_layers"), _int(cfg, "vocab_size")
     experts, k = _int(cfg, "num_experts"), _int(cfg, "num_experts_per_tok")
@@ -285,11 +328,84 @@ def modernbert(cfg: Mapping[str, object]) -> Arch:
     return Arch("modernbert", d, vocab, True, tuple(layers), vocab * d + 2 * norm)  # embedding + 2 norms
 
 
+def _gemma3_layer(cfg: Mapping[str, object], d: int, *, causal: bool, window: int) -> Layer:
+    """A Gemma 3 block: q/k/v/o with per-head q/k norms, GeGLU MLP (gate, up, down), four RMSNorms."""
+    att = _attention(cfg, d, gate=False, qk_norm="head")
+    params = att.dense_params + _swiglu(d, _int(cfg, "intermediate_size")) + 4 * d
+    return replace(att, dense_params=params, causal=causal, window=window)
+
+
+def _section(cfg: Mapping[str, object], key: str) -> Mapping[str, object]:
+    sub = cfg.get(key)
+    if not isinstance(sub, Mapping):
+        raise KeyError(f"config has no {key!r} section")
+    return _text_config({str(k): v for k, v in sub.items()})
+
+
+def t5gemma2_stacks(cfg: Mapping[str, object]) -> dict[str, Arch]:
+    """T5Gemma 2 (Bongard-mini's backbone), text path only (the vision tower never runs on text).
+
+    encoder   bidirectional Gemma 3 text stack: sliding layers see a `sliding_window`-wide band, full ones all
+    cross_kv  the state's K/V projected once per decoder layer (k_proj + k_norm, v_proj: decoder weights)
+    decoder   Gemma 3 stack with merged attention: each question token attends causally to its own tokens and
+              to every state token (`past`); no separate cross-attention weights. The sliding window only
+              limits the self part, which is far shorter than the window, so it is not applied.
+    The decoder shares the encoder's embedding (no decoder.embed_tokens in the checkpoint); there is no vocab
+    head (a judgment head reads hidden states), so forwards keep 0 positions."""
+    enc, dec = _section(cfg, "encoder"), _section(cfg, "decoder")
+    d, vocab = _int(enc, "hidden_size"), _int(enc, "vocab_size")
+    n_enc, n_dec = _int(enc, "num_hidden_layers"), _int(dec, "num_hidden_layers")
+    window = _int(enc, "sliding_window")
+    types = _layer_types(enc, "layer_types", n_enc)
+    enc_layers = tuple(
+        _gemma3_layer(enc, d, causal=False, window=window if t == "sliding_attention" else 0) for t in types
+    )
+    dec_layers = tuple(
+        _gemma3_layer(dec, _int(dec, "hidden_size"), causal=True, window=0) for _ in range(n_dec)
+    )
+    kv = tuple(Layer("projection", 2 * d * ly.kv_dim + ly.head_dim) for ly in dec_layers)  # k, v, k_norm
+    # embedding + the encoder's eoi embedding + one final norm per stack (vision tower and projector excluded)
+    return {
+        "encoder": Arch("t5gemma2_encoder", d, vocab, True, enc_layers, vocab * d + d + d),
+        "cross_kv": Arch("t5gemma2_cross_kv", d, 0, True, kv, 0),
+        "decoder": Arch("t5gemma2_decoder", d, vocab, True, dec_layers, d),
+    }
+
+
+STACKS = {"t5gemma2": t5gemma2_stacks}
+
+
+def stacks(config: Mapping[str, object]) -> dict[str, Arch]:
+    """Every stack of a model, by the name its forwards carry: {"": arch(config)} for a single-stack model."""
+    model_type = config.get("model_type")
+    if isinstance(model_type, str) and model_type in STACKS:
+        return STACKS[model_type](config)
+    return {"": arch(config)}
+
+
+def merged(parts: Mapping[str, Arch]) -> Arch:
+    """One Arch holding every stack's layers and parameters (`params`, `active_params`, layer mix), for
+    reporting; a cross_kv stack reuses decoder weights, so its parameters are not counted again."""
+    if len(parts) == 1:
+        return next(iter(parts.values()))
+    counted = [a for name, a in parts.items() if name != "cross_kv"]
+    first = counted[0]
+    return Arch(
+        first.model_type.partition("_")[0],
+        first.hidden,
+        first.vocab,
+        first.tied,
+        tuple(ly for a in counted for ly in a.layers),
+        sum(a.extra_params for a in counted),
+    )
+
+
 BUILDERS = {
     "qwen3_5": qwen35,
     "qwen3_5_text": qwen35,
     "qwen3": qwen3,
     "olmoe": olmoe,
+    "lfm2": lfm2,
     "lfm2_moe": lfm2_moe,
     "granitemoehybrid": granitemoehybrid,
     "modernbert": modernbert,
@@ -300,6 +416,10 @@ def arch(config: Mapping[str, object]) -> Arch:
     """The cost model of a HF `config.json` (a VLM's `text_config` is used when present)."""
     cfg = _text_config(config)
     model_type = cfg.get("model_type")
+    if isinstance(model_type, str) and model_type in STACKS:
+        raise KeyError(
+            f"{model_type} has several stacks ({', '.join(STACKS[model_type](cfg))}); use flops.stacks"
+        )
     if not isinstance(model_type, str) or model_type not in BUILDERS:
         raise KeyError(f"no cost model for model_type {model_type!r}; known: {', '.join(sorted(BUILDERS))}")
     return BUILDERS[model_type](cfg)
@@ -325,7 +445,8 @@ def cost(a: Arch, f: Forward, *, weight_bytes: int = BF16_BYTES, head_bytes: int
             if ly.window:
                 pairs = min(pairs, f.rows * f.tokens * min(keys, ly.window + 1))
             flops += 4.0 * ly.q_heads * ly.head_dim * pairs  # QK^T and PV
-            kv_tokens = f.rows * f.past + (tokens if f.cached else 0)  # past read + new written
+            past_read = f.past if f.shared_past else f.rows * f.past
+            kv_tokens = past_read + (tokens if f.cached else 0)  # past read + new written
             nbytes += 2.0 * ly.kv_dim * kv_tokens * weight_bytes
         elif ly.state_elements:
             flops += STATE_FLOPS_PER_ELEMENT * ly.state_elements * tokens

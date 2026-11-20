@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Annotated
@@ -13,8 +14,8 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import config, env, ncu, report, runner
-from .launch import Resources, get_launcher
+from . import config, env, ncu, nsys, report, runner
+from .launch import FanOutLauncher, Outcome, Resources, get_launcher
 from .models.catalog import CATALOG
 from .record import RESULTS_DIR, RunRecord, Scalar, load_all
 
@@ -57,7 +58,9 @@ def run(
 @app.command("ncu")
 def ncu_cmd(
     cfg: Path,
-    questions: int = typer.Option(4, "--questions", help="Questions profiled per model."),
+    questions: int = typer.Option(
+        4, "--questions", help="Questions profiled per model (per state length on the length axis)."
+    ),
     results_dir: Path = ResultsDir,
     ncu_bin: str = typer.Option("/usr/local/cuda/bin/ncu", "--ncu", help="Nsight Compute CLI."),
     clock_control: Annotated[
@@ -71,21 +74,75 @@ def ncu_cmd(
     specs = config.load(cfg)
     clock = ncu.clock_control(clock_control)
     job = env.job_id()
-    Path("logs").mkdir(exist_ok=True)
-    for i in range(len(specs)):
-        log = Path("logs") / f"ncu-{job}-{cfg.stem}-{i}.csv"
+    logs = env.log_dir()  # $S1_LOG_DIR: on Modal the run's volume dir, so a timed-out run keeps its ncu log
+    logs.mkdir(parents=True, exist_ok=True)
+    for i, spec in enumerate(specs):
+        log = logs / f"ncu-{job}-{cfg.stem}-{i}.csv"
         before = set(results_dir.glob("*.json"))
         child = [sys.executable, "-m", "s1.cli", "run", str(cfg), "--index", str(i)]
         child += ["--results-dir", str(results_dir), "--set", f"roofline_ncu={questions}"]
-        subprocess.run([ncu_bin, *ncu.args(clock), "--log-file", str(log), *child], check=True)
+        sample = ncu.sampling(spec.invariants | spec.params)
+        subprocess.run([ncu_bin, *ncu.args(clock, sample), "--log-file", str(log), *child], check=True)
         (path,) = set(results_dir.glob("*.json")) - before
         rec = RunRecord.load(path)
-        hw = ncu.summarize(ncu.parse(log.read_text()), rec.results["roofline"], clock)
+        hw = ncu.summarize_named(
+            ncu.parse_named(log.read_text()), rec.results["roofline"], clock, sampled=sample.sampled
+        )
         rec.results["roofline"] |= hw
         rec.meta["ncu_log"] = str(log)
         rec.meta[ncu.META_CLOCK_CONTROL] = clock
+        if sample != ncu.Sampling():
+            rec.meta["ncu_sampling"] = (
+                f"launch_count={sample.launch_count} kernel_regex={sample.kernel_regex!r} "
+                f"metrics={'lean' if sample.lean else 'full'}"
+            )
         rec.save(results_dir)
         console.print(f"[{rec.run_id}] hardware counters: {hw}")
+
+
+@app.command("nsys")
+def nsys_cmd(
+    cfg: Path,
+    decisions: int = typer.Option(64, "--decisions", help="Batch-1 decisions in the profiled range."),
+    results_dir: Path = ResultsDir,
+    nsys_bin: str = typer.Option("/usr/local/cuda/bin/nsys", "--nsys", help="Nsight Systems CLI."),
+    sample: str = typer.Option("process-tree", "--sample", help="nsys --sample: process-tree or none."),
+) -> None:
+    """Run each model of a `batch` CONFIG under Nsight Systems (use inside an allocation): the benchmark
+    answers `--decisions` batch-1 decisions in a CUDA profiler range, and the CPU vs GPU split of their
+    latency (cuda_api_sum, cuda_gpu_kern_sum) is added to that run's record as batch_nsys_*. See
+    s1/nsys.py."""
+    specs = config.load(cfg)
+    job = env.job_id()
+    logs = env.log_dir()  # S1_LOG_DIR on Modal, so the reports come back with the run's logs
+    logs.mkdir(parents=True, exist_ok=True)
+    for i, spec in enumerate(specs):
+        base = logs / f"nsys-{job}-{cfg.stem}-{i}"
+        before = set(results_dir.glob("*.json"))
+        child = [sys.executable, "-m", "s1.cli", "run", str(cfg), "--index", str(i)]
+        child += ["--results-dir", str(results_dir), "--set", f"batch_nsys={decisions}"]
+        hz = nsys.gpu_metrics_hz(spec.invariants | spec.params)
+        subprocess.run([nsys_bin, *nsys.profile_args(str(base), sample, hz), *child], check=True)
+        report_file = f"{base}.nsys-rep"
+        subprocess.run([nsys_bin, *nsys.stats_args(report_file, str(base))], check=True)
+        (path,) = set(results_dir.glob("*.json")) - before
+        rec = RunRecord.load(path)
+        api = nsys.parse(Path(f"{base}_cuda_api_sum.csv").read_text())
+        kernels = nsys.parse(Path(f"{base}_cuda_gpu_kern_sum.csv").read_text())
+        sqlite_file = Path(f"{base}.sqlite")  # nsys stats exports it next to the report
+        graphs = nsys.graph_trace(sqlite_file) if sqlite_file.is_file() else (0, 0.0)
+        split = nsys.summarize(api, kernels, rec.results["batch"], graphs)
+        if hz and sqlite_file.is_file():
+            gm, names = nsys.gpu_metrics(sqlite_file)
+            split |= gm
+            rec.meta[nsys.META_GM_NAMES] = names or "none found in the export"
+            rec.meta["nsys_gpu_metrics_hz"] = str(hz)
+        rec.results["batch"] = split | rec.results["batch"]
+        rec.meta["nsys_report"] = report_file
+        rec.meta[nsys.META_SAMPLE] = sample
+        rec.meta["batch_nsys_kernels_top"] = nsys.top_kernels(kernels)
+        rec.save(results_dir)
+        console.print(f"[{rec.run_id}] nsys CPU/GPU split: {split}")
 
 
 def launch_resources(
@@ -101,23 +158,69 @@ def launch_resources(
     time: str | None = None,
 ) -> Resources:
     """The config's [launch] table (Slurm defaults when absent), each flag that was given overriding its
-    field: `on` the orchestrator, `partition`/`gpu_type` the extras of that orchestrator."""
-    target = None if on is None else config.target(on, "--on")
-    res = config.load_launch(cfg, target) or Resources(orchestrator=target or "slurm")
-    extras = dict(res.extras)
-    if partition is not None:
-        extras["partition"] = partition
-    if gpu_type is not None:
-        extras["gpu_type"] = gpu_type
-    return replace(
-        res,
-        gpu=res.gpu if gpu is None else gpu,
-        gpus=res.gpus if gpus is None else gpus,
-        cpus=res.cpus if cpus is None else cpus,
-        mem=res.mem if mem is None else mem,
-        time=res.time if time is None else time,
-        extras=extras,
+    field: `on` the orchestrator, `partition`/`gpu_type` the extras of that orchestrator. For a config
+    whose `gpu` lists several GPUs, pass `gpu` to pick one, or use `launch_resources_all`."""
+    resolved = launch_resources_all(
+        cfg, on=on, partition=partition, gpu=gpu, gpus=gpus, gpu_type=gpu_type, cpus=cpus, mem=mem, time=time
     )
+    if len(resolved) > 1:
+        names = ", ".join(str(r.gpu) for r in resolved)
+        raise ValueError(f"{cfg}: [launch] gpu lists several GPUs ({names}); pick one with --gpu")
+    return resolved[0]
+
+
+def launch_resources_all(
+    cfg: Path,
+    *,
+    on: str | None = None,
+    partition: str | None = None,
+    gpu: str | None = None,
+    gpus: int | None = None,
+    gpu_type: str | None = None,
+    cpus: int | None = None,
+    mem: str | None = None,
+    time: str | None = None,
+) -> list[Resources]:
+    """`launch_resources` for every GPU of the config, in config order (one entry unless [launch] gpu is a
+    list). `gpu` replaces a single GPU, and narrows a list to that GPU (it must be in the list)."""
+    target = None if on is None else config.target(on, "--on")
+    launches = config.load_launches(cfg, target) or [Resources(orchestrator=target or "slurm")]
+    if gpu is not None and len(launches) > 1:
+        picked = [r for r in launches if r.gpu is not None and r.gpu.strip().lower() == gpu.strip().lower()]
+        if not picked:
+            names = ", ".join(str(r.gpu) for r in launches)
+            raise ValueError(f"--gpu {gpu}: not one of the config's [launch] gpu list ({names})")
+        launches, gpu = picked, None  # keep the config's spelling of the name
+    out: list[Resources] = []
+    for res in launches:
+        extras = dict(res.extras)
+        if partition is not None:
+            extras["partition"] = partition
+        if gpu_type is not None:
+            extras["gpu_type"] = gpu_type
+        out.append(
+            replace(
+                res,
+                gpu=res.gpu if gpu is None else gpu,
+                gpus=res.gpus if gpus is None else gpus,
+                cpus=res.cpus if cpus is None else cpus,
+                mem=res.mem if mem is None else mem,
+                time=res.time if time is None else time,
+                extras=extras,
+            )
+        )
+    return out
+
+
+def _fan_out_summary(outcomes: Sequence[Outcome]) -> Table:
+    t = Table(header_style="bold", title="fan-out")
+    for col in ["gpu", "call id", "records", "result"]:
+        t.add_column(col, no_wrap=col != "result")
+    for o in outcomes:
+        result = "ok" if o.error is None else f"[red]FAILED[/red] {o.error}"
+        records = "\n".join(str(p) for p in o.records) or "-"
+        t.add_row(str(o.gpu), o.call_id or "-", records, result)
+    return t
 
 
 @app.command()
@@ -130,7 +233,9 @@ def submit(
     partition: str | None = typer.Option(
         None, "-p", "--partition", help="Default: [launch.<on>], else cluster default."
     ),
-    gpu: str | None = typer.Option(None, "--gpu", help="Portable GPU name (Modal), e.g. H100, L4."),
+    gpu: str | None = typer.Option(
+        None, "--gpu", help="Portable GPU name (Modal), e.g. H100, L4. Narrows a [launch] gpu list to it."
+    ),
     gpus: int | None = typer.Option(None, "-g", "--gpus", help="Default: [launch], else 1."),
     gpu_type: str | None = typer.Option(None, "--gpu-type", help="GRES type, e.g. l4 (gpu-spec types them)."),
     cpus: int | None = typer.Option(None, "-c", "--cpus", help="Default: [launch], else 8."),
@@ -138,17 +243,37 @@ def submit(
     time: str | None = typer.Option(None, "-t", "--time", help="Default: [launch], else 01:00:00."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print what would be queued only."),
     ncu_questions: int = typer.Option(0, "--ncu", help="Queue `s1 ncu` with this many questions instead."),
+    nsys_decisions: int = typer.Option(0, "--nsys", help="Queue `s1 nsys` with this many decisions instead."),
 ) -> None:
     """Queue `s1 run CONFIG` (or `s1 ncu CONFIG`) on Slurm or Modal, per the config's [launch] table and
-    the flags (flags win). Without [launch] or --on it is a Slurm batch job; logs go to logs/<jobid>.out."""
+    the flags (flags win). Without [launch] or --on it is a Slurm batch job; logs go to logs/<jobid>.out.
+    A [launch] gpu list runs every GPU concurrently on Modal, prints a per-GPU summary and exits 1 if any
+    GPU failed (the others still finish and write back)."""
     config.load(cfg)  # fail fast on a bad config before queueing
     if on is not None and on not in config.ORCHESTRATORS:
         raise typer.BadParameter(f"must be one of {', '.join(config.ORCHESTRATORS)}", param_hint="--on")
-    res = launch_resources(
+    resolved = launch_resources_all(
         cfg, on=on, partition=partition, gpu=gpu, gpus=gpus, gpu_type=gpu_type, cpus=cpus, mem=mem, time=time
     )
     s1 = ["ncu", str(cfg), "--questions", str(ncu_questions)] if ncu_questions else ["run", str(cfg)]
-    get_launcher(res.orchestrator).submit(cfg, res, s1, dry_run=dry_run)
+    if nsys_decisions:
+        s1 = ["nsys", str(cfg), "--decisions", str(nsys_decisions)]
+    if len(resolved) == 1:
+        (res,) = resolved
+        get_launcher(res.orchestrator).submit(cfg, res, s1, dry_run=dry_run)
+        return
+    launcher = get_launcher(resolved[0].orchestrator)  # always "modal": load_launches checks it
+    if not isinstance(launcher, FanOutLauncher):
+        raise TypeError(f"the {resolved[0].orchestrator} launcher cannot fan out across GPUs")
+    outcomes = launcher.submit_many(cfg, resolved, s1, dry_run=dry_run)
+    if dry_run:
+        console.print(f"dry run: {len(outcomes)} GPU(s) would run concurrently, nothing queued")
+        return
+    console.print(_fan_out_summary(outcomes))
+    failed = [str(o.gpu) for o in outcomes if o.error is not None]
+    if failed:
+        console.print(f"[red]{len(failed)} of {len(outcomes)} GPU(s) failed: {', '.join(failed)}[/red]")
+        raise typer.Exit(1)
 
 
 @app.command()

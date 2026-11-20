@@ -158,6 +158,10 @@ class WordCounter:
     def count(self, text: str) -> int:
         return len(text.split())
 
+    def fit(self, text: str, tokens: int) -> str:
+        """`text` cut to its first `tokens` words."""
+        return " ".join(text.split()[:tokens])
+
 
 class FileTokenCounter:
     """Token counts from a real tokenizer file (a Hugging Face `tokenizer.json`).
@@ -178,6 +182,16 @@ class FileTokenCounter:
 
     def count(self, text: str) -> int:
         return len(self._tokenizer.encode(text, add_special_tokens=False).ids)
+
+    def fit(self, text: str, tokens: int) -> str:
+        """`text` cut to its first `tokens` tokens. Decoding then re-encoding can merge across the cut, so
+        drop tokens until it counts no more than `tokens` (in practice it lands on `tokens` exactly)."""
+        ids = self._tokenizer.encode(text, add_special_tokens=False).ids[:tokens]
+        out = self._tokenizer.decode(ids)
+        while ids and self.count(out) > tokens:
+            ids = ids[:-1]
+            out = self._tokenizer.decode(ids)
+        return out
 
 
 def _file_counter(settings: Settings) -> TokenCounter:

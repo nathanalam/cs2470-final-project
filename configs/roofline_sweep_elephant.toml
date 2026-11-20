@@ -1,0 +1,37 @@
+# M4 GPU sweep: elephant-1 in its own torch 2.8 runtime.
+# configs/roofline_l4_elephant.toml (Nathan's cluster L4 settings: 200 questions, seed 0, same warmup and counted)
+# unchanged except where it runs: [launch] fans out across five Modal GPUs, gpu_metrics is detailed
+# (every Modal GPU run), and require_gpu comes from the launcher, one per GPU.
+#   uv run --group modal s1 submit configs/roofline_sweep_elephant.toml              (all five GPUs)
+#   uv run --group modal s1 submit configs/roofline_sweep_elephant.toml --gpu H100   (one of them)
+benchmarks = ["roofline"]
+
+[launch]
+orchestrator = "modal"
+gpu = ["L4", "A100-80GB", "H100", "H200", "B200"]  # one container per GPU, run concurrently; require_gpu is set per GPU by the launcher
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "02:00:00"
+
+[launch.modal]
+runtime = "elephant"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+dtype = "bfloat16"
+measure_ceilings = true
+max_prompt_tokens = 16384
+semif_max_options = 16
+
+[params]
+roofline_limit = 200
+roofline_seed = 0
+roofline_max_tokens = 1024
+roofline_max_options = 16
+roofline_warmup = 8
+roofline_counted = 8
+roofline_tokenizer_file = "$MODELS_DIR/Qwen3.5-4B-Base/tokenizer.json"
+model = "elephant-1"

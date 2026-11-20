@@ -1,0 +1,39 @@
+# Nsight Systems timelines (s1 nsys, s1/nsys.py) of batch-1 decisions for kev-4b.qwen3 (attention-only Kev,
+# eager: no CUDA graphs) at a short state (256 reference tokens), on an H100 and an H200 (one container each).
+# Question: on the M4 length axis kev-4b.qwen3 was 0.66-0.93x on the H200 vs the H100 (37.8 vs 24.8 ms at 256
+# tokens), with the same SM clocks, kernel count and 20-28% GPU utilization on both. Is the gap host time
+# (Python dispatch, cuDNN SDPA plan builds) or GPU kernel time? Prediction: batch_nsys_kernel_ms about equal on
+# both GPUs, and the gap all in wall minus kernel time. meta.cpu_model says whether the two hosts matched.
+# batch_warmup = batch_pool = the profiled decision count, so every profiled question shape was already seen
+# (as on the warmed length axis): the profile measures steady-state dispatch, not first-shape cuDNN plan builds.
+# nsys inflates wall time, so compare kernel time across GPUs, not CPU share.
+#   uv run --group modal s1 submit configs/nsys_kev_qwen3_h100_h200.toml --nsys 32
+benchmarks = ["batch"]
+
+[launch]
+orchestrator = "modal"
+gpu = ["H100", "H200"]
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "00:45:00"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+dtype = "bfloat16"
+max_prompt_tokens = 16384
+
+[params]
+model = "kev-4b.qwen3"
+batch_seed = 0
+batch_pool = 32
+batch_warmup = 32
+batch_max_options = 16
+batch_max_question_tokens = 512
+batch_tokenizer_file = "$MODELS_DIR/Qwen3.5-4B-Base/tokenizer.json"
+
+[grid]
+batch_state_tokens = [256]
+batch_sizes = [1]

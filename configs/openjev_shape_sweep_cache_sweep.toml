@@ -1,0 +1,37 @@
+# M4 GPU sweep: OpenJev cache-aware shape sweep (cache on and off) on every 80 GB-plus GPU, one GPU each (TP=1, bf16,
+# max_model_len 16384). configs/openjev_shape_sweep_cache_h100.toml unchanged except the GPU list: require_gpu comes from the
+# launcher, one per GPU (H100 is pinned as H100!, so Modal cannot swap in an H200). The M1 H100 records
+# used basic GPU metrics; these use detailed ones.
+#   uv run --group modal s1 submit configs/openjev_shape_sweep_cache_sweep.toml --gpu H200   (one GPU at a time)
+benchmarks = ["shape_sweep"]
+
+[launch]
+orchestrator = "modal"
+gpu = ["A100-80GB", "H100", "H200", "B200"]  # the 80 GB-plus GPUs; one container each, run concurrently
+gpus = 1
+cpus = 8
+mem = "96G"
+time = "02:30:00"
+
+[invariants]
+gpu_metrics = "detailed"   # every Modal run (superset of basic); the M1/M2 records committed on 2026-11-08 were basic
+gpu_metrics_schema = 1
+gpu = "auto"
+tensor_parallel_size = 1
+quantization = "none"
+max_model_len = 16384
+state_tokenizer = "file"
+state_tokenizer_file = "$MODELS_DIR/openjev/tokenizer.json"
+
+[params]
+model = "openjev"
+shape_warmup = 1
+shape_min_point_s = 5.0
+shape_unique_states = true
+
+[sweep]
+prefix_caching = [true, false]
+
+[grid]
+state_tokens = [32, 256, 640, 720, 1400, 1500, 2048]
+questions_per_request = [1, 4, 16, 32]
