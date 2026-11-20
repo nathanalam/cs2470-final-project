@@ -1,0 +1,34 @@
+# Does d1-3B reproduce its model card's speed table? The card (huggingface.co/LiquidAI/d1-3B, "Speed") times
+# warm calls one at a time, bf16, median of 20, on an RTX 4090: one question 8 ms with CUDA graphs and 16 ms
+# without, three questions in one pass 21 ms, a 3.4k-token state 102 ms. The roofline's length axis put the
+# L40S (the same Ada AD102 chip as the 4090) at 11.7 ms graphed vs 14.6 eager, but on ~230-token prompts, not
+# the card's few-dozen-token example. This sends the card's own inputs (benchmarks/card_latency.py).
+# Eager and compiled run in one container, so both share one host CPU (meta.cpu_model).
+# Then submit this config with the modal group: s1 submit configs/card_latency_d1_l40s.toml
+benchmarks = ["card_latency"]
+
+[launch]
+orchestrator = "modal"
+gpu = "L40S"
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "00:30:00"   # hard stop: at most half an hour of L40S
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+require_gpu = "L40S"
+dtype = "bfloat16"
+max_prompt_tokens = 16384
+
+[params]
+card_warmup = 5        # compiled: the 3rd call at a size is the first replay
+card_runs = 50         # the card uses 20; 50 for a steadier median
+card_long_tokens = 3400
+state_tokenizer = "file"
+state_tokenizer_file = "$MODELS_DIR/d1-3B/tokenizer.json"  # d1's own tokens, as the card counts them
+
+[sweep]
+model = ["d1-3b.eager", "d1-3b.compiled"]
