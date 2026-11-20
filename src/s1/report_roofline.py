@@ -618,13 +618,15 @@ def nested_list(items: list[tuple[int, str]], inline: Callable[[str], str]) -> s
 
 
 def markdown_to_html(text: str) -> str:
-    """The markdown subset the findings use: ### headings, paragraphs, nested "- " lists, **bold**, `code`."""
+    """The markdown subset the findings use: ### headings, paragraphs, nested "- " lists, **bold**, `code`,
+    and the escaped star `\\*` (a literal *, e.g. "B\\*")."""
     import re  # noqa: PLC0415
 
     def inline(t: str) -> str:
         t = html.escape(t)
         t = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", t)
-        return re.sub(r"`(.+?)`", r"<code>\1</code>", t)
+        t = re.sub(r"`(.+?)`", r"<code>\1</code>", t)
+        return t.replace("\\*", "*")
 
     out: list[str] = []
     for block in re.split(r"\n\s*\n", text.strip()):
