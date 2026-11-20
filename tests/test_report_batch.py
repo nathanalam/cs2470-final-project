@@ -8,7 +8,19 @@ from s1 import report, report_batch
 from s1.record import RunRecord
 
 
-def _rec(run_id, gpu, model, mode=None, *, host="Intel", tflops=(10.0, 20.0, 40.0), busy=0.3, nsys=False):
+def _rec(
+    run_id,
+    gpu,
+    model,
+    mode=None,
+    *,
+    host="Intel",
+    tflops=(10.0, 20.0, 40.0),
+    busy=0.3,
+    nsys=False,
+    params=None,
+    inv=None,
+):
     m = {}
     for length in (128, 1024):
         for b, v in zip((1, 4, 16), tflops, strict=True):
@@ -19,15 +31,15 @@ def _rec(run_id, gpu, model, mode=None, *, host="Intel", tflops=(10.0, 20.0, 40.
         m[f"batch_s{length}_b1_kernels"] = 1150.0
     if nsys:
         m = {"batch_nsys_n": 64.0, "batch_nsys_wall_ms": 100.0}
-    params = {"model": model} | ({"laya_mode": mode} if mode else {})
-    inv = {"gpu": gpu, "platform": "modal"}
+    params = {"model": model} | ({"laya_mode": mode} if mode else {}) | (params or {})
+    inv = {"gpu": gpu, "platform": "modal"} | (inv or {})
     return RunRecord(run_id, inv, params, {"batch": m}, meta={"cpu_model": host})
 
 
 def test_series_uses_the_shortest_length_and_names_laya_modes():
     s = report_batch.series_of(_rec("r1", "NVIDIA L4", "laya.english", "graphs"))
     assert s is not None
-    assert s.key == "laya graphs" and s.name == "Laya CUDA graphs"
+    assert s.key == "laya graphs" and s.name == "Laya (CUDA graphs)"
     assert s.length == 128
     assert s.points == [(1, 10.0), (4, 20.0), (16, 40.0)]
     assert s.b1["kernel_busy"] == 0.3
@@ -74,8 +86,9 @@ def test_charts_and_report_sections():
     ]
     ps = report_batch.panels(recs)
     curves, bars = report_batch.curve_charts(ps), report_batch.split_chart(ps)
-    assert curves.count("<svg") == 2  # one small multiple per GPU
-    assert "var(--bs-0)" in curves and "var(--bs-1)" in curves  # fixed slots: eager 0, graphs 1
+    assert curves.count('role="img"') == 2  # one small multiple per GPU
+    # hue = model (Laya's fixed slot 1), dash = mode: eager solid, graphs dashed
+    assert "var(--bs-1)" in curves and 'stroke-dasharray="6 3"' in curves and "var(--bs-0)" not in curves
     assert bars.count('class="seg"') == 2 and "40%" in bars
     page = report.to_html(recs)
     assert "Where batch-1 latency goes" in page and "--bs-gpu" in page
@@ -102,3 +115,45 @@ def test_host_names_and_mixed_hosts_per_row():
     )
     bars = report_batch.split_chart(mixed)
     assert "hosts differ per row" in bars and "Kev-4B (fused + graphs) · Skylake/Cascade Lake" in bars
+
+
+def test_series_key_separates_host_prep_and_expert_dispatch():
+    lfm = "lfm2-8b-a1b.zeroshot"
+    h100 = "NVIDIA H100 80GB HBM3"
+    recs = [
+        _rec("20261119-01", h100, lfm, inv={"env_experts_implementation": "grouped_mm"}),
+        _rec("20261119-02", h100, lfm, params={"batch_host_prep": "pretokenized"},
+             inv={"env_experts_implementation": "grouped_mm"}),
+        _rec("20261119-03", h100, lfm, params={"semif_experts_implementation": "eager"}),
+        _rec("20261119-04", h100, lfm, params={"batch_host_prep": "pretokenized",
+             "semif_experts_implementation": "eager"}, inv={"env_experts_implementation": "eager"}),
+        _rec("20261119-05", h100, "jevk5-9b"),
+    ]  # fmt: skip
+    (p,) = report_batch.panels(recs)
+    assert [s.name for s in p.series] == [
+        "LFM2-8B-A1B (inline)",
+        "LFM2-8B-A1B (pretokenized)",
+        "LFM2-8B-A1B (eager experts)",
+        "LFM2-8B-A1B (pretokenized, eager experts)",
+        "JevK5-9B",
+    ]
+    assert [s.dash for s in p.series] == [0, 1, 2, 3, 0]
+    assert {s.slot for s in p.series[:4]} == {0} and p.series[4].slot == 5
+    assert p.series[1].prep == "pretokenized" and p.series[0].prep == "inline"
+    assert report_batch.series_key(recs[0]) == lfm  # the default variant keeps the bare model key
+    assert (
+        report_batch.family_of("qwen35-9b.zeroshot") == 4 and report_batch.family_of("qwen3-8b.zeroshot") == 3
+    )
+    assert report_batch.family_of("mystery") == report_batch.OTHER
+
+
+def test_panels_prefer_the_record_covering_more_batch_sizes():
+    lfm = "lfm2-8b-a1b.zeroshot"
+    wide = _rec("20261119-01", "NVIDIA H100 80GB HBM3", lfm, tflops=(1.0, 2.0, 3.0))
+    narrow = _rec("20261119-02", "NVIDIA H100 80GB HBM3", lfm, tflops=(1.0, 2.0, 3.0))
+    narrow.results["batch"] = {k: v for k, v in narrow.results["batch"].items() if "_b16_" not in k}
+    (p,) = report_batch.panels([wide, narrow])
+    assert p.series[0].run_id == "20261119-01"
+    s = report_batch.series_of(wide)
+    assert s is not None
+    assert s.grid[1024][4]["tflops_wall"] == 3.0  # 1.5x at 1024 tokens
