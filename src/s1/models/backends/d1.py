@@ -33,12 +33,15 @@ Settings (all optional):
 
 from __future__ import annotations
 
+import contextlib
+import importlib
 import math
 import sys
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, ClassVar, cast
 
 from ... import profiling
 from ...record import Scalar
@@ -78,8 +81,68 @@ def check_length(tokens: int, max_tokens: int) -> None:
         raise ValueError(f"{tokens} prompt tokens, over max_prompt_tokens={max_tokens}")
 
 
+def vision_shape(tiles: int, patches: int, image_tokens: int) -> dict[str, object]:
+    """The image path of a packed batch: SigLIP2 over `tiles` x `patches` (padded), then the projector over
+    `image_tokens` (benchmarks/vl_batch.py charges each to its flops.vision_stacks arch)."""
+    return {
+        "stack": "vision",
+        "rows": tiles,
+        "tokens": patches,
+        "past": 0,
+        "kept": 0,
+        "cached": False,
+        "image_tokens": image_tokens,
+    }
+
+
+def shared_prefix(rows: Sequence[Sequence[int]], stop: int | None = None) -> int:
+    """Tokens every row starts with, leaving each row at least its last token (the engine's `_logz_ids`
+    rule), and stopping before the first `stop` token (an image placeholder: rows with the same image layout
+    share placeholder ids but not the features scattered into them)."""
+    shared, shortest = 0, min(len(r) for r in rows)
+    while shared < shortest - 1 and len({r[shared] for r in rows}) == 1 and rows[0][shared] != stop:
+        shared += 1
+    return shared
+
+
+def option_columns(groups: Sequence[Sequence[Sequence[int]]]) -> tuple[list[int], list[list[list[int]]]]:
+    """The union of every row's readout token ids (the columns run_batch copies back), and each row's option
+    groups as indices into it."""
+    columns = sorted({t for g in groups for option in g for t in option})
+    at = {t: i for i, t in enumerate(columns)}
+    return columns, [[[at[t] for t in option] for option in g] for g in groups]
+
+
+def option_probs(scores: Sequence[float], groups: Sequence[Sequence[int]]) -> list[float]:
+    """prompt.readout from copied-back logits: each option's best form, softmax over options (no calibration;
+    the per-row log-normalizer cancels)."""
+    best = [max(scores[i] for i in g) for g in groups]
+    top = max(best)
+    exps = [math.exp(b - top) for b in best]
+    return [e / sum(exps) for e in exps]
+
+
+@dataclass
+class Packed:
+    """A batch prepared on the host (prepare_batch): one tree of `trunk` + each row's branch, no padding."""
+
+    trunk: Any  # (1, P) long, CPU
+    packed: Any  # (sum(lengths),) long, CPU
+    lengths: Any  # (B,) long, CPU
+    vision: dict[str, object]  # the processor's pixel inputs (pixel_values, ...), CPU; {} for text
+    columns: Any  # (K,) long: readout token ids
+    groups: list[list[list[int]]]  # per row, per option: indices into columns
+    decisions: int
+    real_tokens: int
+    image_tokens: int
+    tiles: int
+    patches: int
+
+
 @dataclass
 class D1:
+    image_input: ClassVar[bool] = True  # decide(..., images=[PIL images]) (benchmarks/imajev.py)
+
     model: object  # modeling_d1.D1Model
     engine: object  # runner.SystemOne, model.engine
     max_tokens: int
@@ -116,10 +179,160 @@ class D1:
         with self.recorder.span(shape):
             return run()
 
-    def decide(self, state: str, questions: Mapping[str, object]) -> dict[str, object]:
+    last_scores: list[list[float]] = field(default_factory=list)  # run_batch's copied-back option logits
+
+    def decide(
+        self, state: str, questions: Mapping[str, object], images: Sequence[object] | None = None
+    ) -> dict[str, object]:
+        return self.decide_with_usage(state, questions, images or ())[0]
+
+    def decide_with_usage(
+        self, state: str, questions: Mapping[str, object], images: Sequence[object]
+    ) -> tuple[dict[str, object], int]:
+        """The engine's own path (a request with pictures is one plain pass, the SigLIP2 tower inside it), and
+        the prompt tokens it read (image placeholders included)."""
+        engine: Any = self.engine
         with self.lock:  # one engine, and CUDA-graph outputs are reused by the next replay
-            out = self.engine.system_one(state, dict(questions))  # ty: ignore[unresolved-attribute]
-        return {str(k): v for k, v in out["answers"].items()}
+            args = (state, dict(questions), list(images)) if images else (state, dict(questions))
+            out = engine.system_one(*args)
+        return {str(k): v for k, v in out["answers"].items()}, int(
+            out.get("usage", {}).get("input_tokens", 0)
+        )
+
+    # ------------------------------------------------------------- batched (benchmarks/vl_batch.py)
+
+    def _module(self, name: str) -> Any:  # noqa: ANN401 — a module of the shipped code
+        """A module of the shipped code (prompt, hybrid, runner), as trust_remote_code imported it."""
+        package = type(self.engine).__module__.rpartition(".")[0]
+        return sys.modules[f"{package}.{name}"]
+
+    def _processor(self) -> Any:  # noqa: ANN401 — the checkpoint's AutoProcessor
+        engine: Any = self.engine
+        if engine.processor is None:
+            engine.processor = engine._load_processor()
+        return engine.processor
+
+    def image_tokens(self, width: int, height: int) -> int:
+        """LM placeholder tokens one `width` x `height` picture becomes (after the engine's 1 MP cap)."""
+        Image = importlib.import_module("PIL.Image")  # Pillow comes with the GPU extra
+
+        engine, model = cast("Any", self.engine), cast("Any", self.model)
+        picture = self._module("runner").cap_pixels(Image.new("RGB", (width, height)))
+        inputs = self._processor()(
+            text=[engine._image_markup(1)], images=[[picture]], return_tensors="pt", add_special_tokens=False
+        )
+        return int((inputs["input_ids"] == model.config.image_token_id).sum())
+
+    def decide_batch(self, requests: Sequence[tuple[object, ...]]) -> dict[str, int]:
+        return self.run_batch(self.prepare_batch(requests))
+
+    def prepare_batch(self, requests: Sequence[tuple[object, ...]]) -> Packed:
+        """Host half: every request's questions as rows of one packed tree (the engine's `_logz_ids` layout:
+        the rows' common start is the trunk, read once; each row's rest is a branch, no padding). Requests are
+        `(state, questions)` or `(state, questions, images)`; a batch is all text or all with pictures, which
+        then go through the processor together (capped at 1 MP as the engine does) and run as one SigLIP2
+        call. The engine itself runs a request with pictures alone, so this is the batched path it lacks."""
+        import torch  # noqa: PLC0415
+
+        engine, model = cast("Any", self.engine), cast("Any", self.model)
+        prompt, runner = self._module("prompt"), self._module("runner")
+        tok = engine.tokenizer
+        rows: list[list[int]] = []
+        questions: list[object] = []
+        texts: list[str] = []
+        pictures: list[list[object]] = []
+        for request in requests:
+            state, qs = request[0], cast("Mapping[str, object]", request[1])
+            images = list(cast("Sequence[object]", request[2])) if len(request) > 2 and request[2] else []
+            for q in qs.values():
+                question = prompt.as_question(q)
+                questions.append(question)
+                if not images:
+                    rows.append(tok.encode(engine.render(state, question), add_special_tokens=False))
+                    continue
+                capped = [runner.cap_pixels(im) for im in images]
+                markup = engine._image_markup(len(capped))
+                prefix = prompt.prefix_text(tok, state, engine.bos, engine.state_style, engine.system, markup)
+                texts.append(prefix + prompt.suffix_text(tok, question, engine.lead, engine.option_style))
+                pictures.append(capped)
+        if rows and texts:
+            raise ValueError("a batch is all text or all with pictures")
+        vision: dict[str, object] = {}
+        image_id = int(model.config.image_token_id)
+        tiles = patches = 0
+        if texts:
+            inputs = self._processor()(
+                text=texts, images=pictures, return_tensors="pt", add_special_tokens=False, padding=True
+            )
+            mask = inputs.pop("attention_mask")
+            rows = [ids[m.bool()].tolist() for ids, m in zip(inputs.pop("input_ids"), mask, strict=True)]
+            if "pixel_attention_mask" in inputs:  # trim the patch padding, as the engine's _image_inputs does
+                n = int(inputs["pixel_attention_mask"].sum(1).max())
+                inputs["pixel_values"] = inputs["pixel_values"][:, :n]
+                inputs["pixel_attention_mask"] = inputs["pixel_attention_mask"][:, :n]
+            vision = dict(inputs)
+            tiles, patches = int(inputs["pixel_values"].shape[0]), int(inputs["pixel_values"].shape[1])
+        p = shared_prefix(rows, image_id)
+        branches = [r[p:] for r in rows]
+        check_length(p + max(len(b) for b in branches), self.max_tokens)
+        columns, groups = option_columns([prompt.readout_ids(tok, q) for q in questions])
+        return Packed(
+            trunk=torch.tensor([rows[0][:p]], dtype=torch.long),
+            packed=torch.tensor([t for b in branches for t in b], dtype=torch.long),
+            lengths=torch.tensor([len(b) for b in branches], dtype=torch.long),
+            vision=vision,
+            columns=torch.tensor(columns, dtype=torch.long),
+            groups=groups,
+            decisions=len(rows),
+            real_tokens=sum(len(r) for r in rows),
+            image_tokens=sum(r.count(image_id) for r in rows),
+            tiles=tiles,
+            patches=patches,
+        )
+
+    def run_batch(self, b: Packed) -> dict[str, int]:
+        """Device half: one SigLIP2 + projector call for every picture (its own span), then one packed pass of
+        the hybrid language model over [trunk | branches] with the image features scattered into the
+        placeholders (its own span), logits at each branch's last token; the readout columns come back to
+        the host. The language-model pass is `hybrid.LanguageModel.answer` with the embeddings built here, so
+        it runs the same kernels as the engine's text batches."""
+        import torch  # noqa: PLC0415
+
+        model: Any = self.model
+        hybrid = self._module("hybrid")
+        device = next(model.parameters()).device
+        bt: Any = b
+        with self.lock, torch.inference_mode():
+            trunk = bt.trunk.to(device, non_blocking=True)
+            packed = bt.packed.to(device, non_blocking=True)
+            lengths = bt.lengths.to(device, non_blocking=True)
+            ids = torch.cat((trunk[0], packed))[None]
+            embeds = model.get_input_embeddings()(ids)
+            if b.vision:
+                vision = {
+                    k: v.to(device, non_blocking=True) if hasattr(v, "to") else v
+                    for k, v in bt.vision.items()
+                }
+                with self._span(vision_shape(b.tiles, b.patches, b.image_tokens)):
+                    out = model.model.get_image_features(**vision)
+                    features = torch.cat(out.pooler_output).to(embeds.dtype)
+                slots = (ids == model.config.image_token_id).unsqueeze(-1).expand_as(embeds)
+                embeds = embeds.masked_scatter(slots, features)
+            p = int(trunk.shape[1])
+            with self._span(tree_shape(p, [int(n) for n in bt.lengths.tolist()])):
+                tree = hybrid.Tree(p, lengths)
+                h = model.model.language_model.run(embeds, tree)
+                logits = model.lm_head(h[0, tree.leaves])
+            picked = logits[:, bt.columns.to(device)].float().cpu()
+        self.last_scores = picked.tolist()
+        return {"decisions": b.decisions, "real_tokens": b.real_tokens, "image_tokens": b.image_tokens}
+
+    def batch_probs(self, b: Packed) -> list[list[float]]:
+        """The option probabilities of the last run_batch (each row's readout, as the engine would give)."""
+        return [option_probs(s, g) for s, g in zip(self.last_scores, b.groups, strict=True)]
+
+    def _span(self, shape: dict[str, object]) -> contextlib.AbstractContextManager[None]:
+        return contextlib.nullcontext() if self.recorder is None else self.recorder.span(shape)
 
     def profile_info(self) -> dict[str, object]:
         if self.recorder is None:

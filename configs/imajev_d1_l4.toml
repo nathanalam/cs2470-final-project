@@ -1,0 +1,31 @@
+# Multimodal experiment B (docs/multimodal.md): d1-3B on ImajevBench's 254 labeled rows (230 answerable), with
+# the pictures and with them removed (the card's ablation), one Modal L4. Records accuracy per track, prompt
+# tokens per decision (image placeholders included), latency and peak memory above the weights. Requests run
+# one at a time through the engine's own path (a request with a picture is one plain pass). Warm-up answers
+# the rows once untimed.
+#   uv run --group modal s1 submit configs/imajev_d1_l4.toml
+benchmarks = ["imajev"]
+
+[launch]
+orchestrator = "modal"
+gpu = "L4"
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "01:00:00"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+require_gpu = "L4"
+dtype = "bfloat16"
+max_prompt_tokens = 16384
+
+[params]
+model = "d1-3b.eager"
+imajev_seed = 0
+imajev_warmup = true
+
+[sweep]
+imajev_images = [true, false]

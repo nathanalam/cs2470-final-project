@@ -1,0 +1,35 @@
+# Multimodal experiment A (docs/multimodal.md): same capacity, wider training data. LFM2.5-VL-3B (the base of
+# d1-3B, text + images) vs LFM2.5-2.6B (the same base checkpoint post-trained on text only), both zero-shot with
+# SemIf's letter softmax, on the d1 JEVal smoke's 200 questions (configs/d1_jeval_smoke_modal.toml: same limit
+# and seed) and on ImajevBench's text track (38 labeled rows, 33 answerable). The VL model runs text only.
+# Weights (once):
+#   uv run --group modal s1 download LiquidAI/LFM2.5-VL-3B 35a118d938ce6d123ac2d371649f24a8efb69058 LFM2.5-VL-3B
+#   uv run --group modal s1 download LiquidAI/LFM2.5-2.6B 7141b56cd4650af95c7c7b86983443aed050c96a LFM2.5-2.6B
+#   uv run --group modal s1 submit configs/mm_pair_jeval_l4.toml
+benchmarks = ["jeval", "imajev"]
+
+[launch]
+orchestrator = "modal"
+gpu = "L4"
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "01:00:00"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+require_gpu = "L4"
+dtype = "bfloat16"
+max_prompt_tokens = 16384
+semif_max_options = 16
+
+[params]
+jeval_limit = 200
+jeval_seed = 0
+jeval_concurrency = 1
+imajev_tracks = "text"
+
+[sweep]
+model = ["lfm25-vl-3b.zeroshot", "lfm25-2.6b.zeroshot"]
