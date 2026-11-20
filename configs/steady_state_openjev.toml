@@ -1,0 +1,41 @@
+# Steady-state concurrency for vLLM-served OpenJev on the 80 GB-plus GPUs (paper methodology, 2026-11-19).
+# vLLM has no per-point kernel_busy, so steady state = the smallest jeval_concurrency whose questions/s gain to
+# the next step is < 5% with per-GPU util (gpu0_util_pct) >= 95%; gpu0_mem_util_pct (memory controller) is
+# the second signal. Weaker than kernel_busy: nvidia-smi util only says "a kernel was running".
+# Existing records stop at 8 in flight, where the B200 sat at 79% util and q/s was still rising (6.5 -> 10.3
+# from 1 to 8); the H100 records at 1 and 8 used basic metrics. This config is openjev_jeval_smoke_sweep.toml
+# with two changes: more concurrency steps, and 1000 questions instead of 200, because 200 questions at 64-128
+# in flight is only 2-3 waves and the ramp-up/tail would dominate q/s. Concurrencies 1 and 8 are re-run here
+# so the curve comes from one question set. vLLM's --max-num-seqs is 256, so 128 in flight is not capped.
+# Prefix caching stays on (the default, as in every earlier OpenJev record).
+# Estimate per GPU (one container, sweep elements in sequence; first load 6-8 min, later ones 2-3 min;
+# 1000 questions at the measured q/s): A100 ~70 min, H100 ~45, H200 ~45, B200 ~35. About 3.3 GPU-hours,
+# roughly $15 on Modal at list prices (GPU plus 8 CPUs and 96 GB per container).
+# Cheaper variant: --set jeval_limit=500 roughly halves the jeval time (not the load time).
+#   uv run --group modal s1 submit configs/steady_state_openjev.toml                (all four GPUs)
+#   uv run --group modal s1 submit configs/steady_state_openjev.toml --gpu B200     (one of them)
+benchmarks = ["jeval"]
+
+[launch]
+orchestrator = "modal"
+gpu = ["A100-80GB", "H100", "H200", "B200"]  # one container each, run concurrently; require_gpu comes from the launcher
+gpus = 1
+cpus = 8
+mem = "96G"
+time = "03:00:00"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+tensor_parallel_size = 1
+quantization = "none"
+max_model_len = 16384
+
+[params]
+model = "openjev"
+jeval_limit = 1000
+jeval_seed = 0
+
+[sweep]
+jeval_concurrency = [1, 8, 16, 32, 64, 128]

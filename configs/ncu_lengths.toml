@@ -1,0 +1,49 @@
+# Hardware-counter (Nsight Compute) length axis: which kernels run, how close each kernel class gets to the
+# GPU's DRAM and SM peaks, and what share of a forward the GPU spends in kernels (roofline_hw_busy), from
+# 32 to 16,384 state tokens. Kernel-level counters exclude host time (cuDNN plan builds, Python dispatch, the
+# container's CPU), so the H100/H200 pair (same sm90 kernels, same compute, 1.41x measured bandwidth) can be
+# compared per kernel class. 8 seeded JEVal questions per length, all from states of >= 16,384 reference
+# tokens (roofline_min_state_tokens), so the three configs of this experiment share questions:
+#   ncu_lengths.toml        qwen3-8b, qwen35-9b, lfm2-8b-a1b on H100 + H200, 32 .. 16,384 tokens
+#   ncu_lengths_l4.toml     the same three on the L4 (the roofline-bound reference), 32 .. 8,192 tokens
+#   ncu_lengths_olmoe.toml  olmoe-1b-7b (trained context 4,096) on L4 + H100 + H200, 32 .. 4,096 tokens
+# Timing and roofline only: accuracy at cut lengths is not meaningful.
+# Run under ncu with N questions per length (queues `s1 ncu`; paid Modal GPU time):
+#   uv run --group modal s1 submit configs/ncu_lengths.toml --ncu 3
+benchmarks = ["roofline"]
+
+[launch]
+orchestrator = "modal"
+gpu = ["H100", "H200"]  # one container per GPU, run concurrently; require_gpu is set per GPU by the launcher
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "04:00:00"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+dtype = "bfloat16"
+measure_ceilings = true
+max_prompt_tokens = 20480  # a 16,384-token state plus question JSON and chat template
+semif_max_options = 16
+
+[params]
+roofline_seed = 0
+roofline_max_options = 16
+roofline_warmup = 4
+roofline_counted = 4
+roofline_per_length = 8  # timed questions per length; ncu then re-runs --ncu N of them
+roofline_min_state_tokens = 16384  # every config of this experiment draws the same questions
+roofline_tokenizer_file = "$MODELS_DIR/Qwen3.5-4B-Base/tokenizer.json"
+
+[sweep]
+model = [
+    "qwen3-8b.zeroshot",
+    "qwen35-9b.zeroshot",
+    "lfm2-8b-a1b.zeroshot",
+]
+
+[grid]
+roofline_state_tokens = [32, 512, 2048, 4096, 8192, 16384]

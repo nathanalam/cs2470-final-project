@@ -351,6 +351,26 @@ def test_ncu_log_name_uses_env_job_id(tmp_path: Path, monkeypatch: pytest.Monkey
     assert log == str(Path("logs") / "ncu-ta-9-exp-0.csv")
 
 
+def test_ncu_log_goes_to_s1_log_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """On Modal $S1_LOG_DIR is on the runs volume: the ncu log must land there to survive a timeout."""
+    monkeypatch.setenv("MODAL_TASK_ID", "ta-9")
+    monkeypatch.setenv("S1_LOG_DIR", str(tmp_path / "vol" / "logs"))
+    cfg = _cfg(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    seen: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> None:
+        seen.append(cmd)
+        raise _Stop
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(_Stop):
+        cli.ncu_cmd(cfg, questions=1, results_dir=tmp_path, ncu_bin="ncu")
+    log = seen[0][seen[0].index("--log-file") + 1]
+    assert log == str(tmp_path / "vol" / "logs" / "ncu-ta-9-exp-0.csv")
+    assert (tmp_path / "vol" / "logs").is_dir()
+
+
 # --- fan-out: [launch] gpu as a list (M3) -----------------------------------------------------------
 
 SWEEP5 = '["L4", "A100-80GB", "H100", "H200", "B200"]'

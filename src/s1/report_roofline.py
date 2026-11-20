@@ -141,11 +141,22 @@ def _model(r: RunRecord) -> str:
     return str(r.params.get("model", "?"))
 
 
+GRAPH_RECORDING = "graph recording timed"
+
+
 def variant(r: RunRecord) -> str:
     """What sets this run apart from another of the same model on the same GPU: granite with the fused
-    Mamba kernels (mamba-ssm installed) against plain PyTorch."""
+    Mamba kernels (mamba-ssm installed) against plain PyTorch; a CUDA-graphed d1 run warmed only once per
+    input size, whose timed calls were graph recordings, not replays (torch's graph trees record a size on
+    its 2nd call and replay from the 3rd; `roofline_warmup_passes = 2` times replays)."""
     mamba = str(r.invariants.get("env_mamba_ssm", "absent"))
-    return "fused Mamba kernels" if mamba not in ("absent", "") else ""
+    if mamba not in ("absent", ""):
+        return "fused Mamba kernels"
+    compiled = str(r.params.get("d1_compile", "")).lower() in ("true", "1")
+    passes = r.params.get("roofline_warmup_passes", 1)
+    if compiled and isinstance(passes, int | float) and passes < 2:
+        return GRAPH_RECORDING
+    return ""
 
 
 def _is_ncu(r: RunRecord) -> bool:

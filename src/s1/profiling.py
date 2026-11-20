@@ -35,10 +35,15 @@ class ForwardRecorder:
         self._suspended = 0
         self._pending: list[tuple[dict[str, Any], Any, Any]] = []
         self._open: list[tuple[dict[str, Any], Any]] = []
-        self._handles = [
-            model.register_forward_pre_hook(self._pre, with_kwargs=True),
-            model.register_forward_hook(self._post, with_kwargs=True),
-        ]
+        # model=None: no hooks, `span` only (a backend that times its own passes, e.g. bongard's stacks)
+        self._handles = (
+            []
+            if model is None
+            else [
+                model.register_forward_pre_hook(self._pre, with_kwargs=True),
+                model.register_forward_hook(self._post, with_kwargs=True),
+            ]
+        )
 
     def _pre(self, module: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:  # noqa: ANN401
         import torch  # noqa: PLC0415
@@ -191,6 +196,13 @@ def count_flops(fn: Callable[[], Any]) -> tuple[Any, float]:
     return out, float(counter.get_total_flops())
 
 
+def ncu_marker() -> None:
+    """A tiny kernel named "spin" (torch.cuda._sleep) that `s1 ncu` uses to split its log by state length."""
+    import torch  # noqa: PLC0415
+
+    torch.cuda._sleep(1000)
+
+
 def kernel_env(model: Any = None) -> dict[str, str]:  # noqa: ANN401
     """Which fast kernels this process can use; transformers falls back to plain torch without them."""
     import torch  # noqa: PLC0415
@@ -207,6 +219,8 @@ def kernel_env(model: Any = None) -> dict[str, str]:  # noqa: ANN401
             env[pkg] = str(getattr(importlib.import_module(pkg), "__version__", "present"))
     if model is not None:
         env["attn_implementation"] = str(getattr(model.config, "_attn_implementation", "unknown"))
+        if (experts := getattr(model.config, "_experts_implementation", None)) is not None:
+            env["experts_implementation"] = str(experts)  # MoE dispatch (eager, grouped_mm, ...)
     return env
 
 
@@ -251,3 +265,27 @@ def profile_kernels(fn: Callable[[], object]) -> list[tuple[str, float]]:
         for e in events
         if e.device_type == cuda and e.time_range.elapsed_us() > 0
     ]
+
+
+def trace_activity(fn: Callable[[], object]) -> list[tuple[str, str, float]]:
+    """Run `fn` once under torch.profiler (CPU + CUDA activity) and return (name, kind, us) for every CUDA
+    runtime/driver call on the host (kind "api": cudaLaunchKernel, cudaGraphLaunch, cudaStreamSynchronize...)
+    and every GPU activity (kind "kernel", or "copy" for memcpy/memset). The in-process stand-in for an nsys
+    `cuda_api_sum` + `cuda_gpu_kern_sum` (benchmarks/batch_sweep.py); CUPTI tracing, so it needs no counter
+    permission, but it slows the host, so time `fn` elsewhere."""
+    import torch  # noqa: PLC0415
+
+    cuda = torch.autograd.DeviceType.CUDA
+    torch.cuda.synchronize()
+    acts = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    with torch.profiler.profile(activities=acts) as prof:
+        fn()
+        torch.cuda.synchronize()
+    out: list[tuple[str, str, float]] = []
+    for e in prof.events() or []:
+        name, us = str(e.name), float(e.time_range.elapsed_us())
+        if e.device_type == cuda:
+            out.append((name, "copy" if name.startswith(("Memcpy", "Memset")) else "kernel", us))
+        elif name.startswith(("cuda", "cu")) and not name.startswith("cudnn"):
+            out.append((name, "api", us))
+    return out

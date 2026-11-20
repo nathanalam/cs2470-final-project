@@ -16,7 +16,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import report_lengths, report_roofline
+from . import report_batch, report_lengths, report_profiling, report_qpr, report_roofline
 from .record import RESULTS_DIR, Metrics, RunRecord, load_all
 
 SUFFIXES = ("accuracy", "ece", "brier", "invalid", "n", "latency_ms", "latency_ms_p99", "questions_per_s")
@@ -262,10 +262,27 @@ def _md_table(t: Table) -> str:
     return "\n".join(lines)
 
 
+GRAPH_NOTE = (
+    "d1-3b.compiled replays one CUDA graph per exact prompt length; torch records a length's graph on"
+    ' its 2nd call and replays it only from the 3rd. Rows marked "graph recording timed" were warmed '
+    "once and time the recording; unmarked d1-3b.compiled rows were warmed twice "
+    "(configs/roofline_d1_graph_warmup.toml, configs/roofline_d1_graph_replay_gpus.toml) and time "
+    "replays. At 32 tokens, replay vs eager: B200 3.1 vs 15.8 ms, H200 4.1 vs 23.8, H100 4.6 vs 23.2,"
+    " A100 9.8 vs 18.7, L40S 11.7 vs 14.6, L4 32.8 vs 34.6. Eager d1-3B on the big GPUs is host-"
+    "launch-bound: the GPU work is 3-5 ms of its 16-24 ms, and on the B200 eager stays near 16-17 ms "
+    "up to 2048 tokens while the replay rises from 3 to 14 ms. Host CPUs differ between the eager and"
+    " replay containers (meta.cpu_model), so the replays do not separate an AMD from an Intel host."
+)
+
+
+def _has_graph_rows(lpanels: Sequence[report_lengths.LengthPanel]) -> bool:
+    return any(c.model.startswith("d1-") and "compiled" in c.model for p in lpanels for c in p.curves)
+
+
 def _md_lengths(recs: Sequence[RunRecord]) -> list[str]:
     """The state-length axis: median GPU ms by length per panel, then the H200-vs-H100 speedups."""
     lpanels = report_lengths.panels(recs)
-    out: list[str] = []
+    out: list[str] = [GRAPH_NOTE, ""] if _has_graph_rows(lpanels) else []
     for sp in report_lengths.speedups(lpanels):
         name = f"{report_roofline.gpu_name(sp.other.gpu)} vs {report_roofline.gpu_name(sp.base.gpu)}"
         out += [
@@ -290,7 +307,7 @@ def _md_lengths(recs: Sequence[RunRecord]) -> list[str]:
 
 def _html_lengths(recs: Sequence[RunRecord]) -> list[str]:
     lpanels = report_lengths.panels(recs)
-    parts: list[str] = []
+    parts: list[str] = [f'<p class="sub">{html.escape(GRAPH_NOTE)}</p>'] if _has_graph_rows(lpanels) else []
     for sp in report_lengths.speedups(lpanels):
         h, rows = report_lengths.speedup_table(sp)
         parts += [report_lengths.speedup_chart(sp), '<div class="card">',
@@ -300,6 +317,132 @@ def _html_lengths(recs: Sequence[RunRecord]) -> list[str]:
         h, rows = report_lengths.ms_table(lp)
         parts += [report_lengths.length_chart(lp, scale), '<div class="card">',
                   _html_table(Table(h, rows), 1, len(h) - 2), "</div>"]  # fmt: skip
+    return parts
+
+
+BATCH_NOTE = (
+    "Hypothesis H2 (docs/h2_batch_findings.md): B independent requests per forward, newest record per GPU "
+    "and series, `s1 nsys` records left out. TFLOP/s is cost-model FLOPs over wall time; CPU share is "
+    "1 - GPU kernel time / wall time at batch 1. The eager batch-1 floor depends on the host CPU, "
+    "listed per row."
+)
+
+
+def _md_batch(recs: Sequence[RunRecord]) -> list[str]:
+    ps = report_batch.panels(recs)
+    if not ps:
+        return []
+    return [
+        BATCH_NOTE,
+        "",
+        "### Batch 1: CPU vs GPU share of latency",
+        "",
+        _md_table(Table(*report_batch.b1_table(ps))),
+        "",
+        "### Achieved TFLOP/s vs batch size",
+        "",
+        _md_table(Table(*report_batch.curve_table(ps))),
+        "",
+    ]
+
+
+def _md_qpr(recs: Sequence[RunRecord]) -> list[str]:
+    mqs = report_qpr.models(recs)
+    if not mqs:
+        return []
+    return [
+        "### Questions per request: GPU cost per question as questions share one state",
+        "",
+        _md_table(Table(*report_qpr.table(mqs))),
+        "",
+    ]
+
+
+def _html_batch(recs: Sequence[RunRecord]) -> list[str]:
+    ps = report_batch.panels(recs)
+    if not ps:
+        return []
+    bh, br = report_batch.b1_table(ps)
+    ch, cr = report_batch.curve_table(ps)
+    return [
+        f'<p class="sub">{html.escape(BATCH_NOTE)}</p>',
+        "<h3>Batch 1: CPU vs GPU share of latency</h3>",
+        report_batch.split_chart(ps),
+        '<div class="card">', _html_table(Table(bh, br), 3, len(bh)), "</div>",
+        "<h3>Achieved TFLOP/s vs batch size</h3>",
+        report_batch.curve_charts(ps),
+        '<div class="card">', _html_table(Table(ch, cr), 2, len(ch)), "</div>",
+    ]  # fmt: skip
+
+
+def _html_qpr(recs: Sequence[RunRecord]) -> list[str]:
+    mqs = report_qpr.models(recs)
+    if not mqs:
+        return []
+    parts = [report_qpr.chart(mq) for mq in mqs]
+    h, rows = report_qpr.table(mqs)
+    return [
+        *parts,
+        "<h3>Questions per request</h3>",
+        '<div class="card">',
+        _html_table(Table(h, rows), 5, len(h)),
+        "</div>",
+    ]
+
+
+def _md_nsys_lengths(recs: Sequence[RunRecord]) -> list[str]:
+    h, rows = report_profiling.nsys_table(recs)
+    if not rows:
+        return []
+    title = "### Nsight Systems: kernel-time roofline and GPU counters by state length"
+    out = [report_profiling.NOTE, "", title,
+           "", _md_table(Table(h, rows)), ""]  # fmt: skip
+    rh, rrows = report_profiling.h200_table(recs)
+    if rrows:
+        out += ["### Nsight Systems: H100 over H200 by state length", "", _md_table(Table(rh, rrows)), ""]
+    return out
+
+
+def _md_ncu_sampled(recs: Sequence[RunRecord]) -> list[str]:
+    h, rows = report_profiling.ncu_table(recs)
+    if not rows:
+        return []
+    out = ["### Sampled Nsight Compute: kernel classes", "", _md_table(Table(h, rows)), ""]
+    rh, rrows = report_profiling.ncu_ratio_table(recs)
+    if rrows:
+        out += [
+            "### Sampled Nsight Compute: H100 over H200 per kernel class",
+            "",
+            _md_table(Table(rh, rrows)),
+            "",
+        ]
+    return out
+
+
+def _html_nsys_lengths(recs: Sequence[RunRecord]) -> list[str]:
+    h, rows = report_profiling.nsys_table(recs)
+    if not rows:
+        return []
+    parts = [f'<p class="sub">{html.escape(report_profiling.NOTE)}</p>',
+             "<h3>Nsight Systems: kernel-time roofline and GPU counters by state length</h3>",
+             '<div class="card">', _html_table(Table(h, rows), 5, len(h) - 1), "</div>"]  # fmt: skip
+    rh, rrows = report_profiling.h200_table(recs)
+    if rrows:
+        parts += ["<h3>Nsight Systems: H100 over H200 by state length</h3>", '<div class="card">',
+                  _html_table(Table(rh, rrows), 3, len(rh)), "</div>"]  # fmt: skip
+    return parts
+
+
+def _html_ncu_sampled(recs: Sequence[RunRecord]) -> list[str]:
+    h, rows = report_profiling.ncu_table(recs)
+    if not rows:
+        return []
+    parts = ["<h3>Sampled Nsight Compute: kernel classes</h3>", '<div class="card">',
+             _html_table(Table(h, rows), 6, len(h) - 1), "</div>"]  # fmt: skip
+    rh, rrows = report_profiling.ncu_ratio_table(recs)
+    if rrows:
+        parts += ["<h3>Sampled Nsight Compute: H100 over H200 per kernel class</h3>", '<div class="card">',
+                  _html_table(Table(rh, rrows), 4, len(rh)), "</div>"]  # fmt: skip
     return parts
 
 
@@ -339,6 +482,11 @@ def to_markdown(recs: Sequence[RunRecord], results_dir: Path = RESULTS_DIR) -> s
                     "",
                 ]
             out += _md_lengths(recs)
+            out += _md_qpr(recs)
+            out += _md_ncu_sampled(recs)
+        if bench == report_batch.BENCH:
+            out += _md_batch(recs)
+            out += _md_nsys_lengths(recs)
         out += [
             "### Leaderboard (each model's largest run)",
             "",
@@ -459,7 +607,8 @@ def to_html(recs: Sequence[RunRecord], results_dir: Path = RESULTS_DIR) -> str:
     parts = [
         "<!doctype html><html lang=en><head><meta charset=utf-8>",
         '<meta name="viewport" content="width=device-width,initial-scale=1">',
-        f"<title>Decision-model results</title><style>{CSS}{report_roofline.CSS}</style></head><body><main>",
+        "<title>Decision-model results</title>",
+        f"<style>{CSS}{report_roofline.CSS}{report_batch.CSS}{report_qpr.CSS}</style></head><body><main>",
         "<h1>Decision-model results</h1>",
         f'<p class="sub">Generated by <code>uv run s1 report</code> from {len(recs)} run record(s) in '
         "<code>results/</code>. Do not edit by hand.</p>",
@@ -496,6 +645,11 @@ def to_html(recs: Sequence[RunRecord], results_dir: Path = RESULTS_DIR) -> str:
                 parts += [report_roofline.chart(panel, scale), '<div class="card">',
                           _html_table(Table(header, rows), 2, len(header)), "</div>"]  # fmt: skip
             parts += _html_lengths(recs)
+            parts += _html_qpr(recs)
+            parts += _html_ncu_sampled(recs)
+        if bench == report_batch.BENCH:
+            parts += _html_batch(recs)
+            parts += _html_nsys_lengths(recs)
         parts += ["<h3>Leaderboard (each model's largest run)</h3>", '<div class="card">',
                   _html_table(leaderboard(bench, recs), 1, 1 + n_keys), "</div>"]  # fmt: skip
         parts += ["<h3>All runs</h3>", '<div class="card">',

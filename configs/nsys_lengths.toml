@@ -1,0 +1,48 @@
+# Nsight Systems length axis with GPU-metrics sampling: the replacement for the full-kernel ncu sweep
+# (configs/ncu_lengths.toml), which could not finish (2026-11-15: ~1 h per question under ncu). Per (model,
+# state length), 8 batch-1 decisions inside the profiled range, after 8 warm-up ones on the same questions:
+#   batch_nsys_gpu_share         kernel time / wall time: where host overhead stops mattering (hypothesis B)
+#   batch_nsys_kernel_tflops/gbs cost-model work / kernel time: each decision on the roofline, host time removed
+#   batch_nsys_gm_*_active       DRAM read/write bandwidth and SM / tensor activity while the SMs are busy
+#                                (hypotheses A and C: does the H200 sustain more DRAM bandwidth than the H100?)
+# Each length is its own run ([sweep], the model reloads), so every finished length writes its record before
+# the next starts and a cap cannot erase finished work. 8 rows whose own state is >= 16,384 reference tokens
+# (batch_min_state_tokens), the same rows in nsys_lengths_l4.toml and nsys_lengths_olmoe.toml.
+# Run after configs/nsys_gm_test.toml shows GPU metrics reach the export on Modal:
+#   uv run --group modal s1 submit configs/nsys_lengths.toml --nsys 8
+benchmarks = ["batch"]
+
+[launch]
+orchestrator = "modal"
+gpu = ["H100", "H200"]  # one container per GPU, run concurrently; require_gpu is set per GPU by the launcher
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "02:00:00"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+dtype = "bfloat16"
+measure_ceilings = false
+max_prompt_tokens = 20480  # a 16,384-token state plus question JSON and chat template
+semif_max_options = 16
+nsys_gpu_metrics = true
+
+[params]
+batch_seed = 0
+batch_pool = 8
+batch_warmup = 8
+batch_max_options = 16
+batch_max_question_tokens = 512
+batch_min_state_tokens = 16384
+batch_tokenizer_file = "$MODELS_DIR/Qwen3.5-4B-Base/tokenizer.json"
+
+[sweep]
+model = ["qwen3-8b.zeroshot", "qwen35-9b.zeroshot", "lfm2-8b-a1b.zeroshot"]
+batch_nsys_state_tokens = [32, 512, 2048, 4096, 8192, 16384]
+
+[grid]
+batch_state_tokens = [32, 512, 2048, 4096, 8192, 16384]
+batch_sizes = [1]
