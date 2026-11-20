@@ -61,7 +61,7 @@ memory cost is mostly the 0.85 GB of vision weights, plus the vision activations
 Short answer: a picture does make d1-3B's state much bigger and its decisions much more expensive per
 decision, and it uses more activation memory per decision. But it does not push the model toward
 memory-bound. With or without a picture, every steady-state point is compute-bound, far right of the ridge on
-both GPUs, and the picture moves it further right. The accuracy question is not settled yet (see A).
+both GPUs, and the picture moves it further right. The accuracy premise is not supported, with a confound (see A).
 
 ### B. d1-3B on ImajevBench (L4, `results/20261120-142445-7427749f`, `-142920-33a46b0b`)
 
@@ -126,18 +126,32 @@ the two. On the L4, the 1024 px image arm ran out of memory at B = 64 (recorded 
 - **Check:** the packed batched path matches the engine's own single-request answers within 0.027 (H100) and
   0.031 (L4) in probability (bf16 kernels differ by batch shape).
 
-### A. Same capacity, wider data (L4, `results/20261120-141038-47e8326c`)
+### A. Same capacity, wider data (L4, `results/20261120-141038-47e8326c` VL, `-154053-8a326c34` text)
 
-LFM2.5-VL-3B zero-shot: **40.8%** on the JEVal smoke's 200 questions (49 invalid: the 16-option cap, as for
-every SemIf control), 57.6% on ImajevBench's text track. Its weights take 5.97 GB on the GPU, against 5.15 GB
-for the text twin (+0.81 GB idle vision tower).
+Zero-shot, SemIf's letter softmax, the same 200 JEVal smoke questions and ImajevBench's 33 answerable text-track
+rows. Both have 49 invalid JEVal answers (the 16-option cap, as for every SemIf control).
 
-The text twin's first run (`20261120-141138-322c83e3`, not committed) is **invalid**. LFM2.5-2.6B turned out to
-be a pure reasoning model: its chat template ends every prompt in an open `<think>` and ignores
-enable_thinking. So the readout scored option letters at the start of a thought (20.4%, below always-yes on
-yes/no questions). Fixed in 030ca10 (`semif_close_think`, an empty thought, on for that spec only). The
-rerun, `configs/mm_text_twin_l4.toml`, is pending approval. Even with it, the pair differs in more than
-image data: the twin was post-trained for reasoning, the VL model was not.
+| | LFM2.5-VL-3B (text + images) | LFM2.5-2.6B (text only) |
+|---|---|---|
+| JEVal smoke accuracy | **40.8%** | 21.4% |
+| choice / yes-no / score | 37.6% / 65.2% / 25.0% | 19.1% / 39.1% / 0.0% |
+| ECE / Brier | 0.304 / 0.667 | 0.563 / 1.169 |
+| ImajevBench text track | **57.6%** | 42.4% |
+| weights on the GPU | 5.97 GB | 5.15 GB |
+
+Read this as "the text twin cannot be read out this way", not as "wider data makes a better decider".
+LFM2.5-2.6B is a pure reasoning model: its chat template ends every prompt in an open `<think>` and ignores
+enable_thinking. The first run (`20261120-141138-322c83e3`, not committed) scored option letters inside that
+thought (20.4%). The rerun closes it with an empty thought (`semif_close_think`, 030ca10; the record has
+`params.semif_close_think = true`). That fixed ImajevBench yes/no (30% -> 70%, the same as the VL model), but
+JEVal barely moved (20.4% -> 21.4%). Its JEVal yes/no is still below always-yes (39% vs 46%), and it gets no
+score question right. A model post-trained to reason before answering puts little mass on an answer letter
+right after an empty thought, so a first-token readout understates it. A fair comparison would let the twin
+think and parse its answer (decoding, so a different cost profile) or fine-tune both the way d1 was.
+
+So at matched text capacity, the premise that a multimodal model "decides less accurately" is **not
+supported**: the VL model is the better zero-shot reader here. But the pair is not clean. It differs in
+reasoning post-training as well as in image data, and the gap is mostly that confound.
 
 ### Notes on the keys
 
