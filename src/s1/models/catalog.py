@@ -278,6 +278,43 @@ D1_3B = ModelSpec(
 # mode="reduce-overhead"). The card measures 16 ms eager vs 8 ms graphed for one question on an RTX 4090.
 D1_3B_COMPILED = D1_3B.variant("compiled", options={"d1_compile": True})
 
+# The multimodal matched pair (docs/multimodal.md): one base checkpoint (LFM2.5-2.6B-Base) post-trained once
+# on text only and once as a vision-language model. The two text towers have the same architecture (30
+# layers, 22 short-conv + 8 GQA, hidden 2048; the configs differ only in rope theta and context length), so
+# at the same text capacity the pair differs in training data and in the VL checkpoint's SigLIP2 tower and
+# projector (+0.85 GB). Both are read out zero-shot by SemIf's letter softmax; the VL one is loaded whole
+# (AutoModelForImageTextToText) and runs text only, so its GPU memory includes the idle vision weights.
+MM_RESOLVED = "2026-11-20"
+LFM25_VL_3B = replace(
+    zeroshot(
+        "lfm25-vl-3b",
+        "LiquidAI/LFM2.5-VL-3B",
+        revision="35a118d938ce6d123ac2d371649f24a8efb69058",
+        size_bytes=6_247_065_472,
+        group="control",
+        notes="Base of d1-3B: LFM2.5-2.6B-Base + SigLIP2-NaFlex 400M, post-trained on text and images. "
+        "Loaded whole, read out on text only (the vision tower is idle). Revision is a proposed pin "
+        "(HEAD 2026-11-20).",
+    ),
+    resolved_on=MM_RESOLVED,
+    base_repo="LiquidAI/LFM2.5-2.6B-Base",
+    base_revision="c57bdaed1ef166fe3095dda07f4a5e789ad5321e",
+)
+LFM25_2B6 = replace(
+    zeroshot(
+        "lfm25-2.6b",
+        "LiquidAI/LFM2.5-2.6B",
+        revision="7141b56cd4650af95c7c7b86983443aed050c96a",
+        size_bytes=5_394_427_456,
+        group="control",
+        notes="Text twin of lfm25-vl-3b: the same base (LFM2.5-2.6B-Base) post-trained on text only. "
+        "Revision is a proposed pin (HEAD 2026-11-20).",
+    ),
+    resolved_on=MM_RESOLVED,
+    base_repo="LiquidAI/LFM2.5-2.6B-Base",
+    base_revision="c57bdaed1ef166fe3095dda07f4a5e789ad5321e",
+)
+
 CATALOG: list[ModelSpec] = [
     OPENJEV,
     LAYA_MULTILINGUAL,
@@ -298,4 +335,6 @@ CATALOG: list[ModelSpec] = [
     ELEPHANT,
     D1_3B,
     D1_3B_COMPILED,
+    LFM25_VL_3B,
+    LFM25_2B6,
 ]

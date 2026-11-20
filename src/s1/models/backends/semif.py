@@ -16,8 +16,8 @@ A-P) and rejects over-long prompts rather than truncating; both stay errors, so 
 Code MIT; weights Apache-2.0.
 
 The same readout serves any causal LM with a chat template, so the catalog also uses it for zero-shot
-controls of other architectures (Qwen3, OLMoE, LFM2, Granite-4.0-H) and for JevK5, which was trained on
-SemIf's prompt and reads out with a fitted temperature.
+controls of other architectures (Qwen3, OLMoE, LFM2, LFM2-VL on text, Granite-4.0-H) and for JevK5, which
+was trained on SemIf's prompt and reads out with a fitted temperature.
 
 For the roofline benchmark the model is profiled (`profile_info`, `take_forwards`, `count_flops`): a forward
 recorder is hooked on first use, and with `measure_ceilings` the GPU's ceilings are measured before the
@@ -313,6 +313,8 @@ def build(spec: ModelSpec, settings: dict[str, Scalar]) -> SemIf:
     cls = transformers.AutoModelForCausalLM
     if config.model_type in ("qwen3_5", "qwen3_5_text"):  # the VLM checkpoint's text tower, as upstream
         cls, config = transformers.Qwen3_5ForCausalLM, config.get_text_config()
+    elif config.model_type == "lfm2_vl":  # the whole VLM (vision tower idle): its forward takes text alone
+        cls = transformers.AutoModelForImageTextToText
     load_kw: dict[str, object] = {}
     if experts := get_str(settings, "semif_experts_implementation", ""):  # "" = transformers' default
         load_kw["experts_implementation"] = experts

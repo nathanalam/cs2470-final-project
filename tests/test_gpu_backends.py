@@ -49,6 +49,8 @@ def test_single_gpu_models_are_ready_and_parallel_ones_planned():
         "elephant-1": "elephant",
         "d1-3b.eager": "d1",
         "d1-3b.compiled": "d1",
+        "lfm25-vl-3b.zeroshot": "semif",
+        "lfm25-2.6b.zeroshot": "semif",
     }
 
 
