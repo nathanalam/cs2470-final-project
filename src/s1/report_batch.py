@@ -1,8 +1,10 @@
 """The `batch` benchmark in the report: achieved FLOP/s vs batch size per GPU, and the CPU vs GPU split of
 batch-1 latency (hypothesis H2, docs/h2_batch_findings.md).
 
-A series is one model, or for Laya one execution mode (eager, CUDA graphs, torch.compile, compile + graphs).
-For each (platform, GPU, series) the newest record wins (records are never edited; a re-run supersedes).
+A series is one model run one way: Laya's execution mode (eager, CUDA graphs, torch.compile, compile +
+graphs), and for the semif models the host prep (`batch_host_prep`, when not inline) and the MoE expert
+dispatch (when not transformers' default grouped_mm). Hue is the model, line dash the variant. For each
+(platform, GPU, series) the record covering the most batch sizes wins, then the newest.
 Records from `s1 nsys` (`batch_nsys_n`) are left out: nsys's own tracing inflates their wall time.
 
 FLOP/s is cost-model FLOPs over wall time (`batch_s<L>_b<B>_tflops_wall`) at the shortest state length a
@@ -18,54 +20,112 @@ import html
 import math
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import report_roofline as rr
 from .record import Metrics, RunRecord
 
 BENCH = "batch"
-SERIES = (  # fixed order = fixed categorical slot (never cycled)
-    ("laya eager", "Laya eager"),
-    ("laya graphs", "Laya CUDA graphs"),
-    ("laya compile", "Laya torch.compile"),
-    ("laya compile_graphs", "Laya compile + graphs"),
-    ("kev-4b.hybrid", "Kev-4B (fused + graphs)"),
-    ("qwen3-8b.zeroshot", "Qwen3-8B eager"),
+FAMILIES = (  # fixed order = fixed categorical slot (never cycled); hue = model, line dash = variant
+    ("lfm2-8b-a1b", "LFM2-8B-A1B"),
+    ("laya", "Laya"),
+    ("kev-4b", "Kev-4B"),
+    ("qwen3-8b", "Qwen3-8B"),
+    ("qwen35-9b", "Qwen3.5-9B"),
+    ("jevk5-9b", "JevK5-9B"),
 )
-SLOT = {key: i for i, (key, _) in enumerate(SERIES)}
-NAME = dict(SERIES)
+OTHER = len(FAMILIES)  # slot for a model not listed above
+LAYA_MODES = {"eager": "eager", "graphs": "CUDA graphs", "compile": "torch.compile",
+              "compile_graphs": "compile + graphs"}  # fmt: skip
+BASE_VARIANT = {
+    "kev-4b.hybrid": "fused + graphs",
+    "qwen3-8b.zeroshot": "eager",
+    "lfm2-8b-a1b.zeroshot": "inline",
+}
+DEFAULT_EXPERTS = ("", "grouped_mm")  # transformers' default MoE dispatch (absent in older records)
+DASHES = ("", "6 3", "2 3", "8 3 2 3")  # variant index -> stroke-dasharray
+DASH_OF = {"CUDA graphs": 1, "torch.compile": 2, "compile + graphs": 3,
+           "pretokenized": 1, "eager experts": 2, "pretokenized, eager experts": 3}  # fmt: skip
 CSS = """
-:root{--bs-0:#2a78d6;--bs-1:#eb6834;--bs-2:#1baf7a;--bs-3:#eda100;--bs-4:#e87ba4;--bs-5:#008300;--bs-gpu:#2a78d6}
+:root{--bs-0:#2a78d6;--bs-1:#eb6834;--bs-2:#1baf7a;--bs-3:#eda100;--bs-4:#e87ba4;--bs-5:#008300;
+  --bs-6:#52514e;--bs-gpu:#2a78d6;--bs-ref:#52514e}
 @media (prefers-color-scheme:dark){:root{--bs-0:#3987e5;--bs-1:#d95926;--bs-2:#199e70;--bs-3:#c98500;
-  --bs-4:#d55181;--bs-5:#008300;--bs-gpu:#3987e5}}
+  --bs-4:#d55181;--bs-5:#0ca30c;--bs-6:#c3c2b7;--bs-gpu:#3987e5;--bs-ref:#c3c2b7}}
 .bsw .grid{stroke:var(--rule);stroke-width:1}.bsw .axis{stroke:var(--ink-2);stroke-width:1}
 .bsw .line{fill:none;stroke-width:2}.bsw g.pt:hover circle{stroke-width:3}
+.bsw .ref{stroke:var(--bs-ref);stroke-width:1;stroke-dasharray:4 3}
 .bsw .legend{display:flex;flex-wrap:wrap;gap:6px 18px;margin:4px 0 10px;color:var(--ink-2);font-size:12px}
 .bsw .key{display:inline-flex;align-items:center;gap:6px}
 .bsw .sw{width:10px;height:10px;border-radius:50%;display:inline-block}
-.bsw .multiples{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:12px}
+.bsw .legend svg{display:inline-block;width:28px;height:10px}
+.bsw .multiples{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(360px,100%),1fr));gap:12px}
 .bsw .multiples svg{max-width:none}
 .bsw .gpu{fill:var(--bs-gpu)}.bsw .host{fill:var(--track)}.bsw g.seg:hover rect{opacity:.8}
 """
 _POINT = re.compile(r"^batch_s(\d+)_b(\d+)_tflops_wall$")
+_ANY = re.compile(r"^batch_s(\d+)_b(\d+)_(.+)$")
+
+
+def family_of(model: str) -> int:
+    """FAMILIES slot of a model name ("laya.english" -> Laya), OTHER when unlisted."""
+    hits = (
+        i for i, (pre, _) in enumerate(FAMILIES) if model == pre or model.startswith((f"{pre}.", f"{pre} "))
+    )
+    return next(hits, OTHER)
+
+
+def experts_of(r: RunRecord) -> str:
+    """The MoE expert dispatch a run used: the param that forced it, else what the runtime recorded."""
+    forced = str(r.params.get("semif_experts_implementation", ""))
+    return forced or str(r.invariants.get("env_experts_implementation", ""))
+
+
+def variant_of(r: RunRecord) -> str:
+    """How a model ran, for labels: Laya's mode, else host prep and expert dispatch when not default."""
+    model = str(r.params.get("model", r.invariants.get("model", "")))
+    if model.startswith("laya"):
+        mode = str(r.params.get("laya_mode", r.invariants.get("laya_mode", "eager")))
+        return LAYA_MODES.get(mode, mode)
+    tags = []
+    if (prep := str(r.params.get("batch_host_prep", "inline"))) != "inline":
+        tags.append(prep)
+    if (experts := experts_of(r)) not in DEFAULT_EXPERTS:
+        tags.append(f"{experts} experts")
+    return ", ".join(tags) or BASE_VARIANT.get(model, "")
 
 
 @dataclass(frozen=True)
 class Series:
-    key: str  # SERIES key
+    key: str  # model, plus its variant: what makes two runs on one GPU the same series
     run_id: str
     host: str  # meta.cpu_model
     length: int  # the shortest state length the record has
     points: list[tuple[int, float]]  # (batch size, TFLOP/s on wall time), ascending B
     b1: Metrics  # batch_s<length>_b1_* without the prefix
-
-    @property
-    def name(self) -> str:
-        return NAME.get(self.key, self.key)
+    model: str = ""
+    variant: str = ""
+    prep: str = "inline"  # batch_host_prep
+    grid: dict[int, dict[int, Metrics]] = field(default_factory=dict)  # length -> B -> metrics (no prefix)
 
     @property
     def slot(self) -> int:
-        return SLOT.get(self.key, len(SERIES) - 1)
+        return family_of(self.model or self.key)
+
+    @property
+    def family(self) -> str:
+        return FAMILIES[self.slot][1] if self.slot < OTHER else (self.model or self.key)
+
+    @property
+    def name(self) -> str:
+        return f"{self.family} ({self.variant})" if self.variant else self.family
+
+    @property
+    def dash(self) -> int:
+        return DASH_OF.get(self.variant, 0)
+
+    @property
+    def order(self) -> tuple[int, int, str]:
+        return self.slot, self.dash, self.variant
 
 
 @dataclass(frozen=True)
@@ -83,7 +143,8 @@ def series_key(r: RunRecord) -> str:
     model = str(r.params.get("model", r.invariants.get("model", "")))
     if model.startswith("laya"):
         return f"laya {r.params.get('laya_mode', r.invariants.get('laya_mode', 'eager'))}"
-    return model
+    variant = variant_of(r)
+    return model if variant in ("", BASE_VARIANT.get(model)) else f"{model} {variant}"
 
 
 def series_of(r: RunRecord) -> Series | None:
@@ -91,30 +152,44 @@ def series_of(r: RunRecord) -> Series | None:
     if m is None or not m or "batch_nsys_n" in m:
         return None
     by_len: dict[int, list[tuple[int, float]]] = {}
+    grid: dict[int, dict[int, Metrics]] = {}
     for k, v in m.items():
+        if hit := _ANY.match(k):
+            grid.setdefault(int(hit[1]), {}).setdefault(int(hit[2]), {})[hit[3]] = v
         if (hit := _POINT.match(k)) and math.isfinite(v) and v > 0:
             by_len.setdefault(int(hit[1]), []).append((int(hit[2]), v))
     if not by_len:
         return None
     length = min(by_len)
-    prefix = f"batch_s{length}_b1_"
-    b1 = {k.removeprefix(prefix): v for k, v in m.items() if k.startswith(prefix)}
+    model = str(r.params.get("model", r.invariants.get("model", "")))
     return Series(
-        series_key(r), r.run_id, str(r.meta.get("cpu_model", "?")), length, sorted(by_len[length]), b1
+        series_key(r),
+        r.run_id,
+        str(r.meta.get("cpu_model", "?")),
+        length,
+        sorted(by_len[length]),
+        dict(grid[length].get(1, {})),
+        model,
+        variant_of(r),
+        str(r.params.get("batch_host_prep", "inline")),
+        {n: dict(sorted(bs.items())) for n, bs in sorted(grid.items())},
     )
 
 
 def panels(recs: Sequence[RunRecord]) -> list[Panel]:
-    """One panel per (platform, GPU), the newest record per series, in SERIES order."""
-    newest: dict[tuple[str, str, str], tuple[str, Series]] = {}
+    """One panel per (platform, GPU), one record per series, in FAMILIES order. Of several records for a
+    series the one covering the most batch sizes wins, then the newest (records are never edited; a re-run
+    supersedes)."""
+    best: dict[tuple[str, str, str], tuple[tuple[int, str], Series]] = {}
     for r in recs:
         if (s := series_of(r)) is None:
             continue
         key = (rr.platform(r.invariants), str(r.invariants.get("gpu", "?")), s.key)
-        if key not in newest or r.run_id > newest[key][0]:
-            newest[key] = (r.run_id, s)
+        rank = (len(s.points), r.run_id)
+        if key not in best or rank > best[key][0]:
+            best[key] = (rank, s)
     grouped: dict[tuple[str, str], list[Series]] = {}
-    for (plat, gpu, _), (_, s) in newest.items():
+    for (plat, gpu, _), (_, s) in best.items():
         grouped.setdefault((plat, gpu), []).append(s)
     order = ("L4", "A100", "H100", "H200", "B200")
 
@@ -122,7 +197,7 @@ def panels(recs: Sequence[RunRecord]) -> list[Panel]:
         return next((i for i, o in enumerate(order) if o in pg[1]), len(order)), pg[1]
 
     return [
-        Panel(plat, gpu, sorted(ss, key=lambda s: s.slot))
+        Panel(plat, gpu, sorted(ss, key=lambda s: s.order))
         for (plat, gpu), ss in sorted(grouped.items(), key=lambda kv: rank(kv[0]))
     ]
 
@@ -202,12 +277,28 @@ W, H = 420, 300
 LEFT, RIGHT, TOP, BOTTOM = 52, 16, 12, 40
 
 
-def _legend(present: Sequence[str]) -> str:
-    return "".join(
-        f'<span class="key"><span class="sw" style="background:var(--bs-{SLOT[k]})"></span>'
-        f"{html.escape(NAME[k])}</span>"
-        for k in present
+def swatch(slot: int, dash: int) -> str:
+    """A short line sample in a series' hue and dash, for legends."""
+    da = f' stroke-dasharray="{DASHES[dash % len(DASHES)]}"' if dash % len(DASHES) else ""
+    return (
+        f'<svg viewBox="0 0 28 10" aria-hidden="true"><line x1="1" x2="27" y1="5" y2="5" '
+        f'stroke="var(--bs-{slot})" stroke-width="2.5"{da}/></svg>'
     )
+
+
+def legend(series: Sequence[Series]) -> str:
+    """One entry per distinct series name, in FAMILIES order."""
+    seen: dict[str, Series] = {}
+    for s in sorted(series, key=lambda s: s.order):
+        seen.setdefault(s.name, s)
+    return "".join(
+        f'<span class="key">{swatch(s.slot, s.dash)}{html.escape(name)}</span>' for name, s in seen.items()
+    )
+
+
+def line(s: Series, d: str) -> str:
+    da = f' stroke-dasharray="{DASHES[s.dash % len(DASHES)]}"' if s.dash % len(DASHES) else ""
+    return f'<path class="line" stroke="var(--bs-{s.slot})"{da} d="{d}"/>'
 
 
 def curve_charts(ps: Sequence[Panel]) -> str:
@@ -244,7 +335,7 @@ def curve_charts(ps: Sequence[Panel]) -> str:
             d = " ".join(
                 f"{'M' if i == 0 else 'L'}{x(b):.1f},{y(v):.1f}" for i, (b, v) in enumerate(s.points)
             )
-            out.append(f'<path class="line" stroke="{color}" d="{d}"/>')
+            out.append(line(s, d))
             for b, v in s.points:
                 tip = (
                     f"{s.name} on {p.label}, B = {b}: {v:.1f} TFLOP/s "
@@ -268,7 +359,6 @@ def curve_charts(ps: Sequence[Panel]) -> str:
             f'<svg viewBox="0 0 {W} {H}" role="img" aria-label="Achieved TFLOP/s vs batch size on {title}">'
             f"{''.join(out)}</svg></figure>"
         )
-    present = [k for k, _ in SERIES if any(s.key == k for p in ps for s in p.series)]
     lengths = sorted({s.length for p in ps for s in p.series})
     head = (
         "Achieved TFLOP/s vs batch size, batch-1 state "
@@ -277,7 +367,7 @@ def curve_charts(ps: Sequence[Panel]) -> str:
     return (
         '<div class="bsw"><figure class="card chart">'
         f"<figcaption><strong>{html.escape(head)}</strong></figcaption>"
-        f'<div class="legend">{_legend(present)}</div>'
+        f'<div class="legend">{legend([s for p in ps for s in p.series])}</div>'
         f'<div class="multiples">{"".join(figs)}</div></figure></div>'
     )
 

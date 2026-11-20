@@ -16,7 +16,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import report_batch, report_lengths, report_profiling, report_qpr, report_roofline
+from . import report_batch, report_lengths, report_profiling, report_qpr, report_roofline, report_steady
 from .record import RESULTS_DIR, Metrics, RunRecord, load_all
 
 SUFFIXES = ("accuracy", "ece", "brier", "invalid", "n", "latency_ms", "latency_ms_p99", "questions_per_s")
@@ -346,6 +346,110 @@ def _md_batch(recs: Sequence[RunRecord]) -> list[str]:
     ]
 
 
+STEADY_NOTE = (
+    "Method of 2026-11-19: batch size is not a free variable. Each model x GPU pair is compared at its "
+    "own steady-state batch B*, the smallest batch with GPU kernel time >= 95% of wall time (kernel_busy; "
+    "values above 1 are trace inflation) that no larger batch beats on decisions/s by 5% or more. TFLOP/s "
+    "grows with batch size, so it is not the comparison metric. OpenJev (vLLM) has no kernel trace: its "
+    "steady state is the smallest concurrency with < 5% more questions/s at the next one and nvidia-smi "
+    "per-GPU utilization >= 95%, a weaker signal (it only says some kernel was running)."
+)
+BEST_NOTE = (
+    "JEVal accuracy counts invalid answers as wrong; accuracy on valid = correct / (N - invalid), "
+    "approximate. The semif models (lfm2, qwen35-9b, jevk5-9b) are also invalid on rows over 16 options "
+    "(the upstream cap). The other models' invalid count matches OpenJev's prompts over the 16,384-token "
+    "context (6 of 200, 21 of 1,000). Speed is decisions/s at B* on 128- and 1024-token batch states "
+    "(`batch`) or questions/s at OpenJev's steady-state concurrency on full JEVal states: compare speeds "
+    "within one unit, not across them."
+)
+PREP_NOTE = (
+    "Inline prep tokenizes and builds the batch inside the timed wall; pretokenized does it before the "
+    "timer and records it as host prep ms. On a fast GPU the host work inside the wall is GPU idle time, so "
+    "inline prep caps kernel_busy below 95% even when the batch is large."
+)
+
+
+def _steady_parts(recs: Sequence[RunRecord]) -> tuple[
+    list[report_batch.Panel], list[report_steady.ConcCurve], list[report_steady.Candidate]
+]:  # fmt: skip
+    ps = report_batch.panels(recs)
+    curves = report_steady.openjev_curves(recs)
+    return ps, curves, report_steady.candidates(recs, ps, curves)
+
+
+def _md_steady(recs: Sequence[RunRecord], results_dir: Path) -> list[str]:
+    ps, curves, cands = _steady_parts(recs)
+    if not ps and not curves:
+        return []
+    out: list[str] = ["## Steady state", "", STEADY_NOTE, ""]
+    if text := report_steady.findings(results_dir):
+        out += ["### Findings", "", text, ""]
+    if cands:
+        out += [
+            "### Best model per GPU",
+            "",
+            BEST_NOTE,
+            "",
+            _md_table(Table(*report_steady.best_table(cands))),
+            "",
+        ]
+    if ps:
+        out += ["### Steady-state batch per model and GPU", "",
+                _md_table(Table(*report_steady.steady_table(ps))), ""]  # fmt: skip
+    if curves:
+        out += ["### OpenJev: throughput, utilization and latency vs concurrency", "",
+                _md_table(Table(*report_steady.concurrency_table(curves))), ""]  # fmt: skip
+    if report_steady.prep_rows(ps):
+        out += ["### Prep mode: host prep inside the timed batch", "", PREP_NOTE, "",
+                _md_table(Table(*report_steady.prep_table(ps))), ""]  # fmt: skip
+    for n in report_steady.LENGTHS:
+        h, rows = report_steady.busy_table(ps, n)
+        if rows:
+            out += [f"### GPU utilization (kernel_busy) vs batch size, {n}-token states", "",
+                    _md_table(Table(h, rows)), ""]  # fmt: skip
+    return out
+
+
+def _html_steady(recs: Sequence[RunRecord], results_dir: Path) -> list[str]:
+    ps, curves, cands = _steady_parts(recs)
+    if not ps and not curves:
+        return []
+    parts: list[str] = ["<h2>Steady state</h2>", f'<p class="sub">{html.escape(STEADY_NOTE)}</p>']
+    if text := report_steady.findings(results_dir):
+        parts += [
+            '<h3>Findings</h3><div class="card prose">',
+            report_roofline.markdown_to_html(text),
+            "</div>",
+        ]
+    if cands:
+        h, rows = report_steady.best_table(cands)
+        parts += ["<h3>Best model per GPU</h3>", f'<p class="sub">{html.escape(BEST_NOTE)}</p>',
+                  '<div class="card">', _html_table(Table(h, rows), 3, 9), "</div>"]  # fmt: skip
+    if ps:
+        h, rows = report_steady.steady_table(ps)
+        parts += ["<h3>Steady-state batch per model and GPU</h3>", '<div class="card">',
+                  _html_table(Table(h, rows), 3, len(h) - 1), "</div>"]  # fmt: skip
+        for n in report_steady.LENGTHS:
+            parts.append(report_steady.busy_chart(ps, n))
+    if curves:
+        h, rows = report_steady.concurrency_table(curves)
+        parts += ["<h3>OpenJev: throughput, utilization and latency vs concurrency</h3>",
+                  report_steady.concurrency_chart(curves), '<div class="card">',
+                  _html_table(Table(h, rows), 1, len(h) - 1), "</div>"]  # fmt: skip
+    if report_steady.prep_rows(ps):
+        h, rows = report_steady.prep_table(ps)
+        parts += ["<h3>Prep mode: host prep inside the timed batch</h3>",
+                  f'<p class="sub">{html.escape(PREP_NOTE)}</p>',
+                  '<div class="card">', _html_table(Table(h, rows), 4, len(h)), "</div>"]  # fmt: skip
+    for n in report_steady.LENGTHS:
+        h, rows = report_steady.busy_table(ps, n)
+        if rows:
+            title = f"Table: kernel_busy vs batch size, {n}-token states"
+            parts += [f"<details class=card><summary>{title}</summary>",
+                      _html_table(Table(h, rows), 2, len(h) - 1), "</details>"]  # fmt: skip
+    return parts
+
+
 def _md_qpr(recs: Sequence[RunRecord]) -> list[str]:
     mqs = report_qpr.models(recs)
     if not mqs:
@@ -454,6 +558,7 @@ def to_markdown(recs: Sequence[RunRecord], results_dir: Path = RESULTS_DIR) -> s
         "A browsable version with charts is [`report.html`](report.html).",
         "",
     ]
+    out += _md_steady(recs, results_dir)
     for bench in benchmarks(recs):
         out += [f"## {bench}", ""]
         if bench == report_roofline.BENCH:
@@ -613,6 +718,7 @@ def to_html(recs: Sequence[RunRecord], results_dir: Path = RESULTS_DIR) -> str:
         f'<p class="sub">Generated by <code>uv run s1 report</code> from {len(recs)} run record(s) in '
         "<code>results/</code>. Do not edit by hand.</p>",
     ]
+    parts += _html_steady(recs, results_dir)
     for bench in benchmarks(recs):
         n_keys = len(metric_keys(bench, recs))
         parts += [f"<h2>{html.escape(bench)}</h2>", _bar_chart(bench, recs)]
