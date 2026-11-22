@@ -1,0 +1,42 @@
+# LFM2-8B-A1B steady-state B* on the H200 with host prep outside the timing (batch_host_prep = "pretokenized"),
+# the setting that took it past kernel_busy 0.95 on the H100 (B* 32 at 128 tokens, 16 at 1024; record
+# 20261119-230040-acb6fcff). Same rows and settings as lfm2_host_prep_h100.toml, default expert dispatch.
+# Estimate: one model load + one sweep to B = 64, ~10-15 min, ~$1.1 on Modal.
+# Launch: uv run --group modal s1 <submit> configs/lfm2_pretok_h200.toml
+benchmarks = ["batch"]
+
+[launch]
+orchestrator = "modal"
+gpu = "H200"
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "02:00:00"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+require_gpu = "H200"
+dtype = "bfloat16"
+measure_ceilings = true
+max_prompt_tokens = 16384
+semif_max_options = 16
+
+[params]
+batch_host_prep = "pretokenized"
+model = "lfm2-8b-a1b.zeroshot"
+batch_seed = 0
+batch_pool = 256
+batch_min_decisions = 32
+batch_min_batches = 4
+batch_trace = 2
+batch_warmup = 8
+batch_max_options = 16
+batch_max_question_tokens = 512
+batch_tokenizer_file = "$MODELS_DIR/Qwen3.5-4B-Base/tokenizer.json"
+
+
+[grid]
+batch_state_tokens = [128, 1024]
+batch_sizes = [1, 2, 4, 8, 16, 32, 64]
