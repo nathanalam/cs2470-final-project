@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import html
 import math
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -642,6 +643,12 @@ th{color:var(--ink-2);font-weight:600;font-size:12px}
 td.num,th.num{text-align:right}
 code{font:12px ui-monospace,monospace}
 details{margin:6px 0}summary{cursor:pointer}
+.toc ul{margin:4px 0;padding-left:20px}.toc>ul{columns:2}.toc li{margin:2px 0;break-inside:avoid}
+.toc a{color:var(--ink)}
+g.pt,g.mark,g.seg{cursor:pointer}.pin{margin:8px 0;padding:8px 12px;border-left:3px solid var(--bar);
+  background:var(--surface);white-space:pre-wrap}.pin a{color:var(--bar)}
+details.tbl>summary{color:var(--ink-2);padding:4px 0}details.tbl[open]>summary{margin-bottom:6px}
+.scroll{max-height:70vh;overflow:auto}thead th{position:sticky;top:0;background:var(--surface)}
 .chart svg{display:block;width:100%;max-width:820px;height:auto}
 .chart text{fill:var(--ink);font:12px system-ui,sans-serif}.chart .muted{fill:var(--ink-2)}
 .chart .bar{fill:var(--bar)}.chart .track{fill:var(--track)}
@@ -649,6 +656,29 @@ details{margin:6px 0}summary{cursor:pointer}
 .prose{line-height:1.6}.prose p,.prose ul{max-width:90ch}.prose li{margin:4px 0}.prose h4{margin:18px 0 6px}
 .recipes td{white-space:normal;min-width:7em;vertical-align:top}
 """
+
+# Clicking a chart point pins its tooltip under the chart;
+# run ids in it link to (and open) that run's details.
+CLICK_JS = """<script>
+document.addEventListener("click", e => {
+  const g = e.target.closest("g.pt, g.mark, g.seg");
+  if (!g) return;
+  const t = g.querySelector("title");
+  if (!t) return;
+  const svg = g.closest("svg"), host = svg.parentElement;
+  let pin = host.nextElementSibling;
+  if (!pin || !pin.classList.contains("pin")) {
+    pin = document.createElement("div"); pin.className = "pin"; host.after(pin);
+  }
+  const esc = s => s.replace(/[&<>]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;"})[c]);
+  pin.innerHTML = esc(t.textContent).replace(/\\b\\d{8}-\\d{6}-[0-9a-f]{8}\\b/g,
+    id => document.getElementById("run-" + id) ? `<a href="#run-${id}" data-run="${id}">${id}</a>` : id);
+});
+document.addEventListener("click", e => {
+  const a = e.target.closest("a[data-run]");
+  if (a) document.getElementById("run-" + a.dataset.run).open = true;
+});
+</script>"""
 
 
 def _cell(s: str, numeric: bool) -> str:
@@ -664,7 +694,22 @@ def _html_table(t: Table, numeric_from: int, numeric_to: int) -> str:
     body = "".join(
         "<tr>" + "".join(_cell(c, is_num(i)) for i, c in enumerate(row)) + "</tr>" for row in t.rows
     )
-    return f'<div class="scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
+    out = f'<div class="scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
+    if len(t.rows) <= COLLAPSE_ROWS or t.header == ["Key", "Value"]:  # run details already collapse
+        return out
+    return f'<details class="tbl"><summary>{html.escape(table_summary(t))}</summary>{out}</details>'
+
+
+COLLAPSE_ROWS = 15  # tables longer than this start collapsed behind a summary of what they hold
+
+
+def table_summary(t: Table) -> str:
+    """One line saying what a collapsed table holds: row count, what a row is, and its columns."""
+    first, rest = (t.header[0], t.header[1:]) if t.header else ("row", [])
+    cols = ", ".join(rest)
+    return f"Show table: {len(t.rows)} rows, one per {first.lower()}" + (
+        f" · columns: {cols}" if cols else ""
+    )
 
 
 def _bar_chart(bench: str, recs: Sequence[RunRecord]) -> str:
@@ -767,13 +812,47 @@ def to_html(recs: Sequence[RunRecord], results_dir: Path = RESULTS_DIR) -> str:
         rows += [[f"{name} · {k}", f"{v:.6g}"] for name, m in run_detail(r) for k, v in m.items()]
         rows += [[f"meta · {k}", str(v)] for k, v in r.meta.items()]
         parts += [
-            f"<details class=card><summary><code>{html.escape(r.run_id)}</code> · "
+            f'<details class=card id="run-{html.escape(r.run_id)}">'
+            f"<summary><code>{html.escape(r.run_id)}</code> · "
             f"{html.escape(model_of(r))} · {html.escape(other_params(r))}</summary>",
             _html_table(Table(["Key", "Value"], rows), 1, 2),
             "</details>",
         ]
-    parts.append("</main></body></html>")
-    return "\n".join(parts) + "\n"
+    parts.append(f"</main>{CLICK_JS}</body></html>")
+    return with_contents("\n".join(parts)) + "\n"
+
+
+HEAD_RE = re.compile(r"<(h[23])>(.*?)</\1>")
+
+
+def with_contents(page: str) -> str:
+    """Give every h2/h3 an id and put a linked table of contents (h3s under their h2) before the first h2."""
+    seen: dict[str, int] = {}
+    items: list[tuple[str, str, str]] = []
+
+    def anchor(m: re.Match[str]) -> str:
+        tag, text = m.group(1), m.group(2)
+        base = re.sub(r"[^a-z0-9]+", "-", re.sub(r"<[^>]+>", "", text).lower()).strip("-") or "section"
+        seen[base] = seen.get(base, 0) + 1
+        hid = base if seen[base] == 1 else f"{base}-{seen[base]}"
+        items.append((tag, hid, text))
+        return f'<{tag} id="{hid}">{text}</{tag}>'
+
+    page = HEAD_RE.sub(anchor, page)
+    if not items:
+        return page
+    out, open_sub = ['<details class="card toc" open><summary><b>Contents</b></summary><ul>'], False
+    for tag, hid, text in items:
+        if tag == "h2":
+            if open_sub:
+                out.append("</ul></li>")
+            out.append(f'<li><a href="#{hid}">{text}</a><ul>')
+            open_sub = True
+        elif open_sub:
+            out.append(f'<li><a href="#{hid}">{text}</a></li>')
+    out.append("</ul></li></ul></details>" if open_sub else "</ul></details>")
+    i = page.find("<h2 ")
+    return page[:i] + "".join(out) + page[i:] if i >= 0 else page
 
 
 def write(results_dir: Path = RESULTS_DIR) -> tuple[Path, Path]:
