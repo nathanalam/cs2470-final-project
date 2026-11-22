@@ -372,6 +372,50 @@ def t5gemma2_stacks(cfg: Mapping[str, object]) -> dict[str, Arch]:
     }
 
 
+def siglip2_vision(cfg: Mapping[str, object]) -> Arch:
+    """SigLIP2 (NaFlex) vision tower, as LFM2-VL runs it (no pooling head): a patch embedding (Linear over
+    channels x patch x patch pixels), a learned position table, then pre-norm encoder blocks (biased q/k/v/o,
+    GELU MLP, two LayerNorms) and a post LayerNorm. A forward's rows are image tiles and its tokens the
+    (padded) patches per tile; every patch sees every other patch of its tile (`causal=False`)."""
+    d, n, inter = _int(cfg, "hidden_size"), _int(cfg, "num_hidden_layers"), _int(cfg, "intermediate_size")
+    heads, patch, channels = (
+        _int(cfg, "num_attention_heads"),
+        _int(cfg, "patch_size"),
+        _int(cfg, "num_channels"),
+    )
+    block = 4 * (d * d + d) + 2 * d * inter + inter + d + 2 * 2 * d  # attention, MLP, two LayerNorms
+    encoder = Layer("attention", block, q_heads=heads, head_dim=d // heads, kv_dim=d, causal=False)
+    embed = Layer("projection", channels * patch * patch * d + d)
+    positions = _int(cfg, "num_patches") * d
+    return Arch("siglip2_vision_model", d, 0, True, (embed, *[encoder] * n), positions + 2 * d)
+
+
+def lfm2_vl_projector(cfg: Mapping[str, object]) -> Arch:
+    """LFM2-VL's projector: pixel-unshuffle by `downsample_factor` (f x f patches -> one image token of f^2 x
+    the vision width), an optional LayerNorm, then Linear -> GELU -> Linear into the text width. A forward's
+    tokens are image tokens (the LM's placeholders), not patches."""
+    vision, text = _section(cfg, "vision_config"), _text_config(cfg)
+    f, hidden = _int(cfg, "downsample_factor"), _int(cfg, "projector_hidden_size")
+    d_in, d_out = _int(vision, "hidden_size") * f * f, _int(text, "hidden_size")
+    params = d_in * hidden + hidden * d_out
+    if cfg.get("projector_bias", True):
+        params += hidden + d_out
+    if cfg.get("projector_use_layernorm", True):
+        params += 2 * d_in
+    return Arch("lfm2_vl_projector", d_out, 0, True, (Layer("projection", params),), 0)
+
+
+def vision_stacks(config: Mapping[str, object]) -> dict[str, Arch]:
+    """An LFM2-VL checkpoint's image path, {"vision", "projector"}; the text tower stays `arch(config)`.
+    Kept apart from `stacks` so every text-only caller of a VL config (d1-3B's roofline) is unchanged."""
+    if config.get("model_type") != "lfm2_vl":
+        raise KeyError(f"no vision cost model for model_type {config.get('model_type')!r}; known: lfm2_vl")
+    vision = _section(config, "vision_config")
+    if vision.get("model_type") != "siglip2_vision_model":
+        raise KeyError(f"no cost model for vision tower {vision.get('model_type')!r}")
+    return {"vision": siglip2_vision(vision), "projector": lfm2_vl_projector(config)}
+
+
 STACKS = {"t5gemma2": t5gemma2_stacks}
 
 

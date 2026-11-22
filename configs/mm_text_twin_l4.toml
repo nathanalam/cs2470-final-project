@@ -1,0 +1,30 @@
+# Multimodal experiment A, text twin only, re-run with semif_close_think (docs/multimodal.md). The first run
+# (results/20261120-141138-322c83e3.json) read LFM2.5-2.6B's option letters inside the <think> its chat
+# template opens; lfm25-2.6b.zeroshot now closes it with an empty thought. Same settings as
+# configs/mm_pair_jeval_l4.toml otherwise; the VL model's run there was unaffected and is not repeated.
+#   uv run --group modal s1 submit configs/mm_text_twin_l4.toml
+benchmarks = ["jeval", "imajev"]
+
+[launch]
+orchestrator = "modal"
+gpu = "L4"
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "01:00:00"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+require_gpu = "L4"
+dtype = "bfloat16"
+max_prompt_tokens = 16384
+semif_max_options = 16
+
+[params]
+model = "lfm25-2.6b.zeroshot"
+jeval_limit = 200
+jeval_seed = 0
+jeval_concurrency = 1
+imajev_tracks = "text"
