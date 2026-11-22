@@ -52,7 +52,9 @@ GPU), and `batch_s<L>_b<B>_prep_ms` records the host preparation time per batch 
 
 `batch_sizes = ["steady"]` (or `["steady-bracket"]`) in [grid] makes the runner pick the steady-state batch
 per length for the GPU the run is on (src/s1/steady_state.py) and set `batch_sizes_at = "128:32,1024:16"`;
-the benchmark then runs only that size at each length (or half, it and double for the bracket).
+the benchmark then runs only that size at each length (or half, it and double for the bracket). If the steady
+pick runs out of memory, the benchmark halves it until a batch fits and records the batch it used as
+`batch_s<L>_steady_fallback` (0 if even B = 1 did not fit), next to the pick's `_oom` = 1.
 
 The model may implement `after_warmup()` (called after each point's warm-up; kev captures pending CUDA
 graphs) and `profiler(on)` (needed for batch_nsys).
@@ -280,6 +282,56 @@ def _free_cuda() -> None:
         sys.modules["torch"].cuda.empty_cache()
 
 
+@dataclass
+class _Sweep:
+    """What every (length, batch size) point of one sweep shares."""
+
+    m: Batched
+    pool: Mapping[int, Sequence[jeval.Row]]
+    settings: Settings
+    host_prep: str
+    arch: flops.Arch
+    sizes_kw: Mapping[str, int]
+    traced_n: int
+
+    def point(self, out: Metrics, length: int, size: int) -> bool:
+        """Measure one point into `out`; False (and `_oom` = 1) when it ran out of GPU memory."""
+        m, prefix = self.m, f"batch_s{length}_b{size}_"
+        plan = batches(self.pool[length], size, self.settings)
+        after_warmup = getattr(m, "after_warmup", None)
+        try:
+            calls, prep_ms = plan_calls(m, plan, self.host_prep)
+            peak = _reset_peak()
+            for call in calls:  # warm-up: every shape once, untimed
+                call()
+            if callable(after_warmup):
+                after_warmup()
+            m.take_forwards()
+            timed = [time_batch(m, call, self.arch, self.sizes_kw) for call in calls]
+            trace = trace_batches(m, calls[: self.traced_n]) if self.traced_n else None
+        except Exception as e:
+            if not _is_oom(e):
+                raise
+            m.take_forwards()
+            _free_cuda()
+            out[f"{prefix}oom"] = 1.0
+            note(f"{prefix}oom", f"{type(e).__name__}: {e}"[:200])
+            print(f"batch: L={length} B={size} out of memory", flush=True)
+            return False
+        out |= point(prefix, timed, size, trace, min(self.traced_n, len(plan)))
+        if peak:
+            out[f"{prefix}peak_mb"] = _peak_mb()
+        if not math.isnan(prep_ms):
+            out[f"{prefix}prep_ms"] = prep_ms
+        print(
+            f"batch: L={length} B={size} wall {out[f'{prefix}wall_ms']:.2f} ms, "
+            f"{out[f'{prefix}tflops_wall']:.2f} TFLOP/s, "
+            f"cpu_share {out.get(f'{prefix}cpu_share', math.nan):.2f}",
+            flush=True,
+        )
+        return True
+
+
 @benchmark(NAME)
 def run(model: object, settings: Settings) -> Metrics:
     m = _model(model)
@@ -303,46 +355,18 @@ def run(model: object, settings: Settings) -> Metrics:
     host_prep = get_str(settings, "batch_host_prep", "inline")
     if host_prep not in HOST_PREP:
         raise ValueError(f"batch_host_prep must be one of {', '.join(HOST_PREP)}, got {host_prep!r}")
-    pool = pools(settings, lengths, max(sizes))
-    after_warmup = getattr(m, "after_warmup", None)
-    traced_n = get_int(settings, "batch_trace", 2)
+    sweep = _Sweep(m, pools(settings, lengths, max(sizes)), settings, host_prep, arch, sizes_kw,
+                   get_int(settings, "batch_trace", 2))  # fmt: skip
     out: Metrics = {}
     for length in lengths:
         for size in steady_state.sizes_for(settings, length, sizes):
-            prefix = f"batch_s{length}_b{size}_"
-            plan = batches(pool[length], size, settings)
-            try:
-                calls, prep_ms = plan_calls(m, plan, host_prep)
-                peak = _reset_peak()
-                for call in calls:  # warm-up: every shape once, untimed
-                    call()
-                if callable(after_warmup):
-                    after_warmup()
-                m.take_forwards()
-                timed = [time_batch(m, call, arch, sizes_kw) for call in calls]
-                trace = None
-                if traced_n:
-                    trace = trace_batches(m, calls[:traced_n])
-            except Exception as e:
-                if not _is_oom(e):
-                    raise
-                m.take_forwards()
-                _free_cuda()
-                out[f"{prefix}oom"] = 1.0
-                note(f"{prefix}oom", f"{type(e).__name__}: {e}"[:200])
-                print(f"batch: L={length} B={size} out of memory", flush=True)
+            if sweep.point(out, length, size) or not steady_state.halves_on_oom(settings):
                 continue
-            out |= point(prefix, timed, size, trace, min(traced_n, len(plan)))
-            if peak:
-                out[f"{prefix}peak_mb"] = _peak_mb()
-            if not math.isnan(prep_ms):
-                out[f"{prefix}prep_ms"] = prep_ms
-            print(
-                f"batch: L={length} B={size} wall {out[f'{prefix}wall_ms']:.2f} ms, "
-                f"{out[f'{prefix}tflops_wall']:.2f} TFLOP/s, "
-                f"cpu_share {out.get(f'{prefix}cpu_share', math.nan):.2f}",
-                flush=True,
-            )
+            # the steady pick ran out of memory here: halve until a batch fits, so the run still measures
+            # this length, and say which batch it used (it is no longer the table's pick)
+            ran = next((b for b in steady_state.fallback_sizes(size) if sweep.point(out, length, b)), 0)
+            out[f"batch_s{length}_steady_fallback"] = float(ran)
+            note(f"batch_s{length}_steady_fallback", f"B={size} out of memory; ran B={ran or 'none'}")
     return (
         headline(out, lengths, sizes)
         | {"batch_lengths": float(len(lengths)), "batch_sizes": float(len(sizes))}

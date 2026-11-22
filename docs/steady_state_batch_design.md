@@ -1,8 +1,8 @@
 # Picking the steady-state batch automatically: design (2026-11-22)
 
 Status: **implemented** in `src/s1/steady_state.py` (usage and the table: `docs/steady_state_batch.md`), with
-the simple formula and the table-decides default policy. Not implemented yet from section 5: the
-halve-once fallback on OOM, recording vLLM's `max_num_batched_tokens`, the report's "picked by" column and
+the simple formula and the table-decides default policy. The OOM fallback halves repeatedly
+(B/2, B/4, ... to 1) rather than once. Not implemented yet from section 5: recording vLLM's `max_num_batched_tokens`, the report's "picked by" column and
 bracket drift check, and the `vl_batch` hook (that benchmark is on the multimodal branch). No GPU or Modal
 time was spent. The numbers below come from the
 committed records (`results/*.json`), `results/steady_state_findings.md`, `docs/multimodal.md` on

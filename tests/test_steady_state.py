@@ -254,7 +254,9 @@ def test_formula_backtest_against_measured_series():
 # ---------------------------------------------------------------- runner and benchmark wiring
 
 
-def _run(tmp_path, monkeypatch, model, gpu="NVIDIA L4", name="qwen3-8b.zeroshot", **params):
+def _run(
+    tmp_path, monkeypatch, model, *, gpu="NVIDIA L4", name="qwen3-8b.zeroshot", sizes="steady", **params
+):
     rows = [row(i, state_words=300 + i) for i in range(20)]
     monkeypatch.setattr(jeval, "load_rows", lambda: rows)
     monkeypatch.setattr(runner, "detect_gpu", lambda: gpu)
@@ -266,7 +268,7 @@ def _run(tmp_path, monkeypatch, model, gpu="NVIDIA L4", name="qwen3-8b.zeroshot"
         benchmarks=["batch"],
         invariants={"gpu": "auto"},
         params={"model": name, "batch_pool": 16, "batch_min_decisions": 8, **params},
-        grid={batch_sweep.LENGTHS: [64, 128], batch_sweep.SIZES: ["steady"]},
+        grid={batch_sweep.LENGTHS: [64, 128], batch_sweep.SIZES: [sizes]},
     )
     return runner.run(spec, results_dir=tmp_path, log=lambda _: None, gpu_sampler=_no_gpu)
 
@@ -301,3 +303,25 @@ def test_runner_formula_after_load(tmp_path, monkeypatch):
     at = steady_state.parse_sizes_at(str(rec.params["batch_sizes_at"]))
     assert rec.params["steady_source"] == "formula"
     assert all(f"batch_s{n}_b{b}_wall_ms" in rec.results["batch"] for n, b in at.items())
+
+
+def test_steady_pick_that_runs_out_of_memory_is_halved(tmp_path, monkeypatch):
+    rec = _run(tmp_path, monkeypatch, FakeBatched(oom_at=4))  # the L4 pick is 4 at both lengths
+    m = rec.results["batch"]
+    for n in (64, 128):
+        assert m[f"batch_s{n}_b4_oom"] == 1 and m[f"batch_s{n}_steady_fallback"] == 2
+        assert m[f"batch_s{n}_b2_wall_ms"] > 0
+    assert "B=4 out of memory; ran B=2" in str(rec.meta["batch_s64_steady_fallback"])
+
+
+def test_nothing_fits_records_zero(tmp_path, monkeypatch):
+    m = _run(tmp_path, monkeypatch, FakeBatched(oom_at=1)).results["batch"]
+    assert m["batch_s64_steady_fallback"] == 0 and m["batch_s64_b1_oom"] == 1
+
+
+def test_bracket_and_explicit_sweeps_keep_the_oom_point(tmp_path, monkeypatch):
+    m = _run(tmp_path, monkeypatch, FakeBatched(oom_at=8), sizes="steady-bracket").results["batch"]
+    assert m["batch_s64_b8_oom"] == 1 and "batch_s64_steady_fallback" not in m
+    assert m["batch_s64_b4_wall_ms"] > 0 and m["batch_s64_b2_wall_ms"] > 0
+    assert not steady_state.halves_on_oom({})
+    assert steady_state.fallback_sizes(16) == [8, 4, 2, 1] and steady_state.fallback_sizes(1) == []

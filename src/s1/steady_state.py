@@ -469,6 +469,25 @@ def sizes_for(settings: Mapping[str, Scalar], length: int, grid_sizes: Sequence[
     return bracket(b) if settings.get("steady_bracket") in (True, "true", "True", 1) else [b]
 
 
+def halves_on_oom(settings: Mapping[str, Scalar]) -> bool:
+    """Whether the `batch` benchmark should halve a steady pick that runs out of memory: a plain "steady"
+    run, which would otherwise measure nothing at that length. Explicit sweeps and brackets keep the OOM
+    point as data (the bracket's smaller size is already in the run)."""
+    raw = settings.get(SIZES_AT)
+    return (
+        isinstance(raw, str) and bool(raw) and settings.get("steady_bracket") not in (True, "true", "True", 1)
+    )
+
+
+def fallback_sizes(b: int) -> list[int]:
+    """The batches to try, in order, after `b` ran out of memory: b/2, b/4, ..., 1."""
+    out: list[int] = []
+    while b > 1:
+        b //= 2
+        out.append(b)
+    return out
+
+
 def markdown_table() -> str:
     """The table as markdown, one row per entry (docs/steady_state_batch.md embeds it; a test checks)."""
     cols = ("Model", "GPU", "Setup", "Batch at 128 tokens", "Batch at 1024 tokens", "Steady state reached?")

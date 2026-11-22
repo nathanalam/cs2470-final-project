@@ -72,6 +72,25 @@ When the run starts, the runner:
    `steady_source` (`table`), `steady_status` (`reached` or `plateau` per length), `steady_runs` (the sweep
    it came from), `steady_gpu` and `steady_rule`.
 
+**If the pick runs out of memory**, the benchmark halves it (B/2, B/4, ... down to 1) until a batch fits,
+measures that, and records `batch_s<L>_steady_fallback` = the batch it used (0 if none fit) next to the
+pick's `_oom` = 1. Why the dynamic design needs this:
+
+- **The pick is a lookup, not a guarantee for this container.** Entries come from one past sweep. A new run
+  can carry more memory than that one did: longer real rows or more padding than the reference states, a
+  different setup applied by the config, or a smaller card behind the same key (`A100-PCIe` covers 40 GB and
+  80 GB cards). The opt-in formula's memory cap is itself an estimate (0.3 MB per token).
+- **A "steady" run measures one batch per length.** A sweep that hits OOM at B = 64 still has B = 1-32. A
+  steady run that hits OOM at its only point would record nothing for that length and waste the GPU time,
+  including the model load.
+- **Halving keeps the run useful and honest.** Steady state is reached at the smallest busy batch, and
+  throughput is flat just above it, so the largest batch that fits is the best available stand-in. The record
+  says it is no longer the table's pick, so it is not quoted as one. A fallback is a signal to re-sweep that
+  pair and update the table.
+
+Explicit sweeps and `"steady-bracket"` runs do not halve: their other sizes already cover the smaller
+batches, and the OOM point is itself data.
+
 **If the table has no entry** for that model x GPU x setup, the run stops *before the model loads*, with a
 message saying what is missing. Fill the gap with a sweep (below), or set the batch explicitly.
 
