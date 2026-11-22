@@ -16,8 +16,8 @@ A-P) and rejects over-long prompts rather than truncating; both stay errors, so 
 Code MIT; weights Apache-2.0.
 
 The same readout serves any causal LM with a chat template, so the catalog also uses it for zero-shot
-controls of other architectures (Qwen3, OLMoE, LFM2, Granite-4.0-H) and for JevK5, which was trained on
-SemIf's prompt and reads out with a fitted temperature.
+controls of other architectures (Qwen3, OLMoE, LFM2, LFM2-VL on text, Granite-4.0-H) and for JevK5, which
+was trained on SemIf's prompt and reads out with a fitted temperature.
 
 For the roofline benchmark the model is profiled (`profile_info`, `take_forwards`, `count_flops`): a forward
 recorder is hooked on first use, and with `measure_ceilings` the GPU's ceilings are measured before the
@@ -28,6 +28,7 @@ Settings (all optional):
     mode               direct | reranker                                          (from the spec)
     semif_max_options  options per question, at most 26 (A-Z)                    default 16 (upstream)
     semif_temperature  divides the option scores before the softmax               default 1.0 (upstream)
+    semif_close_think  close a `<think>` the chat template opens (empty thought)  default false
     max_prompt_tokens  longest prompt (one pair, for the reranker)                default 16384
                        (upstream defaults to 4096; 16384 matches openjev's max_model_len)
     measure_ceilings   measure the GPU's roofline ceilings before loading         default false
@@ -157,6 +158,7 @@ class SemIf:
     letter_ids: list[int]
     yes_no: tuple[int, int] | None  # (no, yes); reranker only
     temperature: float = 1.0
+    close_think: bool = False
     hf_config: dict[str, object] = field(default_factory=dict)  # what the roofline cost model reads
     ceilings: dict[str, float] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -204,11 +206,18 @@ class SemIf:
             raise TypeError("model returned no logits")
         return logits
 
+    def direct_prompt(self, state: str, row: Row) -> str:
+        """The direct-mode chat prompt, thinking disabled. With `close_think`, a prompt the template ends in
+        an open `<think>` (a pure reasoning model's template ignores enable_thinking) gets an empty thought,
+        so the letters are read at the answer slot, not at the start of a thought."""
+        prompt = self.tokenizer.apply_chat_template(  # ty: ignore[unresolved-attribute]
+            direct_messages(state, row), tokenize=False, add_generation_prompt=True, enable_thinking=False
+        )
+        return close_think(str(prompt)) if self.close_think else str(prompt)
+
     def scores(self, state: str, row: Row) -> list[float]:
         if self.mode == "direct":
-            prompt = self.tokenizer.apply_chat_template(  # ty: ignore[unresolved-attribute]
-                direct_messages(state, row), tokenize=False, add_generation_prompt=True, enable_thinking=False
-            )
+            prompt = self.direct_prompt(state, row)
             logits = self._last_logits([self._checked(self.encode(prompt))])[0]
             return [float(logits[t]) / self.temperature for t in self.letter_ids[: len(row.options)]]
         if self.yes_no is None:
@@ -235,12 +244,7 @@ class SemIf:
         for state, questions in requests:
             for q in questions.values():
                 row = to_row(q, self.max_options)
-                prompt = self.tokenizer.apply_chat_template(  # ty: ignore[unresolved-attribute]
-                    direct_messages(state, row),
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    enable_thinking=False,
-                )
+                prompt = self.direct_prompt(state, row)
                 prompts.append(self._checked(self.encode(prompt)))
         ids, mask = self._pad(prompts)
         return Prepared(ids=ids, mask=mask, decisions=len(prompts), real_tokens=sum(len(p) for p in prompts))
@@ -285,6 +289,11 @@ class SemIf:
         torch.cuda.empty_cache()
 
 
+def close_think(prompt: str) -> str:
+    """`prompt` with an open trailing `<think>` closed by an empty thought (LFM2.5's `<think>...</think>`)."""
+    return prompt + "</think>" if prompt.endswith("<think>") else prompt
+
+
 def single_token(tokenizer: object, text: str) -> int:
     ids = tokenizer.encode(text, add_special_tokens=False)  # ty: ignore[unresolved-attribute]
     if len(ids) != 1 or tokenizer.decode(ids) != text:  # ty: ignore[unresolved-attribute]
@@ -313,6 +322,8 @@ def build(spec: ModelSpec, settings: dict[str, Scalar]) -> SemIf:
     cls = transformers.AutoModelForCausalLM
     if config.model_type in ("qwen3_5", "qwen3_5_text"):  # the VLM checkpoint's text tower, as upstream
         cls, config = transformers.Qwen3_5ForCausalLM, config.get_text_config()
+    elif config.model_type == "lfm2_vl":  # the whole VLM (vision tower idle): its forward takes text alone
+        cls = transformers.AutoModelForImageTextToText
     load_kw: dict[str, object] = {}
     if experts := get_str(settings, "semif_experts_implementation", ""):  # "" = transformers' default
         load_kw["experts_implementation"] = experts
@@ -342,6 +353,7 @@ def build(spec: ModelSpec, settings: dict[str, Scalar]) -> SemIf:
         letter_ids=letters,
         yes_no=(single_token(tok, "no"), single_token(tok, "yes")) if mode == "reranker" else None,
         temperature=get_float(settings, "semif_temperature", 1.0),
+        close_think=get_bool(settings, "semif_close_think", False),
         hf_config=dict(config.to_dict()),
         ceilings=ceilings,
     )

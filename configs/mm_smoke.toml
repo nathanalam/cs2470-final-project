@@ -1,0 +1,38 @@
+# Smoke for the multimodal experiment (docs/multimodal.md) on one Modal L4, d1-3b.eager: 20 ImajevBench rows
+# through `imajev`, then `vl_batch` at one image size and two batch sizes with the packed-vs-engine check.
+# Checks the pipeline (dataset fetch, image path, packed batches, vision spans, write-back), not the numbers.
+#   uv run --group modal s1 submit configs/mm_smoke.toml
+benchmarks = ["imajev", "vl_batch"]
+
+[launch]
+orchestrator = "modal"
+gpu = "L4"
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "00:40:00"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+require_gpu = "L4"
+dtype = "bfloat16"
+max_prompt_tokens = 16384
+
+[params]
+model = "d1-3b.eager"
+imajev_limit = 20
+imajev_seed = 0
+vl_batch_arms = "image,text,none"
+vl_batch_tokenizer_file = "$MODELS_DIR/d1-3B/tokenizer.json"
+vl_batch_seed = 0
+vl_batch_min_decisions = 8
+vl_batch_min_batches = 2
+vl_batch_trace = 1
+vl_batch_check = true
+vl_batch_check_rows = 4
+
+[grid]
+vl_batch_image_px = [384]
+vl_batch_sizes = [1, 4]
