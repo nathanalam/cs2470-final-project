@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import sqlite3
+import threading
 from typing import override
 
 import pytest
@@ -347,8 +348,54 @@ def test_inline_is_the_default_and_records_no_prep_time(tmp_path, monkeypatch):
 def test_pretokenized_needs_the_split_methods(tmp_path, monkeypatch):
     with pytest.raises(TypeError, match="prepare_batch"):
         _run(tmp_path, monkeypatch, FakeBatched(), batch_host_prep="pretokenized")
+    with pytest.raises(TypeError, match="overlapped needs"):
+        _run(tmp_path, monkeypatch, FakeBatched(), batch_host_prep="overlapped")
     with pytest.raises(ValueError, match="batch_host_prep"):
-        _run(tmp_path, monkeypatch, FakePrepared(), batch_host_prep="overlapped")
+        _run(tmp_path, monkeypatch, FakePrepared(), batch_host_prep="streamed")
+
+
+class FakePinned(FakePrepared):
+    def __init__(self):
+        super().__init__()
+        self.pinned = 0
+        self.threads: set[str] = set()
+
+    @override
+    def prepare_batch(self, requests):
+        self.threads.add(threading.current_thread().name)
+        return super().prepare_batch(requests)
+
+    def pin_batch(self, prepared):
+        self.pinned += 1
+        return prepared
+
+
+def test_overlapped_prepares_on_a_thread_and_keeps_prep_in_the_wall(tmp_path, monkeypatch):
+    model = FakePinned()
+    m = _run(tmp_path, monkeypatch, model, batch_host_prep="overlapped").results["batch"]
+    assert model.threads and all(t.startswith("batch-prep") for t in model.threads)
+    assert model.pinned == model.prepared
+    assert "batch_s16_b1_prep_ms" not in m  # prep is inside wall_ms, not taken out of it
+    assert m["batch_s16_b1_prep_wait_ms"] >= 0 and m["batch_s64_b8_prep_wait_ms"] >= 0
+    assert m["batch_s16_b8_decisions_per_s"] > 0
+
+
+def test_overlap_prefetches_the_next_batch_and_wraps():
+    order: list[str] = []
+    ov = batch_sweep.Overlap(
+        [[("a", {})], [("b", {})], [("c", {})]],
+        prepare=lambda r: (order.append(f"prep {r[0][0]}"), r[0][0])[1],
+        run=lambda p: (order.append(f"run {p}"), {"decisions": 1})[1],
+    )
+    try:
+        for i in (0, 1, 2, 0):
+            ov.call(i)
+    finally:
+        ov.close()
+    runs = [o for o in order if o.startswith("run")]
+    assert runs == ["run a", "run b", "run c", "run a"]
+    assert order.count("prep a") == 2 and order.count("prep b") == 1  # wrapped prefetch of a, b never twice
+    assert len(ov.waits_ms) == 4
 
 
 def test_benchmark_rejects_models_without_decide_batch():
