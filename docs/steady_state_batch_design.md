@@ -1,6 +1,10 @@
 # Picking the steady-state batch automatically: design (2026-11-22)
 
-Status: **design only, nothing implemented.** No GPU or Modal time was spent. The numbers below come from the
+Status: **implemented** in `src/s1/steady_state.py` (usage and the table: `docs/steady_state_batch.md`), with
+the simple formula and the table-decides default policy. Not implemented yet from section 5: the
+halve-once fallback on OOM, recording vLLM's `max_num_batched_tokens`, the report's "picked by" column and
+bracket drift check, and the `vl_batch` hook (that benchmark is on the multimodal branch). No GPU or Modal
+time was spent. The numbers below come from the
 committed records (`results/*.json`), `results/steady_state_findings.md`, `docs/multimodal.md` on
 `claude/multimodal-exp-53e3b0`, and a web literature pass (sources are cited inline).
 

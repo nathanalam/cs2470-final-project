@@ -88,6 +88,11 @@ you're testing (model, sample size, seed) in `[params]` or `[sweep]`. **Always r
 smoke config first.** The 2k sample gives ±2-point accuracy CIs, and the full JEVal run takes ~5 h
 on A10G.
 
+**Compare models at their steady-state batch, and let the code pick it.** Write `batch_sizes = ["steady"]`
+in `[grid]` (or `jeval_concurrency = "steady"` for OpenJev on vLLM). The runner looks up the measured batch
+for the GPU it landed on in `src/s1/steady_state.py`; a pair the table lacks fails before the model loads.
+`docs/steady_state_batch.md` has the table and how to add a row after a sweep.
+
 **GPU-efficiency questions need `gpu_metrics = "detailed"`** (see "GPU metrics"): request-shape sweeps and
 anything asking whether the GPU is used well. A run without it cannot separate shapes (pooled utilization
 saturates), so treat it as inconclusive for that question. Accuracy-only runs stay `basic`.

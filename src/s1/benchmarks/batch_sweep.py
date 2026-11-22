@@ -27,6 +27,7 @@ again timed. Per point, `batch_s<L>_b<B>_*`:
     launch_api_ms             host time in kernel/graph launch calls per batch
     kernel_busy, cpu_share    kernel_ms / wall_ms and 1 - that: how much of the latency the GPU computes
     kernels_per_forward
+    peak_mb                   peak GPU memory allocated over the point (torch.cuda, when CUDA is up)
     oom                       1 when the point ran out of GPU memory (its other keys are then absent)
 
 The kernel trace runs after the timed pass on `batch_trace` batches; its wall time is never used (tracing
@@ -48,6 +49,10 @@ implement
 and decide_batch(r) must equal run_batch(prepare_batch(r)). Every batch of a point is prepared before its
 warm-up, outside the timed and traced passes (a server tokenizes in another process, overlapped with the
 GPU), and `batch_s<L>_b<B>_prep_ms` records the host preparation time per batch that wall_ms then leaves out.
+
+`batch_sizes = ["steady"]` (or `["steady-bracket"]`) in [grid] makes the runner pick the steady-state batch
+per length for the GPU the run is on (src/s1/steady_state.py) and set `batch_sizes_at = "128:32,1024:16"`;
+the benchmark then runs only that size at each length (or half, it and double for the bracket).
 
 The model may implement `after_warmup()` (called after each point's warm-up; kev captures pending CUDA
 graphs) and `profiler(on)` (needed for batch_nsys).
@@ -71,7 +76,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
-from .. import env, flops, nsys
+from .. import env, flops, nsys, steady_state
 from ..record import Metrics
 from ..registry import Settings, benchmark, get_int, get_str, note
 from . import jeval, roofline
@@ -249,6 +254,23 @@ def _is_oom(e: BaseException) -> bool:
     return "out of memory" in str(e).lower() or type(e).__name__ == "OutOfMemoryError"
 
 
+def _reset_peak() -> bool:
+    """Start a point's peak-memory window; False (no peak_mb) without CUDA, e.g. under test fakes."""
+    import sys  # noqa: PLC0415
+
+    torch = sys.modules.get("torch")
+    if torch is None or not torch.cuda.is_available():
+        return False
+    torch.cuda.reset_peak_memory_stats()
+    return True
+
+
+def _peak_mb() -> float:
+    import sys  # noqa: PLC0415
+
+    return float(sys.modules["torch"].cuda.max_memory_allocated()) / 1e6
+
+
 def _free_cuda() -> None:
     import gc  # noqa: PLC0415
     import sys  # noqa: PLC0415
@@ -286,11 +308,12 @@ def run(model: object, settings: Settings) -> Metrics:
     traced_n = get_int(settings, "batch_trace", 2)
     out: Metrics = {}
     for length in lengths:
-        for size in sizes:
+        for size in steady_state.sizes_for(settings, length, sizes):
             prefix = f"batch_s{length}_b{size}_"
             plan = batches(pool[length], size, settings)
             try:
                 calls, prep_ms = plan_calls(m, plan, host_prep)
+                peak = _reset_peak()
                 for call in calls:  # warm-up: every shape once, untimed
                     call()
                 if callable(after_warmup):
@@ -310,6 +333,8 @@ def run(model: object, settings: Settings) -> Metrics:
                 print(f"batch: L={length} B={size} out of memory", flush=True)
                 continue
             out |= point(prefix, timed, size, trace, min(traced_n, len(plan)))
+            if peak:
+                out[f"{prefix}peak_mb"] = _peak_mb()
             if not math.isnan(prep_ms):
                 out[f"{prefix}prep_ms"] = prep_ms
             print(
