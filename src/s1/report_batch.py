@@ -45,7 +45,7 @@ BASE_VARIANT = {
 DEFAULT_EXPERTS = ("", "grouped_mm")  # transformers' default MoE dispatch (absent in older records)
 DASHES = ("", "6 3", "2 3", "8 3 2 3")  # variant index -> stroke-dasharray
 DASH_OF = {"CUDA graphs": 1, "torch.compile": 2, "compile + graphs": 3,
-           "pretokenized": 1, "eager experts": 2, "pretokenized, eager experts": 3}  # fmt: skip
+           "pretokenized": 1, "overlapped": 1, "eager experts": 2, "pretokenized, eager experts": 3}  # fmt: skip
 CSS = """
 :root{--bs-0:#2a78d6;--bs-1:#eb6834;--bs-2:#1baf7a;--bs-3:#eda100;--bs-4:#e87ba4;--bs-5:#008300;
   --bs-6:#52514e;--bs-gpu:#2a78d6;--bs-ref:#52514e}

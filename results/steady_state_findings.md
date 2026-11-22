@@ -12,3 +12,19 @@ From the records of 2026-11-09 to 2026-11-19.
 - The A100s differ: the 2026-11-19 runs are on an **A100 80GB PCIe** (300 W), the 2026-11-08 runs and all batch records on an **A100-SXM4-80GB** (400 W). The 11-08 SXM4 run's 2.49 q/s at concurrency 8 (200 questions) does not compare directly with the PCIe card's 2.22 (1,000 questions).
 - **Kev-4B at 1024 tokens on the H100, H200 and B200 sits at kernel_busy 0.22-0.32 and 10-14 decisions/s at every batch size**, no faster than on the A100 (0.82-0.86, 14/s). Batching does not help it there, so something outside the GPU limits it. It needs a trace before any claim about it.
 - Qwen3.5-9B and JevK5-9B have identical JEVal accuracy and invalid counts (56.6%, 49/200) with different ECE (0.103 vs 0.075), and near-identical batch curves. That is plausible for a fine-tune of the same base, but it is worth checking that the runs loaded different weights.
+
+### B\* per model x GPU (records to 2026-11-22)
+
+B\* at 128 / 1024 tokens; "none (x)" = no batch reaches kernel_busy 0.95 without a larger one beating it by 5%, x = best kernel_busy. Inline prep unless noted.
+
+- **lfm2-8b-a1b**, overlapped prep: A100 PCIe 32 / 32 · H100 32 / 16 · H200 32 / 8 · B200 32 / 16. L4 (inline): none (0.95) / none (0.94), OOM at 32-64 (1024 tokens).
+- **qwen3-8b**: L4 4 / 1 · A100 SXM4 1 / 1 · H100 4 / 4 · H200 4 / 4 · B200 none (0.97, still gaining) / 4.
+- **kev-4b.hybrid**: L4 8 / 1 · A100 SXM4 16 / none (0.86) · H100, H200, B200 none (0.90-0.97 at B = 1) / none (0.26-0.32).
+- **kev-4b.qwen3**: L4 none (0.86 at B = 1; batching is slower, 13 -> 11 decisions/s) / 1.
+- **qwen35-9b**: L4 4 / 1. **jevk5-9b**: L4 2 / 1.
+- **olmoe-1b-7b**: L4 none (0.93; throughput peaks at B = 4, 15/s) / 1, OOM at 32-64 (1024 tokens).
+- **laya.english**: none on every GPU (best 0.95 on the L4 at B = 64 / 0.90). **laya.multilingual**: L4 none (0.86) / none (0.85).
+- **granite4-h-tiny**: cannot batch on the L4. Without mamba-ssm/causal-conv1d (`env_mamba_ssm = absent`), transformers' plain-torch Mamba2 scan allocates ~9 GiB per row: B = 1 runs at 0.5 decisions/s (128 tokens), and every B >= 2 (and B = 1 at 1024 tokens) runs out of memory. It needs the fused kernels in the image before it can be swept.
+- **elephant-1, bongard-mini, d1-3B (text)**: cannot batch. No `decide_batch` yet. d1's packed path in PR #18 already takes text requests, so its text path needs only that PR plus a config; bongard needs per-row encoder states (its runtime assumes one shared state); elephant needs a batched op in its worker protocol.
+
+**Host prep, three ways on one H100** (records 20261122-175101/-175309/-175440): inline never reaches 0.95 (0.90 at B = 64), while pretokenized and **overlapped** (batch i+1 prepared on a CPU thread while batch i runs, prep kept in the wall time) both reach B\* 32 / 16 at 121 / 49 decisions/s. Overlapping hides the prep completely from B = 4 up (mean wait 0.01 ms at B = 64), so the pretokenized numbers are what a serving loop gets.
