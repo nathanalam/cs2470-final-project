@@ -33,7 +33,10 @@ Default setup, **batch at 128-token / 1024-token states**. `*` = 95% busy not re
 | qwen35-9b.zeroshot | 4 / 1 | - | - | - | - | - |
 | jevk5-9b | 2 / 1 | - | - | - | - | - |
 | kev-4b.hybrid | 8 / 1 | 16 / 2* | - | 16 / 2* | 16 / 2* | 16 / 8* |
-| lfm2-8b-a1b.zeroshot | 2 / 1* | 32 / 32* | - | 32 / 16 (pretokenized) | 32 / 16* | 32 / 16* |
+| lfm2-8b-a1b.zeroshot | 2 / 1* | 32 / 32* | 32 / 32 (overlapped) | 32 / 16 (overlapped) | 32 / 8 (overlapped) | 32 / 16 (overlapped) |
+| kev-4b.qwen3 | 1 / 1* | - | - | - | - | - |
+| olmoe-1b-7b.zeroshot | 2 / 1* | - | - | - | - | - |
+| laya.multilingual | 8 / 4* | - | - | - | - | - |
 | laya.english | 8 / 4* | 32 / 32* | - | 64 / 32* | 64 / 32* | 32 / 16* |
 | openjev | - | - | concurrency 8 | concurrency 8 | concurrency 8 | concurrency 8 |
 
@@ -41,8 +44,13 @@ Default setup, **batch at 128-token / 1024-token states**. `*` = 95% busy not re
   tokens per request and "1024" about 1,300.
 - A big model on a slow GPU is busy from batch 1-4 (9B models on the L4). A small model on a fast GPU needs
   many requests at once (LFM2, 1.5B active parameters, needs 32 on the H100).
-- LFM2 on the H100 only reaches steady state with prompts tokenized ahead of time
-  (`batch_host_prep = "pretokenized"`), so that is the setup the table picks there.
+- LFM2 only reaches steady state when prompt prep stays off the GPU's critical path. With
+  `batch_host_prep = "overlapped"` (batch i+1 is tokenized on a CPU thread while batch i runs; the prep stays
+  inside the wall time, as in a serving loop) it reaches 95% busy on the A100 PCIe, H100, H200 and B200, so
+  that is the setup the table picks there (records from #21). `"pretokenized"` gives the same batch on the
+  H100. With inline prep it only reaches a plateau.
+- granite4-h-tiny has no row: on the current L4 image (no mamba-ssm kernels) every batch >= 2 runs out of
+  memory.
 - Not here: elephant-1 and bongard-mini (no batched path); `"steady"` is an error for them. d1-3B batches
   through its packed path (`vl_batch`, PR #18), but its steady-state batches are not in this table yet, so a
   `"steady"` run of it fails as missing (`docs/multimodal.md` has its measured B\*).
@@ -66,7 +74,7 @@ When the run starts, the runner:
    wrong).
 2. **Looks up the table** for that model, setup and GPU, and takes the value for the nearest measured
    length within 2x (64-256 tokens use the 128 entry, 512-2048 the 1024 entry). If the entry was measured
-   with a particular setup (pretokenized prompts, a Laya mode), the run uses that setup unless the config sets
+   with a particular setup (overlapped prompt prep, a Laya mode), the run uses that setup unless the config sets
    it.
 3. **Runs only that batch** at each length (or half, it and double with `"steady-bracket"`).
 4. **Records what it chose and why** in the run's params: `batch_sizes_at` (e.g. `"128:32,1024:16"`),
@@ -131,6 +139,9 @@ Every entry, with the setup it was measured under and its source run (all on Mod
 | jevk5-9b | L4 | inline prep | 2 | 1 | yes | 20261119-230530-ed7206a6 |
 | kev-4b.hybrid | L4 | default | 8 | 1 | yes | 20261109-230438-4ddb0b2d |
 | lfm2-8b-a1b.zeroshot | L4 | inline prep | 2 | 1 | no (plateau) | 20261119-224843-9162d873 |
+| kev-4b.qwen3 | L4 | default | 1 | 1 | 128: plateau, 1024: reached | 20261122-174224-2b9402d0 |
+| olmoe-1b-7b.zeroshot | L4 | inline prep | 2 | 1 | 128: plateau, 1024: reached | 20261122-182750-d8dc8419 |
+| laya.multilingual | L4 | eager mode | 8 | 4 | no (plateau) | 20261122-182531-9bfa76ff |
 | laya.english | L4 | eager mode | 8 | 4 | no (plateau) | 20261109-205307-30a4666a |
 | laya.english | L4 | graphs mode | 4 | 4 | no (plateau) | 20261109-205548-b5716441 |
 | laya.english | L4 | compile mode | 8 | 16 | no (plateau) | 20261109-205821-652d33c6 |
@@ -138,11 +149,13 @@ Every entry, with the setup it was measured under and its source run (all on Mod
 | qwen3-8b.zeroshot | A100-SXM4 | inline prep | 1 | 1 | yes | 20261109-231247-cc3371f7 |
 | kev-4b.hybrid | A100-SXM4 | default | 16 | 2 | 128: reached, 1024: plateau | 20261109-230438-7a7d5a81 |
 | lfm2-8b-a1b.zeroshot | A100-SXM4 | inline prep | 32 | 32 | no (plateau) | 20261119-222604-2a4972b9 |
+| lfm2-8b-a1b.zeroshot | A100-PCIe | overlapped prep | 32 | 32 | yes | 20261122-181032-8ea3ce5e |
 | laya.english | A100-SXM4 | eager mode | 32 | 32 | no (plateau) | 20261109-230437-6351524c |
 | laya.english | A100-SXM4 | graphs mode | 32 | 32 | no (plateau) | 20261109-230556-bc2c7922 |
 | laya.english | A100-SXM4 | compile mode | 32 | 32 | no (plateau) | 20261109-230701-057912aa |
 | laya.english | A100-SXM4 | compile_graphs mode | 32 | 32 | no (plateau) | 20261109-230957-e4075dcf |
 | qwen3-8b.zeroshot | H100 | inline prep | 4 | 4 | yes | 20261109-211259-b63a8b3e |
+| lfm2-8b-a1b.zeroshot | H100 | overlapped prep | 32 | 16 | yes | 20261122-175440-dc068906 |
 | lfm2-8b-a1b.zeroshot | H100 | pretokenized prep | 32 | 16 | yes | 20261119-230040-acb6fcff |
 | lfm2-8b-a1b.zeroshot | H100 | inline prep | 32 | 16 | no (plateau) | 20261119-222604-5a3f7682 |
 | kev-4b.hybrid | H100 | default | 16 | 2 | no (plateau) | 20261109-205016-9d8b32e6 |
@@ -151,6 +164,7 @@ Every entry, with the setup it was measured under and its source run (all on Mod
 | laya.english | H100 | compile mode | 64 | 32 | no (plateau) | 20261109-230730-559ab4d1 |
 | laya.english | H100 | compile_graphs mode | 64 | 32 | no (plateau) | 20261109-231109-e21280ed |
 | qwen3-8b.zeroshot | H200 | inline prep | 4 | 4 | yes | 20261109-231248-7eb18713 |
+| lfm2-8b-a1b.zeroshot | H200 | overlapped prep | 32 | 8 | yes | 20261122-181037-5b2031f6 |
 | lfm2-8b-a1b.zeroshot | H200 | inline prep | 32 | 16 | no (plateau) | 20261119-222601-ced5a93f |
 | kev-4b.hybrid | H200 | default | 16 | 2 | no (plateau) | 20261109-230438-b785789f |
 | laya.english | H200 | eager mode | 64 | 32 | no (plateau) | 20261109-230438-3115efc1 |
@@ -158,6 +172,7 @@ Every entry, with the setup it was measured under and its source run (all on Mod
 | laya.english | H200 | compile mode | 32 | 32 | no (plateau) | 20261109-230702-5f3feeec |
 | laya.english | H200 | compile_graphs mode | 32 | 32 | no (plateau) | 20261109-230958-c55ccaa2 |
 | qwen3-8b.zeroshot | B200 | inline prep | 64 | 4 | 128: plateau, 1024: reached | 20261109-231135-fd87886c |
+| lfm2-8b-a1b.zeroshot | B200 | overlapped prep | 32 | 16 | yes | 20261122-181855-63c8017d |
 | lfm2-8b-a1b.zeroshot | B200 | inline prep | 32 | 16 | no (plateau) | 20261119-222600-33e72d92 |
 | kev-4b.hybrid | B200 | default | 16 | 8 | no (plateau) | 20261109-230440-c7b126b6 |
 | laya.english | B200 | eager mode | 32 | 16 | no (plateau) | 20261109-230438-6835673b |

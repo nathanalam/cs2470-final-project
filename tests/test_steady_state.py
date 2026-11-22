@@ -110,7 +110,9 @@ def test_doc_embeds_the_current_tables():
 
 def test_lookup_prefers_reached_and_respects_explicit_setup():
     e = lookup("lfm2-8b-a1b.zeroshot", "H100", {})
-    assert e is not None and e.variant["batch_host_prep"] == "pretokenized" and e.at == {128: 32, 1024: 16}
+    assert e is not None and e.variant["batch_host_prep"] == "overlapped" and e.at == {128: 32, 1024: 16}
+    pretok = lookup("lfm2-8b-a1b.zeroshot", "H100", {"batch_host_prep": "pretokenized"})
+    assert pretok is not None and pretok.runs == ("20261119-230040-acb6fcff",)
     inline = lookup("lfm2-8b-a1b.zeroshot", "H100", {"batch_host_prep": "inline"})
     assert inline is not None and set(inline.status.values()) == {PLATEAU}
     assert lookup("lfm2-8b-a1b.zeroshot", "H100", {"semif_experts_implementation": "eager"}) is None
@@ -136,10 +138,10 @@ def test_resolve_table_pick_and_record_fields():
     assert out.grid == {"batch_sizes": [16, 32]}
     p = out.params
     assert p["batch_sizes_at"] == "128:32,1024:16" and p["steady_bracket"] is False
-    assert p["batch_host_prep"] == "pretokenized"  # the entry's setup is applied
+    assert p["batch_host_prep"] == "overlapped"  # the entry's setup is applied
     assert "semif_experts_implementation" not in p  # defaults are not written
     assert p["steady_source"] == "table" and p["steady_status"] == "128:reached,1024:reached"
-    assert p["steady_runs"] == "20261119-230040-acb6fcff" and p["steady_gpu"] == "H100"
+    assert p["steady_runs"] == "20261122-175440-dc068906" and p["steady_gpu"] == "H100"
     assert p["steady_rule"] == steady_state.RULE and p["steady_policy"] == "table"
 
 

@@ -96,7 +96,7 @@ GPUS: dict[str, Gpu] = {
     "A10G": Gpu(1_500, 21.5, False),
     "RTX-PRO-4500": Gpu(2_000, 29.0, False),
     "A100-SXM4": Gpu(3_000, 72.0, True),
-    "A100-PCIe": Gpu(3_000, 72.0, False),  # same chip as the SXM4; batch never swept on the PCIe card
+    "A100-PCIe": Gpu(3_000, 72.0, True),  # same chip as the SXM4; LFM2 swept here (#21)
     "L40S": Gpu(3_000, 43.0, False),
     "H100": Gpu(6_000, 72.0, True),
     "H200": Gpu(6_000, 127.0, True),
@@ -128,7 +128,9 @@ def gpu_key(detected: str) -> str:
 
 # Batch entries: the `batch` benchmark at state lengths 128 and 1024 (rows are ~L + 270 tokens), Modal hosts,
 # transformers' default MoE dispatch. Status R = kernel_busy >= 0.95 reached, P = only the throughput plateau.
-# Of several entries for one model x GPU, `lookup` prefers more lengths reached, then the first listed.
+# Of several entries for one model x GPU, `lookup` prefers more lengths reached, then the first listed: LFM2's
+# overlapped rows come first (prep runs on a CPU thread during the previous batch and stays in the wall time).
+# granite4-h-tiny has no row: on the L4 image (no mamba-ssm) every B >= 2 runs out of memory (#21).
 # tests/test_steady_state.py recomputes every row from its run.
 _BATCH = """
 # model               gpu        b128 b1024 s128 s1024 run                       setup
@@ -137,6 +139,9 @@ qwen35-9b.zeroshot    L4         4    1     R    R     20261119-225425-e0d0badf 
 jevk5-9b              L4         2    1     R    R     20261119-230530-ed7206a6  batch_host_prep=inline
 kev-4b.hybrid         L4         8    1     R    R     20261109-230438-4ddb0b2d  -
 lfm2-8b-a1b.zeroshot  L4         2    1     P    P     20261119-224843-9162d873  batch_host_prep=inline,semif_experts_implementation=
+kev-4b.qwen3          L4         1    1     P    R     20261122-174224-2b9402d0  -
+olmoe-1b-7b.zeroshot  L4         2    1     P    R     20261122-182750-d8dc8419  batch_host_prep=inline,semif_experts_implementation=
+laya.multilingual     L4         8    4     P    P     20261122-182531-9bfa76ff  laya_mode=eager
 laya.english          L4         8    4     P    P     20261109-205307-30a4666a  laya_mode=eager
 laya.english          L4         4    4     P    P     20261109-205548-b5716441  laya_mode=graphs
 laya.english          L4         8    16    P    P     20261109-205821-652d33c6  laya_mode=compile
@@ -144,11 +149,13 @@ laya.english          L4         16   16    P    P     20261109-210356-5f94a8be 
 qwen3-8b.zeroshot     A100-SXM4  1    1     R    R     20261109-231247-cc3371f7  batch_host_prep=inline
 kev-4b.hybrid         A100-SXM4  16   2     R    P     20261109-230438-7a7d5a81  -
 lfm2-8b-a1b.zeroshot  A100-SXM4  32   32    P    P     20261119-222604-2a4972b9  batch_host_prep=inline,semif_experts_implementation=
+lfm2-8b-a1b.zeroshot  A100-PCIe  32   32    R    R     20261122-181032-8ea3ce5e  batch_host_prep=overlapped,semif_experts_implementation=
 laya.english          A100-SXM4  32   32    P    P     20261109-230437-6351524c  laya_mode=eager
 laya.english          A100-SXM4  32   32    P    P     20261109-230556-bc2c7922  laya_mode=graphs
 laya.english          A100-SXM4  32   32    P    P     20261109-230701-057912aa  laya_mode=compile
 laya.english          A100-SXM4  32   32    P    P     20261109-230957-e4075dcf  laya_mode=compile_graphs
 qwen3-8b.zeroshot     H100       4    4     R    R     20261109-211259-b63a8b3e  batch_host_prep=inline
+lfm2-8b-a1b.zeroshot  H100       32   16    R    R     20261122-175440-dc068906  batch_host_prep=overlapped,semif_experts_implementation=
 lfm2-8b-a1b.zeroshot  H100       32   16    R    R     20261119-230040-acb6fcff  batch_host_prep=pretokenized,semif_experts_implementation=
 lfm2-8b-a1b.zeroshot  H100       32   16    P    P     20261119-222604-5a3f7682  batch_host_prep=inline,semif_experts_implementation=
 kev-4b.hybrid         H100       16   2     P    P     20261109-205016-9d8b32e6  -
@@ -157,6 +164,7 @@ laya.english          H100       64   16    P    P     20261109-230623-02c3b499 
 laya.english          H100       64   32    P    P     20261109-230730-559ab4d1  laya_mode=compile
 laya.english          H100       64   32    P    P     20261109-231109-e21280ed  laya_mode=compile_graphs
 qwen3-8b.zeroshot     H200       4    4     R    R     20261109-231248-7eb18713  batch_host_prep=inline
+lfm2-8b-a1b.zeroshot  H200       32   8     R    R     20261122-181037-5b2031f6  batch_host_prep=overlapped,semif_experts_implementation=
 lfm2-8b-a1b.zeroshot  H200       32   16    P    P     20261119-222601-ced5a93f  batch_host_prep=inline,semif_experts_implementation=
 kev-4b.hybrid         H200       16   2     P    P     20261109-230438-b785789f  -
 laya.english          H200       64   32    P    P     20261109-230438-3115efc1  laya_mode=eager
@@ -164,6 +172,7 @@ laya.english          H200       64   64    P    P     20261109-230603-94e3dd99 
 laya.english          H200       32   32    P    P     20261109-230702-5f3feeec  laya_mode=compile
 laya.english          H200       32   32    P    P     20261109-230958-c55ccaa2  laya_mode=compile_graphs
 qwen3-8b.zeroshot     B200       64   4     P    R     20261109-231135-fd87886c  batch_host_prep=inline
+lfm2-8b-a1b.zeroshot  B200       32   16    R    R     20261122-181855-63c8017d  batch_host_prep=overlapped,semif_experts_implementation=
 lfm2-8b-a1b.zeroshot  B200       32   16    P    P     20261119-222600-33e72d92  batch_host_prep=inline,semif_experts_implementation=
 kev-4b.hybrid         B200       16   8     P    P     20261109-230440-c7b126b6  -
 laya.english          B200       32   16    P    P     20261109-230438-6835673b  laya_mode=eager
@@ -541,6 +550,6 @@ def summary_table() -> str:
             else:
                 cell = f"{e.at[128]} / {e.at[1024]}" + star
                 prep = e.variant.get("batch_host_prep")
-                cells.append(cell + (" (pretokenized)" if prep == "pretokenized" else ""))
+                cells.append(cell + (f" ({prep})" if prep in ("pretokenized", "overlapped") else ""))
         rows.append(f"| {model} | " + " | ".join(cells) + " |")
     return "\n".join(rows)

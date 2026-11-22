@@ -49,6 +49,11 @@ implement
 and decide_batch(r) must equal run_batch(prepare_batch(r)). Every batch of a point is prepared before its
 warm-up, outside the timed and traced passes (a server tokenizes in another process, overlapped with the
 GPU), and `batch_s<L>_b<B>_prep_ms` records the host preparation time per batch that wall_ms then leaves out.
+`batch_host_prep = "overlapped"` is what a serving loop sees: batch i+1 is prepared (and its host tensors
+pinned, if the model has `pin_batch(prepared)`) on one CPU thread while the GPU runs batch i, and prep stays
+inside the timing: each batch's wall_ms includes any wait for its own preparation to finish.
+`batch_s<L>_b<B>_prep_wait_ms` records that mean exposed wait per batch (0 when prep hides fully behind the
+forward). The prep thread shares the GIL with the forward's Python launches, so overlap is not free.
 
 `batch_sizes = ["steady"]` (or `["steady-bracket"]`) in [grid] makes the runner pick the steady-state batch
 per length for the GPU the run is on (src/s1/steady_state.py) and set `batch_sizes_at = "128:32,1024:16"`;
@@ -75,7 +80,8 @@ import math
 import statistics
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from .. import env, flops, nsys, steady_state
@@ -90,7 +96,7 @@ LENGTHS = "batch_state_tokens"
 
 Request = tuple[str, Mapping[str, object]]
 Call = Callable[[], Mapping[str, int]]
-HOST_PREP = ("inline", "pretokenized")
+HOST_PREP = ("inline", "pretokenized", "overlapped")
 
 
 class Batched(Protocol):
@@ -236,20 +242,67 @@ def _model(model: object) -> Batched:
     return model  # ty: ignore[invalid-return-type]
 
 
-def plan_calls(m: Batched, plan: Sequence[Sequence[jeval.Row]], host_prep: str) -> tuple[list[Call], float]:
-    """One call per batch of `plan` and the mean host preparation ms per batch (nan when inline: then the
-    preparation runs inside each call)."""
-    if host_prep == "inline":
-        return [lambda b=b: m.decide_batch(requests(b)) for b in plan], math.nan
+@dataclass
+class Overlap:
+    """Batch i+1 prepared on a CPU thread while batch i runs (batch_host_prep = overlapped). Calls may run in
+    any order (warm-up, timed, traced): a call whose batch was not prefetched prepares it on the thread and
+    waits; every call prefetches the next batch of the plan (the last one, the first)."""
+
+    reqs: list[list[Request]]
+    prepare: Callable[[Sequence[Request]], object]
+    run: Callable[[object], Mapping[str, int]]
+    pin: Callable[[object], object] | None = None
+    pool: ThreadPoolExecutor = field(default_factory=lambda: ThreadPoolExecutor(1, "batch-prep"))
+    pending: dict[int, Future[object]] = field(default_factory=dict)
+    waits_ms: list[float] = field(default_factory=list)
+
+    def _prep(self, i: int) -> object:
+        p = self.prepare(self.reqs[i])
+        return self.pin(p) if self.pin is not None else p
+
+    def _submit(self, i: int) -> Future[object]:
+        if i not in self.pending:
+            self.pending[i] = self.pool.submit(self._prep, i)
+        return self.pending[i]
+
+    def call(self, i: int) -> Mapping[str, int]:
+        t0 = time.perf_counter()
+        prepared = self._submit(i).result()
+        self.waits_ms.append((time.perf_counter() - t0) * 1e3)
+        del self.pending[i]
+        self._submit((i + 1) % len(self.reqs))  # wraps, so the next pass's first batch is ready too
+        return self.run(prepared)
+
+    def close(self) -> None:
+        self.pool.shutdown(wait=True, cancel_futures=True)
+        self.pending.clear()
+
+
+def _split(m: Batched, host_prep: str) -> tuple[Callable[..., object], Callable[..., Mapping[str, int]]]:
     prepare, run_batch = getattr(m, "prepare_batch", None), getattr(m, "run_batch", None)
     if not callable(prepare) or not callable(run_batch):
         raise TypeError(
-            f"batch_host_prep = pretokenized needs .prepare_batch() and .run_batch(); got {type(m).__name__}"
+            f"batch_host_prep = {host_prep} needs .prepare_batch() and .run_batch(); got {type(m).__name__}"
         )
+    return prepare, run_batch
+
+
+def plan_calls(
+    m: Batched, plan: Sequence[Sequence[jeval.Row]], host_prep: str
+) -> tuple[list[Call], float, Overlap | None]:
+    """One call per batch of `plan`, the mean host preparation ms per batch (nan unless pretokenized: inline
+    and overlapped prepare inside each call) and the overlap pipeline (overlapped only)."""
+    if host_prep == "inline":
+        return [lambda b=b: m.decide_batch(requests(b)) for b in plan], math.nan, None
+    prepare, run_batch = _split(m, host_prep)
+    if host_prep == "overlapped":
+        pin = getattr(m, "pin_batch", None)
+        ov = Overlap([requests(b) for b in plan], prepare, run_batch, pin if callable(pin) else None)
+        return [lambda i=i: ov.call(i) for i in range(len(plan))], math.nan, ov
     t0 = time.perf_counter()
     prepared = [prepare(requests(b)) for b in plan]
     prep_ms = (time.perf_counter() - t0) * 1e3 / len(plan)
-    return [lambda p=p: run_batch(p) for p in prepared], prep_ms
+    return [lambda p=p: run_batch(p) for p in prepared], prep_ms, None
 
 
 def _is_oom(e: BaseException) -> bool:
@@ -299,16 +352,12 @@ class _Sweep:
         m, prefix = self.m, f"batch_s{length}_b{size}_"
         plan = batches(self.pool[length], size, self.settings)
         after_warmup = getattr(m, "after_warmup", None)
+        peak = _reset_peak()
         try:
-            calls, prep_ms = plan_calls(m, plan, self.host_prep)
-            peak = _reset_peak()
-            for call in calls:  # warm-up: every shape once, untimed
-                call()
-            if callable(after_warmup):
-                after_warmup()
-            m.take_forwards()
-            timed = [time_batch(m, call, self.arch, self.sizes_kw) for call in calls]
-            trace = trace_batches(m, calls[: self.traced_n]) if self.traced_n else None
+            timed, trace, prep_ms, waits = measure_point(
+                m, plan, self.host_prep, after_warmup=after_warmup, traced_n=self.traced_n, arch=self.arch,
+                sizes_kw=self.sizes_kw,
+            )  # fmt: skip
         except Exception as e:
             if not _is_oom(e):
                 raise
@@ -323,6 +372,8 @@ class _Sweep:
             out[f"{prefix}peak_mb"] = _peak_mb()
         if not math.isnan(prep_ms):
             out[f"{prefix}prep_ms"] = prep_ms
+        if waits:
+            out[f"{prefix}prep_wait_ms"] = statistics.fmean(waits)
         print(
             f"batch: L={length} B={size} wall {out[f'{prefix}wall_ms']:.2f} ms, "
             f"{out[f'{prefix}tflops_wall']:.2f} TFLOP/s, "
@@ -372,6 +423,36 @@ def run(model: object, settings: Settings) -> Metrics:
         | {"batch_lengths": float(len(lengths)), "batch_sizes": float(len(sizes))}
         | out
     )
+
+
+def measure_point(
+    m: Batched,
+    plan: Sequence[Sequence[jeval.Row]],
+    host_prep: str,
+    *,
+    after_warmup: object,
+    traced_n: int,
+    arch: flops.Arch,
+    sizes_kw: Mapping[str, int],
+) -> tuple[list[Timed], Trace | None, float, list[float]]:
+    """One point: warm-up (every shape once, untimed), timed passes, then the trace. Returns the timed
+    batches, the trace, pretokenized's prep ms (else nan) and overlapped's per-batch prep waits."""
+    calls, prep_ms, overlap = plan_calls(m, plan, host_prep)
+    try:
+        for call in calls:
+            call()
+        if callable(after_warmup):
+            after_warmup()
+        m.take_forwards()
+        if overlap is not None:
+            overlap.waits_ms.clear()
+        timed = [time_batch(m, call, arch, sizes_kw) for call in calls]
+        waits = list(overlap.waits_ms) if overlap is not None else []
+        trace = trace_batches(m, calls[:traced_n]) if traced_n else None
+    finally:
+        if overlap is not None:
+            overlap.close()
+    return timed, trace, prep_ms, waits
 
 
 def time_batch(m: Batched, call: Call, arch: flops.Arch, sizes_kw: Mapping[str, int]) -> Timed:

@@ -1,0 +1,44 @@
+# Steady-state batch B* on the L4, second pass (2026-11-22): the batch-capable models with no L4 sweep yet.
+# kev-4b.hybrid, laya.english and qwen3-8b.zeroshot already have L4 records (20261109-230438-4ddb0b2d,
+# 20261109-182250-09cdeb2b, 20261109-231713-a38ec98c), so they are not rerun. Every setting matches
+# steady_state_batch_l4.toml (inline host prep, like every L4 row); only the model list changes. kev and laya
+# first. A point that runs out of memory is recorded as batch_s<L>_b<B>_oom = 1 and the sweep goes on.
+# Estimate: ~12 min per model, ~50 min on one L4 container, ~$0.8-1 on Modal.
+# Launch: uv run --group modal s1 <submit> configs/steady_state_batch_l4_b.toml
+benchmarks = ["batch"]
+
+[launch]
+orchestrator = "modal"
+gpu = "L4"
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "02:00:00"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+require_gpu = "L4"
+dtype = "bfloat16"
+measure_ceilings = true
+max_prompt_tokens = 16384
+semif_max_options = 16
+
+[params]
+batch_seed = 0
+batch_pool = 64
+batch_min_decisions = 32
+batch_min_batches = 4
+batch_trace = 2
+batch_warmup = 8
+batch_max_options = 16
+batch_max_question_tokens = 512
+batch_tokenizer_file = "$MODELS_DIR/Qwen3.5-4B-Base/tokenizer.json"
+
+[sweep]
+model = ["kev-4b.qwen3", "laya.multilingual", "olmoe-1b-7b.zeroshot", "granite4-h-tiny.zeroshot"]
+
+[grid]
+batch_state_tokens = [128, 1024]
+batch_sizes = [1, 2, 4, 8, 16, 32, 64]
