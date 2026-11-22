@@ -31,6 +31,9 @@ Settings (all optional):
     max_prompt_tokens  longest prompt (one pair, for the reranker)                default 16384
                        (upstream defaults to 4096; 16384 matches openjev's max_model_len)
     measure_ceilings   measure the GPU's roofline ceilings before loading         default false
+    semif_experts_implementation  MoE expert dispatch passed to from_pretrained (eager, grouped_mm, ...)
+                       default "" = transformers' choice (grouped_mm when the GPU supports it); recorded
+                       as env_experts_implementation
     dtype, require_gpu see backends/gpu.py
 """
 
@@ -133,6 +136,16 @@ def answer(row: Row, scores: Sequence[float]) -> dict[str, object]:
     return score_answer(scores)
 
 
+@dataclass(frozen=True)
+class Prepared:
+    """A batch after host preparation (SemIf.prepare_batch): left-padded ids and mask on the host."""
+
+    ids: torch.Tensor
+    mask: torch.Tensor
+    decisions: int
+    real_tokens: int
+
+
 @dataclass
 class SemIf:
     tokenizer: object
@@ -148,6 +161,7 @@ class SemIf:
     ceilings: dict[str, float] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
     recorder: profiling.ForwardRecorder | None = None
+    last_letter_logits: torch.Tensor | None = None  # run_batch's output (tests compare batched with batch 1)
 
     def encode(self, text: str) -> list[int]:
         return list(self.tokenizer.encode(text, add_special_tokens=False))  # ty: ignore[unresolved-attribute]
@@ -157,14 +171,30 @@ class SemIf:
             raise ValueError(f"{len(ids)} prompt tokens, over max_prompt_tokens={self.max_tokens}")
         return ids
 
-    def _last_logits(self, rows: list[list[int]]) -> torch.Tensor:
-        """Last-position logits for a left-padded batch of prompts, one forward pass."""
+    def _pad(self, rows: list[list[int]]) -> tuple[torch.Tensor, torch.Tensor]:
+        """A left-padded batch of prompts as host tensors (ids, mask), pinned when the model is on CUDA."""
         import torch  # noqa: PLC0415
 
         width = max(len(r) for r in rows)
         pad = self.tokenizer.pad_token_id  # ty: ignore[unresolved-attribute]
-        ids = torch.tensor([[pad] * (width - len(r)) + r for r in rows], device=self.device)
-        mask = torch.tensor([[0] * (width - len(r)) + [1] * len(r) for r in rows], device=self.device)
+        ids = torch.full((len(rows), width), pad, dtype=torch.long)
+        mask = torch.zeros((len(rows), width), dtype=torch.long)
+        for i, r in enumerate(rows):
+            ids[i, width - len(r) :] = torch.tensor(r, dtype=torch.long)
+            mask[i, width - len(r) :] = 1
+        if self.device.type == "cuda":
+            ids, mask = ids.pin_memory(), mask.pin_memory()
+        return ids, mask
+
+    def _last_logits(self, rows: list[list[int]]) -> torch.Tensor:
+        """Last-position logits for a left-padded batch of prompts, one forward pass."""
+        return self._forward(*self._pad(rows))
+
+    def _forward(self, ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        import torch  # noqa: PLC0415
+
+        ids = ids.to(self.device, non_blocking=True)
+        mask = mask.to(self.device, non_blocking=True)
         kwargs: dict[str, object] = {"input_ids": ids, "attention_mask": mask, "use_cache": False}
         if "logits_to_keep" in inspect.signature(self.model.forward).parameters:
             kwargs["logits_to_keep"] = 1
@@ -191,6 +221,34 @@ class SemIf:
     def decide(self, state: str, questions: Mapping[str, object]) -> dict[str, object]:
         rows = {key: to_row(q, self.max_options) for key, q in questions.items()}
         return {key: answer(row, self.scores(state, row)) for key, row in rows.items()}
+
+    def decide_batch(self, requests: Sequence[tuple[str, Mapping[str, object]]]) -> dict[str, int]:
+        """Every request's questions as rows of one left-padded forward (benchmarks/batch_sweep.py, direct
+        mode only): the option-letter logits are copied to the host, the softmax is skipped."""
+        return self.run_batch(self.prepare_batch(requests))
+
+    def prepare_batch(self, requests: Sequence[tuple[str, Mapping[str, object]]]) -> Prepared:
+        """decide_batch's host half: chat template, tokenize, left-pad into host tensors."""
+        if self.mode != "direct":
+            raise ValueError("decide_batch supports semif mode = direct only")
+        prompts: list[list[int]] = []
+        for state, questions in requests:
+            for q in questions.values():
+                row = to_row(q, self.max_options)
+                prompt = self.tokenizer.apply_chat_template(  # ty: ignore[unresolved-attribute]
+                    direct_messages(state, row),
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+                prompts.append(self._checked(self.encode(prompt)))
+        ids, mask = self._pad(prompts)
+        return Prepared(ids=ids, mask=mask, decisions=len(prompts), real_tokens=sum(len(p) for p in prompts))
+
+    def run_batch(self, prepared: Prepared) -> dict[str, int]:
+        """decide_batch's device half: copy in, one forward, the option-letter logits back to the host."""
+        self.last_letter_logits = self._forward(prepared.ids, prepared.mask)[:, self.letter_ids].cpu()
+        return {"decisions": prepared.decisions, "real_tokens": prepared.real_tokens}
 
     def profile_info(self) -> dict[str, object]:
         if self.recorder is None:
@@ -221,7 +279,8 @@ class SemIf:
 
         if self.recorder is not None:
             self.recorder.close()
-        self.model = self.recorder = None  # ty: ignore[invalid-assignment]
+        self.recorder = None
+        del self.model
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -254,12 +313,16 @@ def build(spec: ModelSpec, settings: dict[str, Scalar]) -> SemIf:
     cls = transformers.AutoModelForCausalLM
     if config.model_type in ("qwen3_5", "qwen3_5_text"):  # the VLM checkpoint's text tower, as upstream
         cls, config = transformers.Qwen3_5ForCausalLM, config.get_text_config()
+    load_kw: dict[str, object] = {}
+    if experts := get_str(settings, "semif_experts_implementation", ""):  # "" = transformers' default
+        load_kw["experts_implementation"] = experts
     loaded: object = cls.from_pretrained(
         model_dir,
         config=config,
         dtype=gpu.torch_dtype(settings),
         device_map={"": str(device)},
         output_loading_info=True,
+        **load_kw,
     )
     if not isinstance(loaded, tuple):
         raise TypeError("from_pretrained ignored output_loading_info")

@@ -22,9 +22,9 @@ def test_config_loads(path: Path) -> None:
 
 @pytest.mark.parametrize("path", CONFIGS, ids=lambda p: p.stem)
 def test_config_launch_table_parses(path: Path) -> None:
-    """[launch] is optional; when present it must parse, and it stays out of every RunSpec."""
-    res = config.load_launch(path)
-    if res is not None:
+    """[launch] is optional; when present it must parse (a `gpu` list included), and it stays out of every
+    RunSpec."""
+    if config.load_launches(path):
         assert all(
             "orchestrator" not in s.params and "orchestrator" not in s.invariants for s in config.load(path)
         )
@@ -33,8 +33,8 @@ def test_config_launch_table_parses(path: Path) -> None:
 @pytest.mark.parametrize("path", CONFIGS, ids=lambda p: p.stem)
 def test_modal_configs_collect_detailed_gpu_metrics(path: Path) -> None:
     """Every Modal GPU run records the detailed (schema 1) GPU metrics: clocks, throttle, memory, PCIe."""
-    res = config.load_launch(path)
-    if res is None or res.orchestrator != "modal" or res.gpu is None:
+    launches = config.load_launches(path)
+    if not any(r.orchestrator == "modal" and r.gpu is not None for r in launches):
         return
     for spec in config.load(path):
         settings = spec.invariants | spec.params

@@ -1,0 +1,43 @@
+# d1-3b.compiled replays on the five GPUs configs/roofline_d1_graph_warmup.toml did not cover. The six-GPU sweep
+# (configs/roofline_sweep_d1_lengths.toml) warmed each input size once, so its compiled rows timed CUDA graph
+# recording; the L40S re-run with the warm-up answered twice timed replays (11.7 ms vs eager 14.6 ms at 32
+# tokens). This is that re-run on the other GPUs, compiled only: eager is unchanged by the second warm-up
+# pass (the L40S repeat matched the sweep within 1 ms), so the sweep's eager rows stand.
+# Two questions: does compiled beat eager on every GPU once replayed, and do the H100 and H200 (AMD EPYC hosts in
+# the sweep, ~23 ms eager at 32 tokens against ~15 on the Intel-hosted L40S and B200) drop to the others' level
+# when graph replay removes the per-kernel CPU launches? If they do, their eager gap was host launch cost.
+# Then submit this config with the modal group, one GPU per submit (--gpu L4, A100-80GB, H100, H200, B200).
+benchmarks = ["roofline"]
+
+[launch]
+orchestrator = "modal"
+gpu = ["L4", "A100-80GB", "H100", "H200", "B200"]  # one container per GPU; require_gpu is set per GPU by the launcher
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "00:45:00"   # hard stop per GPU
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+dtype = "bfloat16"
+measure_ceilings = true
+max_prompt_tokens = 16384
+
+[params]
+roofline_limit = 200
+roofline_seed = 0
+roofline_max_tokens = 1024
+roofline_max_options = 16
+roofline_warmup = 320
+roofline_warmup_passes = 2  # each size's timed call is its 3rd, a replay
+roofline_counted = 8
+roofline_per_length = 40
+roofline_tokenizer_file = "$MODELS_DIR/Qwen3.5-4B-Base/tokenizer.json"
+
+[sweep]
+model = ["d1-3b.compiled"]
+
+[grid]
+roofline_state_tokens = [32, 128, 256, 512, 768, 1024, 1536, 2048]

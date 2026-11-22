@@ -19,4 +19,5 @@ src/s1/profiling.py|unresolved-import|Cannot resolve imported module `torch`
 src/s1/profiling.py|unresolved-import|Cannot resolve imported module `torch`
 src/s1/profiling.py|unresolved-import|Cannot resolve imported module `torch`
 src/s1/profiling.py|unresolved-import|Cannot resolve imported module `torch`
+src/s1/profiling.py|unresolved-import|Cannot resolve imported module `torch`
 src/s1/profiling.py|unsound-return-statement|Unsound return statement: `dict[str, str | Unknown]` is not a subtype of `dict[str, str]`

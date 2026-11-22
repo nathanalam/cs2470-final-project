@@ -1,0 +1,45 @@
+# Cold vs warm question shapes under Nsight Systems: is the short-state "overhead" mostly cuDNN building a
+# plan per new input shape? nsys_gm_test (qwen3-8b, H100, 512 tokens, warm-up on the profiled rows) had the
+# GPU busy 80% of each decision, where earlier nsys runs that profiled unseen rows found ~30%. Two runs, the
+# same model, GPU, length and 8 profiled rows; only the warm-up rows differ:
+#   warm  batch_nsys_warmup_offset = 0: the 8 warm-up decisions are the profiled rows (every shape seen)
+#   cold  batch_nsys_warmup_offset = 8: the warm-up answers 8 other rows, so each profiled shape is new
+# Compare batch_nsys_gpu_share and wall time per decision; meta.batch_nsys_kernels_top and the API time show
+# where the extra host time goes. GPU metrics stay on, so the same records also feed the length analysis.
+#   uv run --group modal s1 submit configs/nsys_cold_warm.toml --nsys 8
+benchmarks = ["batch"]
+
+[launch]
+orchestrator = "modal"
+gpu = ["H100"]
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "00:30:00"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+dtype = "bfloat16"
+measure_ceilings = false
+max_prompt_tokens = 20480
+semif_max_options = 16
+nsys_gpu_metrics = true
+
+[params]
+model = "qwen3-8b.zeroshot"
+batch_seed = 0
+batch_pool = 16  # rows 0..7 profiled, rows 8..15 the cold run's warm-up
+batch_warmup = 8
+batch_max_options = 16
+batch_max_question_tokens = 512
+batch_min_state_tokens = 16384  # the same rows as nsys_lengths.toml
+batch_tokenizer_file = "$MODELS_DIR/Qwen3.5-4B-Base/tokenizer.json"
+
+[sweep]
+batch_nsys_warmup_offset = [0, 8]
+
+[grid]
+batch_state_tokens = [512]
+batch_sizes = [1]

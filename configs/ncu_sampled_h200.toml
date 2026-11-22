@@ -1,0 +1,40 @@
+# configs/ncu_sampled_test.toml on an H200, lean metrics only: the kernel-level check of the H200 prediction.
+# On the H100 the first 200 kernels of one qwen3-8b question at 2,048 tokens split into compute-bound GEMMs and
+# attention (58% of kernel time) and memory-bound elementwise and norm kernels (42%), which predicts the H200
+# at 1 / (0.58 + 0.42 / 1.41) ~ 1.14x over the H100. Here the memory-bound classes should run ~1.4x faster
+# (roofline_hw_elementwise_ms, _norm_ms) and the compute-bound ones ~1.0x (gemm, attention). Same question,
+# same 200 kernels as the H100 lean record 20261115-063935-3c96498f.
+#   uv run --group modal s1 submit configs/ncu_sampled_h200.toml --ncu 1
+benchmarks = ["roofline"]
+
+[launch]
+orchestrator = "modal"
+gpu = ["H200"]  # require_gpu is set by the launcher
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "00:30:00"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+dtype = "bfloat16"
+measure_ceilings = false
+max_prompt_tokens = 20480
+semif_max_options = 16
+
+[params]
+model = "qwen3-8b.zeroshot"
+roofline_seed = 0
+roofline_max_options = 16
+roofline_warmup = 2
+roofline_counted = 0
+roofline_per_length = 2
+roofline_min_state_tokens = 16384  # the same questions as the ncu_lengths configs
+roofline_tokenizer_file = "$MODELS_DIR/Qwen3.5-4B-Base/tokenizer.json"
+ncu_launch_count = 200
+ncu_metrics = "lean"
+
+[grid]
+roofline_state_tokens = [2048]

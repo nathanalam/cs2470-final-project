@@ -1,0 +1,35 @@
+# CI GPU smoke (.github/workflows/ci.yml, job gpu-smoke): 5 real JEVal questions through a real model on one
+# Modal L4, end to end (image, weights from the s1-models volume, GPU sampling, record write-back).
+# It checks the pipeline runs cleanly, not accuracy: 5 questions say nothing about a model's score.
+# Pass: jeval_n = 5, jeval_invalid = 0, a resolved L4 and the detailed GPU keys (scripts/check_gpu_smoke.py).
+# ~1.5-2 min, ~$0.03-0.05 a run. The record is not committed: CI's runner is thrown away.
+#
+# OLMoE-1B-7B: the fastest L4 load of the M2 models (~20 s) and 14 GB bf16. Its context is 4k tokens, so
+# seed 21 is fixed: its 5 questions are 0.4-2.4k characters (well under 4096 tokens), cover choice, noul and
+# score, and have <= 4 options each. A different seed or model is a new smoke test; re-check those three.
+# Weights (once, already on the volume from M2): uv run --group modal s1 download allenai/OLMoE-1B-7B-0125-Instruct b89a7c4bc24fb9e55ce2543c9458ce0ca5c4650e
+# By hand: uv run --group modal s1 submit configs/ci_gpu_smoke_modal.toml
+benchmarks = ["jeval"]
+
+[launch]
+orchestrator = "modal"
+gpu = "L4"
+gpus = 1
+cpus = 4
+mem = "24G"
+time = "00:20:00"   # hard stop: a hung run costs at most ~20 min of L4
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+require_gpu = "L4"
+dtype = "bfloat16"
+max_prompt_tokens = 4096   # OLMoE's context: a longer prompt fails as invalid instead of running past it
+semif_max_options = 16
+
+[params]
+model = "olmoe-1b-7b.zeroshot"
+jeval_limit = 5
+jeval_seed = 21
+jeval_concurrency = 1

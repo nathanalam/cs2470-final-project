@@ -1,0 +1,42 @@
+# M4 GPU sweep: the two Laya checkpoints. STATE-LENGTH AXIS.
+# roofline_sweep_laya.toml plus [grid] roofline_state_tokens: 40 seeded JEVal questions whose own state
+# is at least 2048 reference tokens, each state cut to its first 32, 128, 256, 512, 768, 1024, 1536 and 2048
+# tokens (40 x 8 = 320 timed questions per model; the same questions at every length), so every model
+# crosses each GPU's ridge (measured 2026-11-08: A100 155, H200 161, B200 211, H100 227, L4 ~241 FLOP/byte).
+# Timing and roofline only: accuracy at cut lengths is not meaningful.
+# configs/roofline_l4_laya.toml (Nathan's cluster L4 settings: 200 questions, seed 0, same warmup and counted)
+# unchanged except where it runs: [launch] fans out across five Modal GPUs, gpu_metrics is detailed
+# (every Modal GPU run), and require_gpu comes from the launcher, one per GPU.
+#   uv run --group modal s1 submit configs/roofline_sweep_laya_lengths.toml              (all five GPUs)
+#   uv run --group modal s1 submit configs/roofline_sweep_laya_lengths.toml --gpu H100   (one of them)
+benchmarks = ["roofline"]
+
+[launch]
+orchestrator = "modal"
+gpu = ["L4", "A100-80GB", "H100", "H200", "B200"]  # one container per GPU, run concurrently; require_gpu is set per GPU by the launcher
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "02:00:00"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+measure_ceilings = true
+
+[params]
+roofline_limit = 200
+roofline_seed = 0
+roofline_max_tokens = 1024
+roofline_max_options = 16
+roofline_warmup = 8
+roofline_counted = 8
+roofline_per_length = 40
+roofline_tokenizer_file = "$MODELS_DIR/Qwen3.5-4B-Base/tokenizer.json"
+
+[sweep]
+model = ["laya.english", "laya.multilingual"]
+
+[grid]
+roofline_state_tokens = [32, 128, 256, 512, 768, 1024, 1536, 2048]

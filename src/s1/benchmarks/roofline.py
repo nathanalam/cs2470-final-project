@@ -17,6 +17,22 @@ The subset is the same for every model: choice and noul questions with at most `
 options whose state + question JSON is at most `roofline_max_tokens` tokens of one reference tokenizer
 (`roofline_tokenizer_file`, a tokenizer.json; words if unset), then a seeded sample.
 
+**State-length axis** (`[grid] roofline_state_tokens = [32, 128, 256, 512, 768, 1024, 1536, 2048]`): in place
+of natural JEVal lengths, `roofline_per_length` seeded questions, spread round-robin across JEVal's datasets,
+whose own state is at least the longest length (in reference tokens) run at every length, each state cut to
+that length's prefix (`counter.fit`). Every point is a contiguous prefix of one real state and the same
+questions run at every length, so only the state length differs between points. It places each model's
+forwards across every GPU's ridge (bf16 intensity grows with tokens; natural JEVal at <= 1024 tokens sits left
+of all of them). Too few qualifying rows is an error, never a silent fallback. Per-length points are
+`roofline_s<L>_{tflops,intensity,bandwidth_gbs,n,tokens,gpu_ms,gpu_ms_median,gpu_ms_max}`; the headline keys
+pool all lengths. Accuracy at cut lengths is not meaningful (cut states lose evidence): only timing and the
+roofline are. A backend that cuts its input (Laya: 512 / 1024 tokens) is charged for what it processed, so its
+long points stop growing. Without the axis the benchmark is exactly the natural mode (Nathan's records stay
+comparable).
+
+**Questions-per-request axis** (`[grid] roofline_questions_per_request`, with the length axis): Q questions
+against one shared state in a single `decide` call, at fixed state lengths. benchmarks/roofline_q.py runs it.
+
 The model must implement (see backends/semif.py, backends/elephant.py):
     profile_info() -> {"config": HF config dict, "head_bytes": int, "ceilings": {name: float}}
                       (and "weight_bytes": 4 for a model that keeps fp32 weights; default 2)
@@ -33,18 +49,27 @@ Settings (all optional):
     roofline_max_tokens    reference tokens per question              default 1024
     roofline_max_options   options per question                       default 16
     roofline_warmup        questions answered untimed first           default 8
+    roofline_warmup_passes times the warm-up list is answered          default 1
+                           (CUDA graph trees warm a new input size on its 1st call, record it on the 2nd
+                           and replay from the 3rd: a per-size graphed model needs 2 to time replays)
     roofline_counted       questions re-run under FlopCounterMode     default 8
     roofline_ncu           questions re-run in a CUDA profiler range  default 0 (set by `s1 ncu` runs)
     roofline_kernel_profile  1: note the CUDA kernels of one question in meta (roofline_kernels_top,
                            roofline_attention_kernel), traced after timing; 0: skip     default 1
+    roofline_per_length    questions per state length (with the [grid] axis)        default 40
+    roofline_max_question_tokens  reference tokens of a length-axis question's JSON  default 512
+    roofline_min_state_tokens  length-axis questions need a state at least this long (and at least the
+                           longest length), so axes of different reach share questions   default 0
     roofline_tokenizer_file
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import random
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
@@ -53,13 +78,39 @@ from .. import env, flops
 from ..record import Metrics, summarize
 from ..registry import Settings, benchmark, get_int, get_str, note
 from . import jeval
-from .shape_sweep import FileTokenCounter, TokenCounter, WordCounter
+from .shape_sweep import FileTokenCounter, TokenCounter, WordCounter, parse_int_list
+
+LENGTH_AXIS = "roofline_state_tokens"  # [grid] axis: state lengths in reference tokens
+QPR_AXIS = "roofline_questions_per_request"  # [grid] axis: questions per decide() call (roofline_q.py)
+WARM_PER_LENGTH = 2  # untimed questions at each length before timing
 
 BINS = (128, 256, 512, 1024, 4096)  # prompt tokens a question processed (all its forwards)
 TYPES = ("choice", "noul")
-# Datasheet peaks: dense bf16 tensor TFLOP/s, fp32 TFLOP/s, DRAM GB/s (NVIDIA L4: "242 TFLOPS BF16" is with
-# 2:4 sparsity, so 121 dense; 30.3 FP32; 300 GB/s GDDR6).
-SPEC = {"L4": (121.0, 30.3, 300.0)}
+# Datasheet peaks: dense bf16 tensor TFLOP/s, fp32 (non-tensor) TFLOP/s, DRAM GB/s. NVIDIA quotes bf16 with
+# 2:4 sparsity (2x the dense figure used here). bf16 and bandwidth: the selection doc's ridge-point appendix.
+SPEC = {
+    # L4: 242 TFLOPS BF16 is sparse, so 121 dense; 30.3 FP32; 300 GB/s GDDR6.
+    # https://www.nvidia.com/en-us/data-center/l4/
+    "L4": (121.0, 30.3, 300.0),
+    # A100 80GB SXM: FP32 19.5 (datasheet), 2,039 GB/s. https://www.nvidia.com/en-us/data-center/a100/
+    "A100-80GB": (312.0, 19.5, 2039.0),
+    # H100 SXM: FP32 67 (datasheet), 3.35 TB/s. https://www.nvidia.com/en-us/data-center/h100/
+    "H100": (989.0, 67.0, 3350.0),
+    # H200 SXM: FP32 67 (datasheet), 4.8 TB/s. https://www.nvidia.com/en-us/data-center/h200/
+    "H200": (989.0, 67.0, 4800.0),
+    # HGX B200 (1,000 W): the datasheet gives no per-GPU FP32, only 600 TFLOPS for the 8-GPU board, so 75.0
+    # is that divided by 8 (derived, not quoted). https://www.nvidia.com/en-us/data-center/hgx/
+    "B200": (2250.0, 75.0, 7700.0),
+}
+# nvidia-smi names -> SPEC key. Anchored so lookalikes (A100 40GB/PCIe, H100 PCIe/NVL, H200 NVL, L40S, A10G)
+# match nothing.
+_SPEC_NAMES = (
+    (re.compile(r"^(NVIDIA )?L4$"), "L4"),
+    (re.compile(r"^(NVIDIA )?A100-SXM4-80GB$"), "A100-80GB"),
+    (re.compile(r"^(NVIDIA )?H100 80GB HBM3$"), "H100"),
+    (re.compile(r"^(NVIDIA )?H200$"), "H200"),
+    (re.compile(r"^(NVIDIA )?B200$"), "B200"),
+)
 
 
 class Profiled(Protocol):
@@ -98,8 +149,73 @@ def subset(rows: Sequence[jeval.Row], counter: TokenCounter, settings: Settings)
     return random.Random(get_int(settings, "roofline_seed", 0)).sample(keep, min(limit, len(keep)))
 
 
+class FittingCounter(TokenCounter, Protocol):
+    def fit(self, text: str, tokens: int) -> str: ...
+
+
+def spread(rows: Sequence[jeval.Row], k: int, rng: random.Random) -> list[jeval.Row]:
+    """`k` rows taken round-robin across datasets (`source`), each dataset shuffled by `rng` and the datasets
+    visited in a seeded order: at most ceil(k / datasets) from each, the rest filled from the datasets that
+    still have rows when a small one runs out."""
+    groups: dict[str, list[jeval.Row]] = {}
+    for r in rows:
+        groups.setdefault(r.source, []).append(r)
+    order = sorted(groups)
+    rng.shuffle(order)
+    for name in order:
+        rng.shuffle(groups[name])
+    out: list[jeval.Row] = []
+    while len(out) < k and any(groups.values()):
+        for name in order:
+            if groups[name] and len(out) < k:
+                out.append(groups[name].pop())
+    return out
+
+
+def length_rows(
+    rows: Sequence[jeval.Row], counter: FittingCounter, settings: Settings, lengths: Sequence[int]
+) -> list[tuple[int, jeval.Row]]:
+    """(length, row) for every length in `lengths` x the same `roofline_per_length` seeded rows, states cut
+    to its first `length` reference tokens, picked round-robin across datasets (`spread`; the per-dataset
+    counts are noted as roofline_length_sources). Rows qualify when they are choice/noul with at most
+    `roofline_max_options` options, their question JSON is at most `roofline_max_question_tokens` tokens, and
+    their own state is at least max(lengths) tokens (or `roofline_min_state_tokens`, if larger: configs with
+    shorter axes then draw the same questions), so every point is a prefix of one real state. Ordered
+    length-major (all questions at one length, then the next). Raises if too few rows qualify."""
+    if not lengths:
+        raise ValueError(f"{LENGTH_AXIS} is empty")
+    per = get_int(settings, "roofline_per_length", 40)
+    max_options = get_int(settings, "roofline_max_options", 16)
+    max_question = get_int(settings, "roofline_max_question_tokens", 512)
+    longest = max(*lengths, get_int(settings, "roofline_min_state_tokens", 0))
+    keep = [
+        r
+        for r in rows
+        if r.qtype in TYPES
+        and options(r) <= max_options
+        and counter.count(json.dumps(r.questions, ensure_ascii=False)) <= max_question
+        and counter.count(r.state) >= longest
+    ]
+    if len(keep) < per:
+        raise ValueError(
+            f"only {len(keep)} JEVal rows have a state of at least {longest} reference tokens (and at most "
+            f"{max_options} options, {max_question} question tokens); roofline_per_length = {per}"
+        )
+    chosen = spread(keep, per, random.Random(get_int(settings, "roofline_seed", 0)))
+    counts: dict[str, int] = {}
+    for r in chosen:
+        counts[r.source] = counts.get(r.source, 0) + 1
+    note("roofline_length_sources", "; ".join(f"{k}:{v}" for k, v in sorted(counts.items())))
+    out: list[tuple[int, jeval.Row]] = []
+    for n in lengths:
+        for r in chosen:
+            out.append((n, dataclasses.replace(r, state=counter.fit(r.state, n))))
+    return out
+
+
 def spec_peaks(gpu: str) -> tuple[float, float, float] | None:
-    return next((v for k, v in SPEC.items() if k in gpu.split()), None)
+    name = gpu.strip()
+    return next((SPEC[key] for rx, key in _SPEC_NAMES if rx.match(name)), None)
 
 
 def _ratio(num: float, den: float) -> float:
@@ -179,6 +295,44 @@ def metrics(
     return m
 
 
+def select(settings: Settings) -> tuple[list[jeval.Row], list[jeval.Row], list[int]]:
+    """(timed rows, warm-up rows, each timed row's state length or [] in natural mode)."""
+    counter = _counter(settings)
+    warmup = get_int(settings, "roofline_warmup", 8)
+    if f"grid_{LENGTH_AXIS}" not in settings:
+        rows = subset(jeval.load_rows(), counter, settings)
+        return rows, rows[:warmup], []
+    lengths = parse_int_list(settings, LENGTH_AXIS)
+    tagged = length_rows(jeval.load_rows(), counter, settings, lengths)
+    rows = [r for _, r in tagged]
+    # every length warmed with its first WARM_PER_LENGTH questions: the first pass at a new shape pays one-off
+    # costs (an MoE grouped GEMM picks its kernel per token count; one 512-token OLMoE question took 1.2 s on
+    # an H100 on 2026-11-08 against ~45 ms for the rest), then the configured warm-up
+    per = max(len(tagged) // len(lengths), 1)
+    warm = [r for i, r in enumerate(rows) if i % per < WARM_PER_LENGTH] + rows[:warmup]
+    return rows, warm, [n for n, _ in tagged]
+
+
+def length_points(questions: Sequence[Question], lengths: Sequence[int]) -> Metrics:
+    """roofline_s<L>_* for each state length: achieved TFLOP/s, intensity, bandwidth, n, mean prompt tokens
+    and mean GPU ms of the questions run at that length (questions[i] ran at lengths[i])."""
+    m: Metrics = {"roofline_lengths": float(len(set(lengths)))}
+    for n in sorted(set(lengths)):
+        at = [q for q, ln in zip(questions, lengths, strict=True) if ln == n]
+        cost = flops.ZERO
+        for q in at:
+            cost = cost + q.cost
+        m |= point(f"roofline_s{n}_", cost, len(at))
+        m[f"roofline_s{n}_tokens"] = cost.tokens / len(at)
+        m[f"roofline_s{n}_gpu_ms"] = cost.ms / len(at)
+        ms = sorted(q.cost.ms for q in at)  # a one-off slow pass shows as max >> median
+        m[f"roofline_s{n}_gpu_ms_median"] = (
+            ms[len(ms) // 2] if len(ms) % 2 else (ms[len(ms) // 2 - 1] + ms[len(ms) // 2]) / 2
+        )
+        m[f"roofline_s{n}_gpu_ms_max"] = ms[-1]
+    return m
+
+
 def _profiled(model: object) -> Profiled:
     for attr in ("decide", "profile_info", "take_forwards", "count_flops"):
         if not callable(getattr(model, attr, None)):
@@ -221,7 +375,7 @@ def forward(f: Mapping[str, object]) -> flops.Forward:
     )
 
 
-def _counter(settings: Settings) -> TokenCounter:
+def _counter(settings: Settings) -> FittingCounter:
     path = get_str(settings, "roofline_tokenizer_file", "")
     return FileTokenCounter(str(env.resolve_path(path))) if path else WordCounter()
 
@@ -235,7 +389,6 @@ def run(model: object, settings: Settings) -> Metrics:
     config = info["config"]
     if not isinstance(config, Mapping):
         raise TypeError("profile_info()['config'] must be the model's HF config dict")
-    arch = flops.arch(config)
     head_bytes = int(_num({"head_bytes": flops.BF16_BYTES} | dict(info), "head_bytes", int))
     weight_bytes = int(_num({"weight_bytes": flops.BF16_BYTES} | dict(info), "weight_bytes", int))
     sizes = {"head_bytes": head_bytes, "weight_bytes": weight_bytes}
@@ -243,10 +396,16 @@ def run(model: object, settings: Settings) -> Metrics:
     if not isinstance(raw, Mapping):
         raise TypeError("profile_info()['ceilings'] must be a mapping")
     ceilings = {str(k): _num(raw, k, float) for k in raw}
+    if f"grid_{QPR_AXIS}" in settings:  # the questions-per-request axis: benchmarks/roofline_q.py
+        from . import roofline_q  # noqa: PLC0415 — it imports this module
 
-    rows = subset(jeval.load_rows(), _counter(settings), settings)
-    for row in rows[: get_int(settings, "roofline_warmup", 8)]:
-        jeval.ask(prof, row)
+        return roofline_q.run(prof, settings, config, ceilings, sizes)
+    arch = flops.arch(config)
+
+    rows, warm, row_lengths = select(settings)
+    for _ in range(get_int(settings, "roofline_warmup_passes", 1)):
+        for row in warm:
+            jeval.ask(prof, row)
     if callable(after_warmup := getattr(prof, "after_warmup", None)):
         after_warmup()
     prof.take_forwards()
@@ -260,6 +419,7 @@ def run(model: object, settings: Settings) -> Metrics:
         cost = flops.total(arch, fwd, **sizes)
         questions.append(Question(cost, len(fwd), outcome, real_tokens=real_tokens(raw_fwd)))
     wall_s = time.perf_counter() - t0
+    print(f"roofline: {len(rows)} timed questions in {wall_s:.0f} s", flush=True)  # progress for long runs
 
     for i, row in enumerate(rows[: get_int(settings, "roofline_counted", 8)]):
         try:
@@ -276,9 +436,32 @@ def run(model: object, settings: Settings) -> Metrics:
 
     gpu = str(settings.get("gpu", ""))
     m = metrics(questions, arch, ceilings, gpu, wall_s)
+    if row_lengths:
+        m |= length_points(questions, row_lengths)
     if n_hw := get_int(settings, "roofline_ncu", 0):
-        m |= hardware_region(prof, rows[:n_hw], questions[:n_hw], arch, sizes)
+        m |= _hardware(prof, n_hw, rows, questions, row_lengths=row_lengths, arch=arch, sizes=sizes)
     return m
+
+
+def _hardware(
+    prof: Profiled,
+    n_hw: int,
+    rows: Sequence[jeval.Row],
+    questions: Sequence[Question],
+    *,
+    row_lengths: Sequence[int],
+    arch: flops.Arch,
+    sizes: Mapping[str, int],
+) -> Metrics:
+    """The `s1 ncu` region: `hardware_lengths` on the length axis, else `hardware_region`."""
+    if row_lengths:  # n_hw questions at every length, shortest first, each length after a marker kernel
+        groups = [
+            (n, [rows[i] for i in idx[:n_hw]], [questions[i] for i in idx[:n_hw]])
+            for n in sorted(set(row_lengths))
+            for idx in [[i for i, ln in enumerate(row_lengths) if ln == n]]
+        ]
+        return hardware_lengths(prof, groups, arch, sizes)
+    return hardware_region(prof, rows[:n_hw], questions[:n_hw], arch, sizes)
 
 
 def record_kernels(prof: Profiled, row: jeval.Row, top: int = 10) -> None:
@@ -335,3 +518,62 @@ def hardware_region(
         "roofline_hw_theory_mb": cost.bytes / 1e6,
         "roofline_hw_timed_ms": sum(q.cost.ms for q in timed),
     }
+
+
+def ncu_marker() -> None:
+    """Launch the marker kernel `s1 ncu` splits a length-axis log on (torch.cuda._sleep, named "spin")."""
+    from .. import profiling  # noqa: PLC0415 — imports torch lazily inside
+
+    profiling.ncu_marker()
+
+
+def hardware_lengths(
+    prof: Profiled,
+    groups: Sequence[tuple[int, Sequence[jeval.Row], Sequence[Question]]],
+    arch: flops.Arch,
+    sizes: Mapping[str, int],
+) -> Metrics:
+    """`hardware_region` on the length axis: inside one CUDA profiler range, for each (length, rows, timed)
+    group in ascending length order, a marker kernel and then the rows. Returns the totals of
+    `hardware_region` plus roofline_hw_s<L>_{questions,theory_gflop,theory_mb,timed_ms} per length, which
+    `ncu.summarize_named` pairs with the kernels after each marker."""
+    import time  # noqa: PLC0415
+
+    profiler = getattr(prof, "profiler", None)
+    if not callable(profiler):
+        raise TypeError(f"roofline_ncu needs a model with .profiler(on); got {type(prof).__name__}")
+    if [n for n, _, _ in groups] != sorted({n for n, _, _ in groups}):
+        raise ValueError(
+            "length groups must be distinct and in ascending order (markers map to sorted lengths)"
+        )
+    prof.take_forwards()
+    costs: list[flops.Cost] = []
+    profiler(True)
+    try:
+        for n, rows, _ in groups:
+            t0 = time.perf_counter()
+            ncu_marker()
+            for row in rows:
+                jeval.ask(prof, row)
+            costs.append(flops.total(arch, [forward(f) for f in prof.take_forwards()], **sizes))
+            # under ncu each kernel is replayed, so this is the profiling cost per length
+            print(
+                f"roofline ncu: {n} tokens, {len(rows)} question(s) in {time.perf_counter() - t0:.0f} s",
+                flush=True,
+            )
+    finally:
+        profiler(False)
+    m: Metrics = {
+        "roofline_hw_questions": float(sum(len(rows) for _, rows, _ in groups)),
+        "roofline_hw_theory_gflop": sum(c.flops for c in costs) / 1e9,
+        "roofline_hw_theory_mb": sum(c.bytes for c in costs) / 1e6,
+        "roofline_hw_timed_ms": sum(q.cost.ms for _, _, timed in groups for q in timed),
+    }
+    for (n, rows, timed), cost in zip(groups, costs, strict=True):
+        m |= {
+            f"roofline_hw_s{n}_questions": float(len(rows)),
+            f"roofline_hw_s{n}_theory_gflop": cost.flops / 1e9,
+            f"roofline_hw_s{n}_theory_mb": cost.bytes / 1e6,
+            f"roofline_hw_s{n}_timed_ms": sum(q.cost.ms for q in timed),
+        }
+    return m

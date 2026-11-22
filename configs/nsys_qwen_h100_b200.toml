@@ -1,0 +1,44 @@
+# Nsight Systems timelines (s1 nsys, s1/nsys.py) of single batch-1 decisions at a short state (256 reference
+# tokens) for dense qwen3-8b and Gated-DeltaNet-hybrid qwen35-9b, on an H100 and a B200 (one container per GPU,
+# both models on the same host within a GPU). Questions:
+#   1. qwen3-8b on the H100: what share of one decision's wall time is GPU kernel time, and how much is host
+#      work / launch gaps (the findings attribute ~50 ms to overhead)?
+#   3. qwen35-9b, B200 vs H100: is the 2.5-3x short-state speedup kernel time (a different kernel path for the
+#      DeltaNet mixer: compare batch_nsys_kernels_top and kernels per decision) or host time? qwen3-8b on both
+#      GPUs is the dense control. The records' meta.cpu_model says whether the two containers had the same host.
+# The decisions go through the batch benchmark's decide_batch (SemIf direct readout, one forward per question,
+# no padding at batch 1), after batch_warmup untimed ones.
+#   uv run --group modal s1 submit configs/nsys_qwen_h100_b200.toml --nsys 16
+benchmarks = ["batch"]
+
+[launch]
+orchestrator = "modal"
+gpu = ["H100", "B200"]
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "00:45:00"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+dtype = "bfloat16"
+measure_ceilings = false
+max_prompt_tokens = 16384
+semif_max_options = 16
+
+[params]
+batch_seed = 0
+batch_pool = 16
+batch_warmup = 8
+batch_max_options = 16
+batch_max_question_tokens = 512
+batch_tokenizer_file = "$MODELS_DIR/Qwen3.5-4B-Base/tokenizer.json"
+
+[sweep]
+model = ["qwen3-8b.zeroshot", "qwen35-9b.zeroshot"]
+
+[grid]
+batch_state_tokens = [256]
+batch_sizes = [1]

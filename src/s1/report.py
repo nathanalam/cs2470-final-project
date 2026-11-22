@@ -3,7 +3,9 @@
 runs changes nothing; the pre-commit hook (scripts/hooks/pre-commit) runs `s1 report` every commit.
 
 Benchmark-agnostic: a benchmark's columns are its first metric (the headline) plus whichever of the
-conventional `<bench>_<suffix>` keys it reports (see AGENTS.md "Adding a benchmark").
+conventional `<bench>_<suffix>` keys it reports (see AGENTS.md "Adding a benchmark"). Every table names the
+platform a run was on ("cluster" when `invariants.platform` is absent, else e.g. "Modal"), and run details add
+a telemetry digest (`telemetry()`) for records that carry the newer hardware fields.
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import report_roofline
+from . import report_batch, report_lengths, report_profiling, report_qpr, report_roofline, report_steady
 from .record import RESULTS_DIR, Metrics, RunRecord, load_all
 
 SUFFIXES = ("accuracy", "ece", "brier", "invalid", "n", "latency_ms", "latency_ms_p99", "questions_per_s")
@@ -83,6 +85,11 @@ def model_of(r: RunRecord) -> str:
     return str(r.params.get("model", "?"))
 
 
+def platform(r: RunRecord) -> str:
+    """ "cluster" (no `invariants.platform`: the HUIT cluster) or "Modal"."""
+    return report_roofline.platform(r.invariants)
+
+
 def hardware(r: RunRecord, bench: str) -> str:
     gpu = str(r.invariants.get("gpu", "?")).removeprefix("NVIDIA ")
     count = r.results.get(f"{bench}/nvidia_smi", {}).get("gpu_count")
@@ -130,9 +137,15 @@ def leaderboard(bench: str, recs: Sequence[RunRecord]) -> Table:
     for r in best_per_model(bench, recs):
         m = r.results[bench]
         rows.append(
-            [model_of(r), *(fmt(k, m[k]) if k in m else DASH for k in keys), hardware(r, bench), r.run_id]
+            [
+                model_of(r),
+                *(fmt(k, m[k]) if k in m else DASH for k in keys),
+                platform(r),
+                hardware(r, bench),
+                r.run_id,
+            ]
         )
-    return Table(["Model", *(label(bench, k) for k in keys), "Hardware", "Run"], rows)
+    return Table(["Model", *(label(bench, k) for k in keys), "Platform", "Hardware", "Run"], rows)
 
 
 def all_runs(bench: str, recs: Sequence[RunRecord]) -> Table:
@@ -147,16 +160,94 @@ def all_runs(bench: str, recs: Sequence[RunRecord]) -> Table:
                 other_params(r),
                 *(fmt(k, m[k]) if k in m else DASH for k in keys),
                 *(fmt(k, g[k]) if k in g else DASH for k, _ in GPU_COLS),
+                platform(r),
                 hardware(r, bench),
                 str(r.meta.get("git_commit", "?")),
             ]
         )
     header = ["Run", "Model", "Params", *(label(bench, k) for k in keys), *(n for _, n in GPU_COLS)]
-    return Table([*header, "Hardware", "Commit"], rows)
+    return Table([*header, "Platform", "Hardware", "Commit"], rows)
 
 
 def run_detail(r: RunRecord) -> list[tuple[str, Metrics]]:
     return sorted(r.results.items())
+
+
+def _num(v: float, unit: str = "", digits: int = 0) -> str:
+    return f"{v:,.{digits}f}{unit}"
+
+
+def _gpu_line(m: Metrics, g: str) -> str:
+    """One GPU's detailed (schema-1) means; `g` is "" for the pooled keys or "<index>" per GPU."""
+    k = f"gpu{g}_"
+    parts = []
+    if (v := m.get(f"{k}util_pct")) is not None and g:
+        parts.append(f"util {_num(v, '%', 1)}")
+    if (v := m.get(f"{k}mem_util_pct")) is not None:
+        parts.append(f"memory controller busy {_num(v, '%', 1)}")
+    if (v := m.get(f"{k}clock_sm_mhz")) is not None:
+        low = m.get(f"{k}clock_sm_mhz_min")
+        parts.append(f"SM {_num(v, ' MHz')}" + (f" (min {_num(low, ' MHz')})" if low is not None else ""))
+    if (v := m.get(f"{k}clock_mem_mhz")) is not None:
+        parts.append(f"memory {_num(v, ' MHz')}")
+    if (v := m.get(f"{k}throttle_frac")) is not None:
+        mask = m.get(f"{k}throttle_mask_seen")
+        seen = f", reasons 0x{int(mask):x}" if mask is not None and mask > 0 else ""
+        parts.append(f"throttled {v:.0%} of samples{seen}")
+    total = "_total_mean" if not g else ""
+    rx, tx = m.get(f"{k}pcie_rx_mb_s{total}"), m.get(f"{k}pcie_tx_mb_s{total}")
+    if rx is not None or tx is not None:
+        rate = [DASH if v is None else _num(v, " MB/s") for v in (rx, tx)]
+        parts.append(f"PCIe rx {rate[0]}, tx {rate[1]}")
+    if not g and (v := m.get("gpu_util_pct_spread")) is not None:
+        parts.append(f"util spread across GPUs {_num(v, ' pts', 1)}")
+    return "; ".join(parts)
+
+
+def telemetry(r: RunRecord) -> list[tuple[str, str, bool]]:
+    """Readable digest of the hardware telemetry newer records carry: (label, value, value is code).
+    Empty for records without any of it, so older records render as before. Covers the CPU (meta
+    cpu_model, cpus_requested, cpu_count), the detailed GPU metrics (`gpu_metrics = "detailed"`), and the
+    CUDA kernels a roofline run noted (meta roofline_kernels_top / roofline_attention_kernel)."""
+    rows: list[tuple[str, str, bool]] = []
+    cpu = r.meta.get("cpu_model")
+    if cpu is not None and str(cpu) not in ("", "unknown"):  # "unknown": early Modal records' placeholder
+        rows.append(("CPU", str(cpu), False))
+    cpus = [
+        f"{r.meta[k]} {what}" for k, what in (("cpus_requested", "requested"), ("cpu_count", "visible"))
+        if k in r.meta
+    ]  # fmt: skip
+    if cpus:
+        rows.append(("CPUs", ", ".join(cpus), False))
+    for name, m in run_detail(r):
+        if not name.endswith("/nvidia_smi"):
+            continue
+        where = (
+            f" ({name.removesuffix('/nvidia_smi')})"
+            if sum(n.endswith("/nvidia_smi") for n in r.results) > 1
+            else ""
+        )
+        indices = sorted(
+            {int(i) for k in m if k.startswith("gpu") and (i := k[3:].partition("_")[0]).isdigit()}
+        )
+        if line := _gpu_line(m, ""):
+            rows.append((f"{'GPUs, pooled' if len(indices) > 1 else 'GPU'}{where}", line, False))
+        if len(indices) > 1:
+            rows += [(f"GPU {i}{where}", line, False) for i in indices if (line := _gpu_line(m, str(i)))]
+    if (seen := r.meta.get("roofline_kernels_seen")) is not None:
+        rows.append(("CUDA kernels seen", str(seen), False))
+    if (top := r.meta.get("roofline_kernels_top")) is not None:
+        if str(top) == "none seen":
+            rows.append(("Top CUDA kernels", "none seen", False))
+        for i, item in enumerate((k for k in str(top).split("; ") if k and str(top) != "none seen"), 1):
+            share, _, name = item.partition(" ")  # "41.2% <kernel name>"
+            rows.append((f"Kernel {i} ({share} of GPU time)", name, True))
+    if (att := r.meta.get("roofline_attention_kernel")) is not None:
+        share = r.meta.get("roofline_attention_share")
+        rows.append(("Attention kernel", str(att), str(att) != "none seen"))
+        if share is not None:
+            rows.append(("Attention kernel share", f"{float(share):.1%}", False))
+    return rows
 
 
 # ---------------------------------------------------------------- markdown
@@ -171,6 +262,294 @@ def _md_table(t: Table) -> str:
     return "\n".join(lines)
 
 
+GRAPH_NOTE = (
+    "d1-3b.compiled replays one CUDA graph per exact prompt length; torch records a length's graph on"
+    ' its 2nd call and replays it only from the 3rd. Rows marked "graph recording timed" were warmed '
+    "once and time the recording; unmarked d1-3b.compiled rows were warmed twice "
+    "(configs/roofline_d1_graph_warmup.toml, configs/roofline_d1_graph_replay_gpus.toml) and time "
+    "replays. At 32 tokens, replay vs eager: B200 3.1 vs 15.8 ms, H200 4.1 vs 23.8, H100 4.6 vs 23.2,"
+    " A100 9.8 vs 18.7, L40S 11.7 vs 14.6, L4 32.8 vs 34.6. Eager d1-3B on the big GPUs is host-"
+    "launch-bound: the GPU work is 3-5 ms of its 16-24 ms, and on the B200 eager stays near 16-17 ms "
+    "up to 2048 tokens while the replay rises from 3 to 14 ms. Host CPUs differ between the eager and"
+    " replay containers (meta.cpu_model), so the replays do not separate an AMD from an Intel host."
+)
+
+
+def _has_graph_rows(lpanels: Sequence[report_lengths.LengthPanel]) -> bool:
+    return any(c.model.startswith("d1-") and "compiled" in c.model for p in lpanels for c in p.curves)
+
+
+def _md_lengths(recs: Sequence[RunRecord]) -> list[str]:
+    """The state-length axis: median GPU ms by length per panel, then the H200-vs-H100 speedups."""
+    lpanels = report_lengths.panels(recs)
+    out: list[str] = [GRAPH_NOTE, ""] if _has_graph_rows(lpanels) else []
+    for sp in report_lengths.speedups(lpanels):
+        name = f"{report_roofline.gpu_name(sp.other.gpu)} vs {report_roofline.gpu_name(sp.base.gpu)}"
+        out += [
+            f"### {name} speedup by state length ({sp.platform})",
+            "",
+            f"Median GPU ms on the {report_roofline.gpu_name(sp.base.gpu)} over the "
+            f"{report_roofline.gpu_name(sp.other.gpu)}, same questions at each length. Memory-bound: "
+            f"~{sp.bw_ratio:.2f}x (bandwidth ratio); compute- or overhead-bound: ~1.0x.",
+            "",
+            _md_table(Table(*report_lengths.speedup_table(sp))),
+            "",
+        ]
+    for lp in lpanels:
+        out += [
+            f"### State-length axis on {lp.label}: median GPU ms per question",
+            "",
+            _md_table(Table(*report_lengths.ms_table(lp))),
+            "",
+        ]
+    return out
+
+
+def _html_lengths(recs: Sequence[RunRecord]) -> list[str]:
+    lpanels = report_lengths.panels(recs)
+    parts: list[str] = [f'<p class="sub">{html.escape(GRAPH_NOTE)}</p>'] if _has_graph_rows(lpanels) else []
+    for sp in report_lengths.speedups(lpanels):
+        h, rows = report_lengths.speedup_table(sp)
+        parts += [report_lengths.speedup_chart(sp), '<div class="card">',
+                  _html_table(Table(h, rows), 1, len(h)), "</div>"]  # fmt: skip
+    scale = report_lengths.shared_scale(lpanels)
+    for lp in lpanels:
+        h, rows = report_lengths.ms_table(lp)
+        parts += [report_lengths.length_chart(lp, scale), '<div class="card">',
+                  _html_table(Table(h, rows), 1, len(h) - 2), "</div>"]  # fmt: skip
+    return parts
+
+
+BATCH_NOTE = (
+    "Hypothesis H2 (docs/h2_batch_findings.md): B independent requests per forward, newest record per GPU "
+    "and series, `s1 nsys` records left out. TFLOP/s is cost-model FLOPs over wall time; CPU share is "
+    "1 - GPU kernel time / wall time at batch 1. The eager batch-1 floor depends on the host CPU, "
+    "listed per row."
+)
+
+
+def _md_batch(recs: Sequence[RunRecord]) -> list[str]:
+    ps = report_batch.panels(recs)
+    if not ps:
+        return []
+    return [
+        BATCH_NOTE,
+        "",
+        "### Batch 1: CPU vs GPU share of latency",
+        "",
+        _md_table(Table(*report_batch.b1_table(ps))),
+        "",
+        "### Achieved TFLOP/s vs batch size",
+        "",
+        _md_table(Table(*report_batch.curve_table(ps))),
+        "",
+    ]
+
+
+STEADY_NOTE = (
+    "Method of 2026-11-19: batch size is not a free variable. Each model x GPU pair is compared at its "
+    "own steady-state batch B*, the smallest batch with GPU kernel time >= 95% of wall time (kernel_busy; "
+    "values above 1 are trace inflation) that no larger batch beats on decisions/s by 5% or more. TFLOP/s "
+    "grows with batch size, so it is not the comparison metric. OpenJev (vLLM) has no kernel trace: its "
+    "steady state is the smallest concurrency with < 5% more questions/s at the next one and nvidia-smi "
+    "per-GPU utilization >= 95%, a weaker signal (it only says some kernel was running)."
+)
+BEST_NOTE = (
+    "JEVal accuracy counts invalid answers as wrong; accuracy on valid = correct / (N - invalid), "
+    "approximate. The semif models (lfm2, qwen35-9b, jevk5-9b) are also invalid on rows over 16 options "
+    "(the upstream cap). The other models' invalid count matches OpenJev's prompts over the 16,384-token "
+    "context (6 of 200, 21 of 1,000). Speed is decisions/s at B* on 128- and 1024-token batch states "
+    "(`batch`) or questions/s at OpenJev's steady-state concurrency on full JEVal states: compare speeds "
+    "within one unit, not across them."
+)
+PREP_NOTE = (
+    "Inline prep tokenizes and builds the batch inside the timed wall; pretokenized does it before the "
+    "timer and records it as host prep ms. On a fast GPU the host work inside the wall is GPU idle time, so "
+    "inline prep caps kernel_busy below 95% even when the batch is large."
+)
+
+
+def _steady_parts(recs: Sequence[RunRecord]) -> tuple[
+    list[report_batch.Panel], list[report_steady.ConcCurve], list[report_steady.Candidate]
+]:  # fmt: skip
+    ps = report_batch.panels(recs)
+    curves = report_steady.openjev_curves(recs)
+    return ps, curves, report_steady.candidates(recs, ps, curves)
+
+
+def _md_steady(recs: Sequence[RunRecord], results_dir: Path) -> list[str]:
+    ps, curves, cands = _steady_parts(recs)
+    if not ps and not curves:
+        return []
+    out: list[str] = ["## Steady state", "", STEADY_NOTE, ""]
+    if text := report_steady.findings(results_dir):
+        out += ["### Findings", "", text, ""]
+    if cands:
+        out += [
+            "### Best model per GPU",
+            "",
+            BEST_NOTE,
+            "",
+            _md_table(Table(*report_steady.best_table(cands))),
+            "",
+        ]
+    if ps:
+        out += ["### Steady-state batch per model and GPU", "",
+                _md_table(Table(*report_steady.steady_table(ps))), ""]  # fmt: skip
+    if curves:
+        out += ["### OpenJev: throughput, utilization and latency vs concurrency", "",
+                _md_table(Table(*report_steady.concurrency_table(curves))), ""]  # fmt: skip
+    if report_steady.prep_rows(ps):
+        out += ["### Prep mode: host prep inside the timed batch", "", PREP_NOTE, "",
+                _md_table(Table(*report_steady.prep_table(ps))), ""]  # fmt: skip
+    for n in report_steady.LENGTHS:
+        h, rows = report_steady.busy_table(ps, n)
+        if rows:
+            out += [f"### GPU utilization (kernel_busy) vs batch size, {n}-token states", "",
+                    _md_table(Table(h, rows)), ""]  # fmt: skip
+    return out
+
+
+def _html_steady(recs: Sequence[RunRecord], results_dir: Path) -> list[str]:
+    ps, curves, cands = _steady_parts(recs)
+    if not ps and not curves:
+        return []
+    parts: list[str] = ["<h2>Steady state</h2>", f'<p class="sub">{html.escape(STEADY_NOTE)}</p>']
+    if text := report_steady.findings(results_dir):
+        parts += [
+            '<h3>Findings</h3><div class="card prose">',
+            report_roofline.markdown_to_html(text),
+            "</div>",
+        ]
+    if cands:
+        h, rows = report_steady.best_table(cands)
+        parts += ["<h3>Best model per GPU</h3>", f'<p class="sub">{html.escape(BEST_NOTE)}</p>',
+                  '<div class="card">', _html_table(Table(h, rows), 3, 9), "</div>"]  # fmt: skip
+    if ps:
+        h, rows = report_steady.steady_table(ps)
+        parts += ["<h3>Steady-state batch per model and GPU</h3>", '<div class="card">',
+                  _html_table(Table(h, rows), 3, len(h) - 1), "</div>"]  # fmt: skip
+        for n in report_steady.LENGTHS:
+            parts.append(report_steady.busy_chart(ps, n))
+    if curves:
+        h, rows = report_steady.concurrency_table(curves)
+        parts += ["<h3>OpenJev: throughput, utilization and latency vs concurrency</h3>",
+                  report_steady.concurrency_chart(curves), '<div class="card">',
+                  _html_table(Table(h, rows), 1, len(h) - 1), "</div>"]  # fmt: skip
+    if report_steady.prep_rows(ps):
+        h, rows = report_steady.prep_table(ps)
+        parts += ["<h3>Prep mode: host prep inside the timed batch</h3>",
+                  f'<p class="sub">{html.escape(PREP_NOTE)}</p>',
+                  '<div class="card">', _html_table(Table(h, rows), 4, len(h)), "</div>"]  # fmt: skip
+    for n in report_steady.LENGTHS:
+        h, rows = report_steady.busy_table(ps, n)
+        if rows:
+            title = f"Table: kernel_busy vs batch size, {n}-token states"
+            parts += [f"<details class=card><summary>{title}</summary>",
+                      _html_table(Table(h, rows), 2, len(h) - 1), "</details>"]  # fmt: skip
+    return parts
+
+
+def _md_qpr(recs: Sequence[RunRecord]) -> list[str]:
+    mqs = report_qpr.models(recs)
+    if not mqs:
+        return []
+    return [
+        "### Questions per request: GPU cost per question as questions share one state",
+        "",
+        _md_table(Table(*report_qpr.table(mqs))),
+        "",
+    ]
+
+
+def _html_batch(recs: Sequence[RunRecord]) -> list[str]:
+    ps = report_batch.panels(recs)
+    if not ps:
+        return []
+    bh, br = report_batch.b1_table(ps)
+    ch, cr = report_batch.curve_table(ps)
+    return [
+        f'<p class="sub">{html.escape(BATCH_NOTE)}</p>',
+        "<h3>Batch 1: CPU vs GPU share of latency</h3>",
+        report_batch.split_chart(ps),
+        '<div class="card">', _html_table(Table(bh, br), 3, len(bh)), "</div>",
+        "<h3>Achieved TFLOP/s vs batch size</h3>",
+        report_batch.curve_charts(ps),
+        '<div class="card">', _html_table(Table(ch, cr), 2, len(ch)), "</div>",
+    ]  # fmt: skip
+
+
+def _html_qpr(recs: Sequence[RunRecord]) -> list[str]:
+    mqs = report_qpr.models(recs)
+    if not mqs:
+        return []
+    parts = [report_qpr.chart(mq) for mq in mqs]
+    h, rows = report_qpr.table(mqs)
+    return [
+        *parts,
+        "<h3>Questions per request</h3>",
+        '<div class="card">',
+        _html_table(Table(h, rows), 5, len(h)),
+        "</div>",
+    ]
+
+
+def _md_nsys_lengths(recs: Sequence[RunRecord]) -> list[str]:
+    h, rows = report_profiling.nsys_table(recs)
+    if not rows:
+        return []
+    title = "### Nsight Systems: kernel-time roofline and GPU counters by state length"
+    out = [report_profiling.NOTE, "", title,
+           "", _md_table(Table(h, rows)), ""]  # fmt: skip
+    rh, rrows = report_profiling.h200_table(recs)
+    if rrows:
+        out += ["### Nsight Systems: H100 over H200 by state length", "", _md_table(Table(rh, rrows)), ""]
+    return out
+
+
+def _md_ncu_sampled(recs: Sequence[RunRecord]) -> list[str]:
+    h, rows = report_profiling.ncu_table(recs)
+    if not rows:
+        return []
+    out = ["### Sampled Nsight Compute: kernel classes", "", _md_table(Table(h, rows)), ""]
+    rh, rrows = report_profiling.ncu_ratio_table(recs)
+    if rrows:
+        out += [
+            "### Sampled Nsight Compute: H100 over H200 per kernel class",
+            "",
+            _md_table(Table(rh, rrows)),
+            "",
+        ]
+    return out
+
+
+def _html_nsys_lengths(recs: Sequence[RunRecord]) -> list[str]:
+    h, rows = report_profiling.nsys_table(recs)
+    if not rows:
+        return []
+    parts = [f'<p class="sub">{html.escape(report_profiling.NOTE)}</p>',
+             "<h3>Nsight Systems: kernel-time roofline and GPU counters by state length</h3>",
+             '<div class="card">', _html_table(Table(h, rows), 5, len(h) - 1), "</div>"]  # fmt: skip
+    rh, rrows = report_profiling.h200_table(recs)
+    if rrows:
+        parts += ["<h3>Nsight Systems: H100 over H200 by state length</h3>", '<div class="card">',
+                  _html_table(Table(rh, rrows), 3, len(rh)), "</div>"]  # fmt: skip
+    return parts
+
+
+def _html_ncu_sampled(recs: Sequence[RunRecord]) -> list[str]:
+    h, rows = report_profiling.ncu_table(recs)
+    if not rows:
+        return []
+    parts = ["<h3>Sampled Nsight Compute: kernel classes</h3>", '<div class="card">',
+             _html_table(Table(h, rows), 6, len(h) - 1), "</div>"]  # fmt: skip
+    rh, rrows = report_profiling.ncu_ratio_table(recs)
+    if rrows:
+        parts += ["<h3>Sampled Nsight Compute: H100 over H200 per kernel class</h3>", '<div class="card">',
+                  _html_table(Table(rh, rrows), 4, len(rh)), "</div>"]  # fmt: skip
+    return parts
+
+
 def to_markdown(recs: Sequence[RunRecord], results_dir: Path = RESULTS_DIR) -> str:
     out = [
         "# Results",
@@ -179,19 +558,40 @@ def to_markdown(recs: Sequence[RunRecord], results_dir: Path = RESULTS_DIR) -> s
         "A browsable version with charts is [`report.html`](report.html).",
         "",
     ]
+    out += _md_steady(recs, results_dir)
     for bench in benchmarks(recs):
         out += [f"## {bench}", ""]
         if bench == report_roofline.BENCH:
             if text := report_roofline.findings(results_dir):
                 out += ["### Findings", "", text, ""]
-            for gpu, pts in report_roofline.points_by_gpu(recs).items():
+            panels = report_roofline.panels(recs)
+            out += ["### Roofs", "", _md_table(Table(*report_roofline.roofs(panels))), ""]
+            if len(panels) > 1:
                 out += [
-                    f"### Decision recipes on {gpu}",
+                    "### Achieved TFLOP/s by GPU (% of that GPU's roof)",
                     "",
-                    _md_table(Table(*report_roofline.recipes(pts))),
+                    _md_table(Table(*report_roofline.by_gpu(panels))),
                     "",
                 ]
-                out += [f"### Roofline on {gpu}", "", _md_table(Table(*report_roofline.table(pts))), ""]
+            for panel in panels:
+                out += [
+                    f"### Decision recipes on {panel.label}",
+                    "",
+                    _md_table(Table(*report_roofline.recipes(panel.points))),
+                    "",
+                ]
+                out += [
+                    f"### Roofline on {panel.label}",
+                    "",
+                    _md_table(Table(*report_roofline.table(panel.points))),
+                    "",
+                ]
+            out += _md_lengths(recs)
+            out += _md_qpr(recs)
+            out += _md_ncu_sampled(recs)
+        if bench == report_batch.BENCH:
+            out += _md_batch(recs)
+            out += _md_nsys_lengths(recs)
         out += [
             "### Leaderboard (each model's largest run)",
             "",
@@ -207,6 +607,9 @@ def to_markdown(recs: Sequence[RunRecord], results_dir: Path = RESULTS_DIR) -> s
         out += [
             _md_table(Table(["Setting", "Value"], [[k, str(v)] for k, v in sorted(r.invariants.items())]))
         ]
+        if tele := telemetry(r):
+            rows = [[k, f"`{v}`" if code else v] for k, v, code in tele]
+            out += ["", "**Telemetry**", "", _md_table(Table(["Telemetry", "Value"], rows))]
         for name, metrics in run_detail(r):
             out += [
                 "",
@@ -309,11 +712,13 @@ def to_html(recs: Sequence[RunRecord], results_dir: Path = RESULTS_DIR) -> str:
     parts = [
         "<!doctype html><html lang=en><head><meta charset=utf-8>",
         '<meta name="viewport" content="width=device-width,initial-scale=1">',
-        f"<title>Decision-model results</title><style>{CSS}{report_roofline.CSS}</style></head><body><main>",
+        "<title>Decision-model results</title>",
+        f"<style>{CSS}{report_roofline.CSS}{report_batch.CSS}{report_qpr.CSS}</style></head><body><main>",
         "<h1>Decision-model results</h1>",
         f'<p class="sub">Generated by <code>uv run s1 report</code> from {len(recs)} run record(s) in '
         "<code>results/</code>. Do not edit by hand.</p>",
     ]
+    parts += _html_steady(recs, results_dir)
     for bench in benchmarks(recs):
         n_keys = len(metric_keys(bench, recs))
         parts += [f"<h2>{html.escape(bench)}</h2>", _bar_chart(bench, recs)]
@@ -324,13 +729,33 @@ def to_html(recs: Sequence[RunRecord], results_dir: Path = RESULTS_DIR) -> str:
                     report_roofline.markdown_to_html(text),
                     "</div>",
                 ]
-            for gpu, pts in report_roofline.points_by_gpu(recs).items():
-                rh, rr = report_roofline.recipes(pts)
-                parts += [f"<h3>Decision recipes on {html.escape(gpu)}</h3>", '<div class="card recipes">',
+            panels = report_roofline.panels(recs)
+            scale = report_roofline.shared_scale(panels)
+            fh, fr = report_roofline.roofs(panels)
+            parts += [
+                "<h3>Roofs</h3>",
+                '<div class="card">',
+                _html_table(Table(fh, fr), 1, len(fh)),
+                "</div>",
+            ]
+            if len(panels) > 1:
+                gh, gr = report_roofline.by_gpu(panels)
+                parts += ["<h3>Achieved TFLOP/s by GPU (% of that GPU's roof)</h3>", '<div class="card">',
+                          _html_table(Table(gh, gr), 1, len(gh)), "</div>"]  # fmt: skip
+            for panel in panels:
+                rh, rr = report_roofline.recipes(panel.points)
+                name = html.escape(panel.label)
+                parts += [f"<h3>Decision recipes on {name}</h3>", '<div class="card recipes">',
                           _html_table(Table(rh, rr), 5, len(rh)), "</div>"]  # fmt: skip
-                header, rows = report_roofline.table(pts)
-                parts += [report_roofline.chart(gpu, pts), '<div class="card">',
+                header, rows = report_roofline.table(panel.points)
+                parts += [report_roofline.chart(panel, scale), '<div class="card">',
                           _html_table(Table(header, rows), 2, len(header)), "</div>"]  # fmt: skip
+            parts += _html_lengths(recs)
+            parts += _html_qpr(recs)
+            parts += _html_ncu_sampled(recs)
+        if bench == report_batch.BENCH:
+            parts += _html_batch(recs)
+            parts += _html_nsys_lengths(recs)
         parts += ["<h3>Leaderboard (each model's largest run)</h3>", '<div class="card">',
                   _html_table(leaderboard(bench, recs), 1, 1 + n_keys), "</div>"]  # fmt: skip
         parts += ["<h3>All runs</h3>", '<div class="card">',
@@ -338,6 +763,7 @@ def to_html(recs: Sequence[RunRecord], results_dir: Path = RESULTS_DIR) -> str:
     parts.append("<h2>Run details</h2>")
     for r in sorted(recs, key=lambda r: r.run_id, reverse=True):
         rows = [[k, str(v)] for k, v in sorted(r.invariants.items())]
+        rows += [[f"telemetry · {k}", v] for k, v, _ in telemetry(r)]
         rows += [[f"{name} · {k}", f"{v:.6g}"] for name, m in run_detail(r) for k, v in m.items()]
         rows += [[f"meta · {k}", str(v)] for k, v in r.meta.items()]
         parts += [

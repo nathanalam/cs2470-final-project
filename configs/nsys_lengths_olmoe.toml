@@ -1,0 +1,41 @@
+# configs/nsys_lengths.toml for olmoe-1b-7b, the most memory-bound model (64 experts, top-8; 49-60 FLOP/byte
+# at natural lengths): hypothesis D, its expert kernels should sustain more DRAM bandwidth on the H200 than on
+# the H100 (batch_nsys_gm_dram_*_active), with the L4 as the hardware-bound reference. Stops at 4,096 state
+# tokens, OLMoE's trained context. Same rows as nsys_lengths.toml.
+#   uv run --group modal s1 submit configs/nsys_lengths_olmoe.toml --nsys 8
+benchmarks = ["batch"]
+
+[launch]
+orchestrator = "modal"
+gpu = ["L4", "H100", "H200"]  # one container per GPU, run concurrently; require_gpu is set per GPU by the launcher
+gpus = 1
+cpus = 8
+mem = "28G"
+time = "01:00:00"
+
+[invariants]
+gpu_metrics = "detailed"
+gpu_metrics_schema = 1
+gpu = "auto"
+dtype = "bfloat16"
+measure_ceilings = false
+max_prompt_tokens = 20480
+semif_max_options = 16
+nsys_gpu_metrics = true
+
+[params]
+model = "olmoe-1b-7b.zeroshot"
+batch_seed = 0
+batch_pool = 8
+batch_warmup = 8
+batch_max_options = 16
+batch_max_question_tokens = 512
+batch_min_state_tokens = 16384  # the same rows as nsys_lengths.toml
+batch_tokenizer_file = "$MODELS_DIR/Qwen3.5-4B-Base/tokenizer.json"
+
+[sweep]
+batch_nsys_state_tokens = [32, 512, 2048, 4096]
+
+[grid]
+batch_state_tokens = [32, 512, 2048, 4096]
+batch_sizes = [1]
