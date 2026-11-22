@@ -12,32 +12,43 @@ not swept.
 
 ## 1. Summary
 
-- **Recommendation: a pinned table, with a deterministic formula as the fallback, and no online calibration.**
+- **Recommendation: the pinned table decides; a formula is an opt-in fallback; no online calibration.**
   - The table (`src/s1/steady_state.py`) holds every measured B\*, keyed by model, *variant* (host prep, expert
     dispatch, mode), GPU and state length, together with the run IDs it came from. A test recomputes each entry
     from those records.
-  - For pairs not in the table, an offline formula gives the batch from the model's FLOPs per token, the GPU's
-    measured peak and the host time per forward. Its inputs and result go into the record.
+  - **The table always wins when it has an entry.** By default (`steady_policy = "table"`), a pair that is not
+    in the table fails fast before the model loads, with a message naming the sweep to run. The formula never
+    overrides a table entry.
+  - Only a config that sets `steady_policy = "table+formula"` lets an unswept pair run on the formula: a
+    one-line estimate from the GPU, the model's active parameter count and the request length. Its inputs and
+    result go into the record, marked `predicted`. This is for exploratory runs on new GPUs; a result worth
+    citing should come from a table entry.
   - An opt-in `"steady-bracket"` mode runs {B/2, B, 2B} so that a run can check its own pick.
 - **The formula** (tokens per forward needed, then batch):
 
   ```
-  M*  = max( T_gemm[gpu],  19 * H * F_eff[gpu] / F_tok )        # tokens per forward
-  B   = clamp( 2 ** round(log2(M* / row_tokens(L))),  1,  B_mem(L) )
+  tokens = T[gpu] * max(1, 8B / active_params)
+  B      = clamp( 2 ** round(log2(tokens / row_tokens(L))),  1,  B_mem(L) )
   ```
 
   | Symbol | Meaning |
   |---|---|
-  | `H` | Un-overlapped host time per forward |
-  | `F_eff` | 0.6 x the GPU's measured bf16 peak |
-  | `F_tok` | FLOPs per token from `flops.py` |
-  | `19` | 0.95 / 0.05 |
-  | `T_gemm` | The GEMM-efficiency floor per GPU (section 3) |
-  | `B_mem` | The memory cap |
+  | `T[gpu]` | Tokens per forward that keep this GPU busy for an ~8B dense model: L4 1.5k, A100 3k, H100/H200 6k, B200 12k (section 4.1) |
+  | `active_params` | Parameters used per token (`flops.Arch.active_params`); for an MoE, the active count, not the total |
+  | `row_tokens(L)` | Tokens in one request: state length plus ~270 for the JEVal question and options |
+  | `B_mem` | The memory cap (section 3.5) |
+
+  **In plain terms.** Every forward pass carries a fixed CPU cost of about 10-30 ms to launch it, whatever the
+  model. The GPU only stays 95% busy if it has much more work than that per forward. A big model on a slow GPU
+  already has enough work in a single request; a small model on a fast GPU needs many requests at once. So start
+  from the GPU's number in the table. If the model is smaller than ~8B active parameters, scale that number up
+  in proportion, because each token gives the GPU less work. Divide by how long one request is, and round to a
+  power of two.
 
   **Back-test.** Applied to all 36 measured (model, variant, GPU, length) series, this pick reaches >= 95% of
   the throughput at the measured B\* (or the plateau, when B\* was not reached) in **31 of 36**. The worst case
-  is 82%. Kernel_busy at the pick is >= 0.95 wherever the series reached 0.95 at all (section 3.3).
+  is 82%. A more detailed version that models host time from kernel counts (section 4.5) scores exactly the
+  same, so the design uses the simple one.
 - **Main finding from theory and data: "tokens in flight" depends on the model, not only the GPU.**
   - Dense 8-9B models saturate at about 1.5k tokens per forward on the L4 and 2-7k on Hopper.
   - LFM2-8B-A1B (1.5B active, host-sync-heavy MoE) needs **21-26k** on Hopper.
@@ -176,7 +187,9 @@ performance … for small batches and/or models with a small number [of] activat
 
 **Verdict on B\* ≈ ceil(T_target / state_tokens).**
 - **Sound in form**, with two changes:
-  - T_target must be `max(T_gemm[gpu], M_host(model, runtime, host))`, not a per-GPU constant.
+  - T_target must depend on the model as well as the GPU. Because H is about the same (10-30 ms) for every
+    model we run, M_host mostly varies with F_tok, i.e. with active parameters. That is what the simple
+    formula's `max(1, 8B / active_params)` factor captures.
   - The denominator must be the *row* tokens (state plus question, ~L + 270 for JEVal), padded.
 - **Ceil is wrong; round in log2 instead.** Dense 9B models on the L4 at 1024 tokens lose 20-24% throughput at
   B = 8 versus B = 1, so overshooting has a cost.
@@ -204,7 +217,7 @@ pinned vLLM version before relying on them.
   source.
 
 **Agreement:** engines treat ~2k tokens per step as enough on small GPUs and 8-16k on Hopper/Blackwell. Our
-dense M\* (L4 ~1.5k, Hopper 2-7k, B200 6k to over 12k) falls in the same bands. These are the T_gemm values in
+dense M\* (L4 ~1.5k, Hopper 2-7k, B200 6k to over 12k) falls in the same bands. These are the T[gpu] values in
 section 4.
 
 **Our vLLM serve sets no token budget** (`vllm_shim.serve_args`: only `--max-num-seqs 256`). Through the API
@@ -249,8 +262,9 @@ already does. OpenJev's nvidia-smi-based steady state stays a weaker signal than
   linear-attention kernels are launch-heavy Triton (PyTorch blog above).
 - Liquid publishes no GPU throughput numbers for LFM2; its report benchmarks CPU and phones only.
 - Our data agrees in direction: per layer, LFM2 issues 65-73 kernels and Qwen3-8B 55. Without graphs, hybrids
-  and MoE should expect a larger M_host. The formula captures this through H (kernel count x per-kernel host
-  cost) instead of a fudge factor.
+  and MoE should expect a larger M_host. The simple formula captures this only through the active-parameter
+  factor. An eager per-expert loop (~6x the kernels) is outside what it models, which is one more reason the
+  table decides.
 
 ### 3.4 Host overhead
 
@@ -302,47 +316,45 @@ design therefore:
 
 ### 4.1 Per-GPU constants
 
-`T_gemm` is the floor from engine budgets and the dense data. `F_eff = 0.6 x` measured peak, which matches the
-achieved TFLOP/s at B\* for dense models: L4 37-41, H100 393-396. Rows marked *proposed* have no records yet.
+`T[gpu]` is the tokens per forward that keep the GPU busy for an ~8B dense model, from our dense sweeps and the
+engine budgets in section 3.2. Rows marked *proposed* have no records yet.
 
-| GPU (canonical key) | T_gemm (tokens/forward) | F_eff (TFLOP/s) | Usable memory | Basis |
-|---|---|---|---|---|
-| L4 | 1,500 | 34 | 21.5 GB | measured (dense B\* 1-4) |
-| A10G | 1,500 | 40 *proposed* | 21.5 GB | proposed: L4-class FLOP/s; vLLM/SGLang 2k tier |
-| RTX Pro 4500 | 2,000 | 120 *proposed* | 29 GB | proposed: datasheet x 0.3 until a ceiling run exists |
-| A100-SXM4 / A100 80GB PCIe | 3,000 | 155 / 138 | 72 GB | measured (Kev-4B 16 x 320 = 5.3k; qwen3-8b flat from 0.4k) |
-| L40S | 3,000 | 112 | 43 GB | proposed: measured peak 186 sits between A100 and L4 |
-| H100, H200 | 6,000 | 404 | 72 / 127 GB | measured (dense 2.3-7k, vLLM 8-16k tier) |
-| B200 | 12,000 | 804 | 162 GB | measured (qwen3-8b 128-token plateau at 64 x 660 padded; 1024 B\* 4) |
+| GPU (canonical key) | T (tokens/forward) | Usable memory | Basis |
+|---|---|---|---|
+| L4 | 1,500 | 21.5 GB | measured (dense B\* 1-4) |
+| A10G | 1,500 | 21.5 GB | proposed: L4-class FLOP/s; vLLM/SGLang 2k tier |
+| RTX Pro 4500 | 2,000 | 29 GB | proposed: between L4 and A100 until a ceiling run exists |
+| A100-SXM4 / A100 80GB PCIe | 3,000 | 72 GB | measured (Kev-4B 16 x 320 = 5.3k; qwen3-8b flat from 0.4k) |
+| L40S | 3,000 | 43 GB | proposed: measured bf16 peak 186 TFLOP/s, A100-class |
+| H100, H200 | 6,000 | 72 / 127 GB | measured (dense 2.3-7k, vLLM 8-16k tier) |
+| B200 | 12,000 | 162 GB | measured (qwen3-8b 128-token plateau at 64 x 660 padded; 1024 B\* 4) |
 
-### 4.2 Host-time inputs
+The model factor is `max(1, 8B / active_params)`: 1 for 8-9B dense models, ~2.3 for 3-4B dense, ~5.3 for
+LFM2-8B-A1B (1.5B active). It never shrinks below 1, because bigger models already saturate at batch 1-4.
 
-`H = K x t_k`:
-- K is kernels per forward, taken from the table's `HOST` entry for the model and runtime (any GPU of the same
-  arch family, sm80/89 vs sm90+). Otherwise estimated as 65 x layers, x6 for eager MoE loops.
-- t_k defaults to 6 µs per kernel, the median of our Modal hosts (2.2-8 µs).
-- Use the **shortest** length's B = 1 `launch_api_ms`. At long lengths the launch API blocks on a full queue,
-  which inflates it (L4 qwen 1024: 152 ms instead of 20-31 ms).
-
-### 4.3 Resulting defaults
+### 4.2 Resulting defaults
 
 Row tokens are 128 → ~400 and 1024 → ~1,300. Defaults for model classes we have not swept on that GPU,
-**B at 128 / B at 1024**:
+**B at 128 / B at 1024**, before the memory cap:
 
-| GPU | Dense 8-9B eager (F_tok 14 GF, H ≈ 14 ms) | MoE ~1.5B active, grouped_mm (F_tok 2.9 GF, H ≈ 10 ms; 15 ms on sm80/89) | Dense 3-4B (F_tok 6-7 GF, H ≈ 10 ms eager) | vLLM OpenJev-class |
+| GPU | Dense 8-9B (x1) | Dense 3-4B (x2.3) | MoE ~1.5B active (x5.3) | vLLM OpenJev-class |
 |---|---|---|---|---|
-| L4 | 4 / 1 | 8 / 2 | 4 / 1 | concurrency 8 |
-| A10G | 4 / 1 | 8 / 2 | 4 / 1 | 8 |
-| RTX Pro 4500 | 4 / 2 | 16 / 4 | 8 / 2 | 8 |
-| A100 | 8 / 2 | 32 / 16 | 8 / 2 | 8 (measured) |
-| L40S | 8 / 2 | 16 / 4 | 8 / 2 | 8 |
-| H100 / H200 | 16 / 4 | 64 / 16 | 32 / 8 | 8 (measured) |
-| B200 | 32 / 16 | 128 / 32 | 64 / 16 | 8 (measured) |
+| L4 | 4 / 1 | 8 / 2 | 16 / 8 | concurrency 8 |
+| A10G | 4 / 1 | 8 / 2 | 16 / 8 | 8 |
+| RTX Pro 4500 | 4 / 2 | 16 / 4 | 32 / 8 | 8 |
+| A100 | 8 / 2 | 16 / 4 | 32 / 16 | 8 (measured) |
+| L40S | 8 / 2 | 16 / 4 | 32 / 16 | 8 |
+| H100 / H200 | 16 / 4 | 32 / 8 | 64 / 32 | 8 (measured) |
+| B200 | 32 / 8 | 64 / 16 | 128 / 64 | 8 (measured) |
 
-**For vLLM:** `c = max(8, 2 * ceil(max_num_batched_tokens / mean_prompt_tokens))`, capped at `max_num_seqs`.
-This assumes prompts of a few thousand tokens; short-prompt vLLM models would need the formula's larger values.
+- **For vLLM:** `c = max(8, 2 * ceil(max_num_batched_tokens / mean_prompt_tokens))`, capped at
+  `max_num_seqs`. This assumes prompts of a few thousand tokens; short-prompt vLLM models would need larger
+  values.
+- **Very short rows overshoot.** For d1-3B's ~60-token text rows the formula gives 64 on the L4 and 256 on the
+  H100, against measured B\* 32 and 64. Those pairs are in the table, so the formula is not used for them, but
+  short-row models on new GPUs should get a `steady-bracket` run.
 
-### 4.4 Expected kernel_busy at the default (from the back-test)
+### 4.3 Expected kernel_busy at the default (from the back-test)
 
 - **Dense models with HF eager or CUDA graphs:** 0.95-1.0 on L4/A100/H100/H200 and 0.93-1.0 on B200.
 - **MoE with pretokenized grouped_mm on sm90+:** 0.95-0.96. With inline prep: 0.82-0.94, i.e. "not reached"
@@ -352,21 +364,40 @@ This assumes prompts of a few thousand tokens; short-prompt vLLM models would ne
 - **Laya:** ≤ 0.92 everywhere.
 - **d1 image arms on Hopper:** 0.87-0.91.
 
-### 4.5 Back-test detail
+### 4.4 Back-test detail
 
-Pick = formula with per-series H, F_tok from the record, and the T_gemm and F_eff above. Compared with the
-throughput at the measured B\* (or the plateau), across 36 series:
+Pick = the simple formula, with active parameters estimated per series as FLOPs per token / 2 from the record,
+and the T values above. Compared with the throughput at the measured B\* (or the plateau), across 36 series:
 
 | Group | Count | Throughput at the pick vs reference |
 |---|---|---|
 | All series | 31 / 36 | ≥ 95% |
-| kev-4b L4 128 | 1 | 85% (pick 4, B\* 8) |
-| jevk5-9b L4 128 | 1 | 82% (pick 4, B\* 2). Its twin qwen35-9b gives 100% at B = 4, so this is run noise. |
+| B200 qwen3-8b 128 | 1 | 95% after rounding (pick 32, plateau 64) |
 | A100 qwen3-8b | 2 | 91-92% (pick 8 / 2, B\* 1) |
-| A100 kev-4b 128 | 1 | 94% |
+| L4 lfm2-8b-a1b 1024 (inline) | 1 | 92% (pick 8, plateau 1) |
+| jevk5-9b L4 128 | 1 | 82% (pick 4, B\* 2). Its twin qwen35-9b gives 100% at B = 4, so this is run noise. |
 
 Exact B\* matches include the H100 pretokenized LFM2 at 1024 (16), the H100/H200 qwen3-8b at 1024 (4), and
 every L4 9B dense at 1024 (1).
+
+### 4.5 The detailed version (not used)
+
+An earlier draft modelled host time explicitly:
+
+```
+M* = max(T[gpu], 19 * H * F_eff / F_tok)        # H = kernels per forward x ~6 µs per kernel
+```
+
+- `F_eff` is 0.6 x the GPU's measured bf16 peak (L4 34, A100 155, H100/H200 404, B200 804 TFLOP/s).
+- `F_tok` is FLOPs per token from `flops.py`.
+- `H` comes from the record's B = 1 `launch_api_ms` at the shortest length. At long lengths the launch API
+  blocks on a full queue, which inflates it (L4 qwen 1024: 152 ms instead of 20-31 ms).
+
+It also scored 31 of 36 with an 82% worst case, but it needs kernel counts per model and runtime and a per-kernel
+host cost that varies 3x across Modal hosts (2.2-8 µs). The simple version folds all of that into the 8B
+reference, because H is about the same (10-30 ms) for every model we run. Keep the detailed form in mind only for
+a runtime whose host cost is very different, e.g. full CUDA graphs (smaller H) or eager per-expert MoE loops
+(~6x the kernels); the bracket run will show it.
 
 ## 5. Code design
 
@@ -391,9 +422,10 @@ right skeleton. Changes needed:
 6. **`jeval_concurrency = "steady"` is meaningless for SemIf-family backends,** whose forwards serialize under
    `SemIf.lock`. Only server-batched backends (`vllm_shim`) get it. Others raise.
 7. **The formula needs the model's HF config and its loaded weight bytes.** Table lookup can happen before
-   model load (so a table-only config still fails fast). Formula resolution happens right after load and before
+   model load (so the default policy still fails fast). Formula resolution happens right after load and before
    the first benchmark.
-8. **Fallback choice:** formula, not online calibration (section 5.7).
+8. **Fallback choice:** the table decides, and a missing pair fails by default (the parent design's fail-fast
+   stays the default). The formula is opt-in, and online calibration is rejected (section 5.7).
 
 ### 5.2 Module: `src/s1/steady_state.py`
 
@@ -422,17 +454,9 @@ class Entry:
 
 @dataclass(frozen=True)
 class Gpu:
-    t_gemm: int  # tokens per forward floor
-    peak_tflops: float  # measured bf16 peak (median of roofline_peak_bf16_tflops); nan if none
+    tokens: int  # T[gpu]: tokens per forward that keep it busy for an ~8B dense model
     mem_gb: float  # usable for weights + activations
     measured: bool  # False: proposed defaults (section 4)
-
-
-@dataclass(frozen=True)
-class Host:
-    kernels_per_forward: int  # from a record: batch_s<min L>_b1_kernels_per_forward
-    arch_family: str  # "sm80/89" | "sm90+": kernel count depends on grouped_mm availability
-    runs: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -442,17 +466,16 @@ class Pick:
     source: Source
     status: Mapping[int, Status | Literal["predicted"]]
     runs: tuple[str, ...]  # table: source runs; formula: runs its inputs came from
-    # formula inputs for the record: H_ms, F_tok, F_eff, T_gemm, row_tokens, B_mem
+    # formula inputs for the record: T, active_b, row_tokens, B_mem
     inputs: Mapping[str, float]
 
 
 TABLE: tuple[Entry, ...]
 GPUS: Mapping[str, Gpu]
-HOST: Mapping[tuple[str, str], Host]  # (model, arch family) -> kernel count
 NO_BATCH: Mapping[str, str]  # moved here from report_steady (report imports it)
 SERVER_BATCHED: frozenset[str] = frozenset({"vllm_shim"})
 QUESTION_TOKENS = 270  # JEVal question + options, added to the reference state length
-T_KERNEL_US = 6.0
+REF_ACTIVE_B = 8.0  # the model size T[gpu] is quoted for
 BUSY = 0.95  # imported by report_steady (single source of truth)
 
 
@@ -460,14 +483,12 @@ BUSY = 0.95  # imported by report_steady (single source of truth)
 def gpu_key(detected: str) -> str: ...
 def lookup(model: str, gpu: str, settings: Settings, *, knob: Knob, gpus: int = 1) -> Entry | None: ...
 def formula(
-    cfg: Mapping[str, object],
     gpu: str,
     lengths: Sequence[int],
     *,
-    model: str,
+    active_params: float,
     weights_gb: float,
     mem_mb_per_token: float = 0.3,
-    host_ms: float | None = None,
 ) -> Pick: ...
 def mem_cap(gpu: str, weights_gb: float, row_tokens: float, mb_per_token: float) -> int: ...
 def bracket(b: int) -> list[int]: ...  # [b//2 or 1, b, 2b], deduplicated
@@ -479,17 +500,17 @@ def record_fields(pick: Pick) -> dict[str, Scalar]: ...
 
 **Length buckets.** The table holds lengths 128 and 1024 (and d1's ~60/1.8k rows). A run length L resolves as
 follows:
-- to the entry's value when L is within a factor of √2 of a measured length;
-- otherwise to the formula, scaled from the nearest measured length by row tokens, so B ∝ 1 / row_tokens with
-  the same log2 rounding.
+- to the entry's value when L is within a factor of 2 of a measured length (so 64-256 use the 128 entry and
+  512-2048 the 1024 entry);
+- otherwise it counts as a missing entry: an error under `"table"`, the formula under `"table+formula"`.
 
-This keeps 512-token runs honest without pretending we measured them.
+The table stays the answer for every length near what we measured, without pretending we measured lengths far
+from it.
 
 **Formula inputs:**
-- `F_tok`: `flops.cost(flops.arch(cfg), Forward(rows=1, tokens=L+QUESTION_TOKENS)).flops / tokens`.
-- `F_eff`: 0.6 x `GPUS[gpu].peak_tflops`.
-- `H`: `HOST[(model, family)].kernels_per_forward x T_KERNEL_US`, else 65 x layers (x6 when the run forces
-  `semif_experts_implementation = "eager"`).
+- `active_params`: `flops.arch(cfg).active_params` from the loaded model's HF config (for an MoE, the
+  parameters one token uses, not the total).
+- `T[gpu]`: `GPUS[gpu].tokens`.
 - `weights_gb`: `torch.cuda.memory_allocated()` after load, passed from the runner through a model hook
   (`getattr(model, "weights_gb", None)`). Otherwise the catalog's `weights_gb`.
 
@@ -502,7 +523,8 @@ batch_state_tokens = [128, 1024]
 batch_sizes = ["steady"]            # or ["steady-bracket"]: {B/2, B, 2B} at each length, to verify the pick
 
 [params]
-steady_policy = "table+formula"     # default; "table" = fail unless measured; "formula" = ignore the table
+steady_policy = "table"             # default: measured entries only, fail fast otherwise
+# steady_policy = "table+formula"   # opt-in: table first, formula (status "predicted") only for missing pairs
 
 # OpenJev (vllm_shim only)
 [params]
@@ -521,13 +543,14 @@ Explicit integers keep working unchanged: an explicit sweep *is* how table entri
    - Keep `RunSpec` otherwise as is.
 2. **`runner.run`, right after `invariants["gpu"] = detect_gpu()` (`src/s1/runner.py:~129`)**
    - Call `steady_state.resolve_pre(spec, invariants["gpu"])`.
-   - With `steady_policy = "table"` and no entry, raise `SteadyStateError` here, before the model loads. The
-     message names the nearest entries and the sweep config to run.
+   - With no entry under the default `steady_policy = "table"`, raise `SteadyStateError` here, before the model
+     loads. The message names the nearest entries and the sweep config to run.
    - With a hit, rewrite the spec:
      - `grid["batch_sizes"]` becomes the sorted union of the per-length values, so `report_batch` keeps working.
      - Add `params["batch_sizes_at"] = "128:32,1024:16"`.
-     - Apply the entry's `variant` settings via `setdefault`. A conflicting explicit setting is a mismatch:
-       formula under `table+formula`, error under `table`.
+     - Apply the entry's `variant` settings via `setdefault`, so a run reproduces the conditions the entry was
+       measured under. A conflicting explicit setting (say, inline prep against a pretokenized entry) means
+       the entry does not apply: an error under `"table"`, the formula under `"table+formula"`.
 3. **`runner.run`, right after the model is built and spec params are merged (`~line 160`)**
    - Call `steady_state.resolve_post(...)` for anything still `"steady"`.
    - Recompute `settings` after this point. Today it is computed before model build, so move the `settings =`
@@ -558,8 +581,8 @@ All go in `params`, because they affect the numbers (AGENTS rule 3):
 - `steady_status` (`128:reached,1024:plateau` or `predicted`).
 - `batch_sizes_at` / `vl_batch_sizes_at`, or the resolved int `jeval_concurrency`.
 - `steady_requested` (the original sentinel, so a reader can tell an automatic pick from a hand-set one).
-- For formula picks, `steady_inputs` as compact `key=value` text: `H_ms`, `F_tok_gflop`, `F_eff_tflops`,
-  `T_gemm`, `row_tokens`, `B_mem`.
+- For formula picks, `steady_inputs` as compact `key=value` text: `T`, `active_b`,
+  `row_tokens`, `B_mem`.
 - Plus `batch_s<L>_b<B>_peak_mb` in results and `env_vllm_max_num_batched_tokens` in invariants.
 
 ### 5.6 Tests (all on the login node, no GPU)
@@ -576,15 +599,16 @@ All go in `params`, because they affect the numbers (AGENTS rule 3):
 4. **`test_formula_backtest`.** For every measured `batch` series, the formula pick reaches ≥ 0.80 of the
    reference throughput (today's minimum is 0.82). This is a regression guard on the constants.
 5. **`test_formula_properties`.** B ≥ 1, B is non-increasing in L, B ≤ `mem_cap`, B is a power of two, and
-   doubling `F_eff` never lowers B.
+   a larger `T[gpu]` or a smaller `active_params` never lowers B.
 6. **Runner tests** (`EchoModel` plus a fake `detect_gpu`):
    - `"steady"` resolves and writes the record fields.
-   - `steady_policy = "table"` with an unknown pair raises *before* the model factory is called (assert with a
+   - The default policy with an unknown pair raises *before* the model factory is called (assert with a
      factory that fails if called).
-   - A variant mismatch falls back or raises per policy.
+   - A table entry always wins over the formula, even under `"table+formula"`.
+   - A variant mismatch raises under `"table"` and falls back to the formula under `"table+formula"`.
    - `jeval_concurrency = "steady"` on a non-server backend raises.
 7. **Config tests.** The sentinels parse, mixed lists are rejected, and any Modal config using `"steady"` with
-   `steady_policy = "table"` has an entry for every `[launch] gpu`.
+   the default policy has an entry for every `[launch] gpu`.
 8. **`batch_sweep` tests.** `batch_sizes_at` restricts the points, the bracket set is right, `peak_mb` is absent
    under fakes, and halving on OOM is recorded.
 
@@ -609,8 +633,8 @@ A mini-sweep at run start (e.g. B ∈ {1, 4, 16, 64} for a few batches each, the
 | Failure | What happens | Mitigation in the design |
 |---|---|---|
 | GPU label ≠ GPU (gpu-parallel "L4" is A10G; `gpu` got an A10G) | Wrong entry | Resolve from `detect_gpu()`, never the launch label; `require_gpu` still fails fast |
-| Host CPU differs from the entry's run (Zen 5 vs Skylake) | B\* may shift one step | Record `cpu_model`; bracket mode; formula's `H` is per-kernel and documented |
-| Variant differs (inline vs pretokenized, eager experts, graphs off) | Entry invalid (LFM2: B\* 32 vs not reached) | Variant is part of the key; mismatch → formula or error |
+| Host CPU differs from the entry's run (Zen 5 vs Skylake) | B\* may shift one step | Record `cpu_model`; bracket mode |
+| Variant differs (inline vs pretokenized, eager experts, graphs off) | Entry invalid (LFM2: B\* 32 vs not reached) | Variant is part of the key; the entry's settings are applied by default; a conflicting override → error (or formula when opted in) |
 | Length not near a measured bucket | Extrapolation | Formula scaled by row tokens; status `predicted` |
 | Real rows longer than the reference (padding: 37% at B = 32, L = 128) | More tokens than planned, possible OOM | Memory cap uses padded tokens; `peak_mb` recorded; halve-once fallback |
 | B\* "not reached" (LFM2 inline, Laya, Kev-4B Hopper 1024, d1 images on H100) | A batch is picked but busy < 0.95 | Status `plateau` in the record; the report must not claim steady state |
@@ -618,7 +642,7 @@ A mini-sweep at run start (e.g. B ∈ {1, 4, 16, 64} for a few batches each, the
 | vLLM upgrade changes the default token budget | Steady concurrency may move | Record `env_vllm_max_num_batched_tokens`; rule `c ≥ 2 x budget / mean prompt` |
 | SemIf `jeval_concurrency` (lock-serialized) | "steady" would be meaningless | Rejected for non-server backends |
 | sm90+ cuDNN SDPA plan building per new shape | Host-confounded short-length B\* | Noted on Hopper/Blackwell entries; an sdpa_backend A/B is still owed (memory: modal-host-cpu-confound) |
-| Formula constants (T_gemm, 0.6, 6 µs) wrong for a new GPU | Under- or overshoot | `measured=False` GPUs are flagged in the record; backtest test; one sweep turns them into measured |
+| Formula constants (`T[gpu]`, the 8B reference) wrong for a new GPU (only under `"table+formula"`) | Under- or overshoot | `measured=False` GPUs are flagged in the record; backtest test; one sweep turns them into measured |
 | Table entry superseded by a newer sweep | Old pick persists | Intentional: changing it is a reviewed edit with new `runs` (and a `RULE` bump only if the schema changes) |
 
 ## 7. Sweeps still needed (not run; estimates only)
