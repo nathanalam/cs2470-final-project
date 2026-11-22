@@ -43,8 +43,9 @@ Default setup, **batch at 128-token / 1024-token states**. `*` = 95% busy not re
   many requests at once (LFM2, 1.5B active parameters, needs 32 on the H100).
 - LFM2 on the H100 only reaches steady state with prompts tokenized ahead of time
   (`batch_host_prep = "pretokenized"`), so that is the setup the table picks there.
-- Not here: d1-3B (its engine answers one request at a time), elephant-1 and bongard-mini (no batched path).
-  `"steady"` is an error for them.
+- Not here: elephant-1 and bongard-mini (no batched path); `"steady"` is an error for them. d1-3B batches
+  through its packed path (`vl_batch`, PR #18), but its steady-state batches are not in this table yet, so a
+  `"steady"` run of it fails as missing (`docs/multimodal.md` has its measured B\*).
 
 ## How future runs pick the batch
 

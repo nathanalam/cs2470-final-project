@@ -49,7 +49,6 @@ DEFAULT_CONCURRENCY = 8  # vLLM: steady at 8 on every GPU measured (A100 PCIe, H
 NEAR = 2.0  # a run length uses a measured length's entry when within this factor of it
 SERVER_BATCHED = frozenset({"vllm_shim", "kev"})  # backends that batch concurrent jeval requests
 NO_BATCH = {  # catalog prefix -> why "steady" cannot apply (the backend has no decide_batch)
-    "d1-3b": "the d1 backend answers one request at a time",
     "elephant-1": "elephant-1's engine has no batched path here",
     "bongard-mini": "the bongard backend has no batched path",
 }

@@ -209,7 +209,9 @@ def test_malformed_requests(grid, params, match):
 
 
 def test_no_batch_models_refuse_steady():
-    with pytest.raises(SteadyStateError, match="one request at a time"):
+    with pytest.raises(SteadyStateError, match="no batched path"):
+        resolve(_spec("elephant-1"), "NVIDIA L4")
+    with pytest.raises(SteadyStateError, match="no measured"):  # d1 batches (#18) but has no entry yet
         resolve(_spec("d1-3b.eager"), "NVIDIA L4")
 
 
