@@ -10,7 +10,7 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
-from . import env, models, registry
+from . import env, models, registry, steady_state
 from .config import RunSpec
 from .gpu_stats import SCHEMA, GpuSampler, metrics_mode, resolve_mode
 from .record import RESULTS_DIR, RunRecord, Scalar, new_run_id
@@ -118,6 +118,19 @@ def grid_settings(grid: dict[str, list[Scalar]]) -> dict[str, Scalar]:
     return {f"grid_{k}": ",".join(str(v) for v in vals) for k, vals in grid.items()}
 
 
+def _steady_after_load(
+    rec: RunRecord, benchmarks: list[str], model: object, log: Callable[[str], None]
+) -> dict[str, Scalar]:
+    """Resolve the "steady" knobs the table could not (steady_policy = "table+formula") with the loaded
+    model, into the record; the new benchmark settings."""
+    post = steady_state.resolve(
+        RunSpec(rec.invariants, rec.params, benchmarks, rec.grid), str(rec.invariants["gpu"]), model
+    )
+    post.apply(rec.params, rec.grid)
+    log(f"[{rec.run_id}] steady (formula): {rec.params.get(steady_state.SIZES_AT)}")
+    return rec.invariants | rec.params | grid_settings(rec.grid)
+
+
 def run(
     spec: RunSpec,
     *,
@@ -129,7 +142,12 @@ def run(
     invariants = dict(spec.invariants)
     if invariants.get("gpu", "auto") == "auto":
         invariants["gpu"] = detect_gpu()
-    settings0 = invariants | spec.params
+    # "steady" batch / concurrency: the measured pick for this GPU (src/s1/steady_state.py), before the model
+    # loads so a pair the table lacks fails fast; the opt-in formula waits for the loaded model below
+    params, grid = dict(spec.params), {k: list(v) for k, v in spec.grid.items()}
+    steady = steady_state.resolve(RunSpec(invariants, params, spec.benchmarks, grid), str(invariants["gpu"]))
+    steady.apply(params, grid)
+    settings0 = invariants | params
     gpu_mode = resolve_mode(
         get_str(settings0, "gpu_metrics", "basic"), get_int(settings0, "gpu_metrics_schema", SCHEMA)
     )
@@ -151,9 +169,9 @@ def run(
     rec = RunRecord(
         run_id=new_run_id(),
         invariants=invariants,
-        params=dict(spec.params),
+        params=params,
         meta=meta,
-        grid={k: list(v) for k, v in spec.grid.items()},
+        grid=grid,
     )
     log(f"[{rec.run_id}] params={rec.params}")
 
@@ -167,6 +185,7 @@ def run(
             rec.invariants.setdefault(key, val)  # software the model actually ran with (versions, kernels)
     meta["load_s"] = round(time.perf_counter() - t0, 3)
     try:
+        settings = _steady_after_load(rec, spec.benchmarks, model, log) if steady.pending else settings
         with metrics_mode(gpu_mode):
             for name in spec.benchmarks:
                 t = time.perf_counter()

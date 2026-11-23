@@ -44,7 +44,7 @@ import inspect
 import json
 import threading
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 from ... import profiling
@@ -248,6 +248,10 @@ class SemIf:
                 prompts.append(self._checked(self.encode(prompt)))
         ids, mask = self._pad(prompts)
         return Prepared(ids=ids, mask=mask, decisions=len(prompts), real_tokens=sum(len(p) for p in prompts))
+
+    def pin_batch(self, prepared: Prepared) -> Prepared:
+        """Page-lock the host tensors so run_batch's non_blocking copy is a true async copy (overlapped)."""
+        return replace(prepared, ids=prepared.ids.pin_memory(), mask=prepared.mask.pin_memory())
 
     def run_batch(self, prepared: Prepared) -> dict[str, int]:
         """decide_batch's device half: copy in, one forward, the option-letter logits back to the host."""
