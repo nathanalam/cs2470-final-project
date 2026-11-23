@@ -39,6 +39,7 @@ Default setup, **batch at 128-token / 1024-token states**. `*` = 95% busy not re
 | laya.multilingual | 8 / 4* | - | - | - | - | - |
 | laya.english | 8 / 4* | 32 / 32* | - | 64 / 32* | 64 / 32* | 32 / 16* |
 | openjev | - | - | concurrency 8 | concurrency 8 | concurrency 8 | concurrency 8 |
+| d1-3b.eager | text 32 / 1024 px image 1 | - | - | text 64 / 1024 px image 32* | - | - |
 
 - Rows are ~270 tokens longer than the state (the JEVal question and options), so "128 tokens" is about 400
   tokens per request and "1024" about 1,300.
@@ -51,9 +52,11 @@ Default setup, **batch at 128-token / 1024-token states**. `*` = 95% busy not re
   H100. With inline prep it only reaches a plateau.
 - granite4-h-tiny has no row: on the current L4 image (no mamba-ssm kernels) every batch >= 2 runs out of
   memory.
-- Not here: elephant-1 and bongard-mini (no batched path); `"steady"` is an error for them. d1-3B batches
-  through its packed path (`vl_batch`, PR #18), but its steady-state batches are not in this table yet, so a
-  `"steady"` run of it fails as missing (`docs/multimodal.md` has its measured B\*).
+- **d1-3B** (vision-language) is measured on the `vl_batch` benchmark, not `batch`, so its cell reads
+  "text rows alone / with a 1024 px picture". A picture adds ~1.8k tokens: on the L4 one such request already
+  fills the GPU (batch 1), while ~60-token text rows need 32. On the H100 the image arm never reaches 95% busy
+  (host-side image prep), so 32 is its fastest batch. Per image size, see "d1-3B" below.
+- Not here: elephant-1 and bongard-mini (no batched path); `"steady"` is an error for them.
 
 ## How future runs pick the batch
 
@@ -68,6 +71,15 @@ batch_sizes = ["steady"]          # or ["steady-bracket"] to also run half and d
 jeval_concurrency = "steady"      # vLLM-served models (OpenJev) only
 ```
 
+For d1-3B on `vl_batch`, the same word goes on its size axis; the pick is per arm (image, text, no picture)
+and image size, and must match a measured size exactly (384, 768 or 1024 px):
+
+```toml
+[grid]
+vl_batch_image_px = [384, 1024]
+vl_batch_sizes = ["steady"]
+```
+
 When the run starts, the runner:
 
 1. **Checks which GPU it really got** (`nvidia-smi`, not the requested label; Slurm labels are sometimes
@@ -77,7 +89,8 @@ When the run starts, the runner:
    with a particular setup (overlapped prompt prep, a Laya mode), the run uses that setup unless the config sets
    it.
 3. **Runs only that batch** at each length (or half, it and double with `"steady-bracket"`).
-4. **Records what it chose and why** in the run's params: `batch_sizes_at` (e.g. `"128:32,1024:16"`),
+4. **Records what it chose and why** in the run's params: `batch_sizes_at` (e.g. `"128:32,1024:16"`;
+   `vl_batch_sizes_at` for d1-3B, e.g. `"image@1024:1,none@0:32"`),
    `steady_source` (`table`), `steady_status` (`reached` or `plateau` per length), `steady_runs` (the sweep
    it came from), `steady_gpu` and `steady_rule`.
 
@@ -186,3 +199,17 @@ Every entry, with the setup it was measured under and its source run (all on Mod
 | openjev | H100 | 8 | yes | 20261119-222601-d16bbfd0 .. 20261119-225651-791ecf60 |
 | openjev | H200 | 8 | yes | 20261119-222601-cb08832a .. 20261119-225427-4bc2fe3b |
 | openjev | B200 | 8 | yes | 20261119-222602-58b3adbb .. 20261119-224749-e9aa1791 |
+
+## d1-3B (`vl_batch`)
+
+Batch per arm and image size. "image" is the row with its picture, "text" the picture replaced by
+text of the same token count, "none" the row alone (~60 tokens). From `docs/multimodal.md`.
+
+| Model | GPU | Arm | No picture | 384 px | 768 px | 1024 px | Steady state reached? | Source run |
+|---|---|---|---|---|---|---|---|---|
+| d1-3b.eager | L4 | image |  | 16 | 8 | 1 | yes | 20261120-141226-e1dd7b35 |
+| d1-3b.eager | L4 | text |  | 16 | 8 | 1 | yes | 20261120-141226-e1dd7b35 |
+| d1-3b.eager | L4 | none | 32 |  |  |  | yes | 20261120-141226-e1dd7b35 |
+| d1-3b.eager | H100 | image |  | 64 | 64 | 32 | no (fastest batch) | 20261120-141037-d11b3b27 |
+| d1-3b.eager | H100 | text |  | 64 | 32 | 4 | yes | 20261120-141037-d11b3b27 |
+| d1-3b.eager | H100 | none | 64 |  |  |  | yes | 20261120-141037-d11b3b27 |

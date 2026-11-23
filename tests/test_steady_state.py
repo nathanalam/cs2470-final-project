@@ -4,6 +4,7 @@ its setup matching, the opt-in formula, and the runner / batch benchmark wiring.
 import math
 import re
 from pathlib import Path
+from typing import override
 
 import pytest
 
@@ -12,6 +13,7 @@ from s1.benchmarks import batch_sweep, jeval
 from s1.config import RunSpec
 from s1.models.catalog import CATALOG
 from s1.record import RESULTS_DIR, RunRecord, Scalar, load_all
+from s1.registry import Settings
 from s1.steady_state import PLATEAU, REACHED, TABLE, SteadyStateError, gpu_key, lookup, resolve
 from tests.test_batch_sweep import FakeBatched
 from tests.test_roofline import _no_gpu, row
@@ -103,6 +105,7 @@ def test_every_recorded_gpu_has_a_key():
 def test_doc_embeds_the_current_tables():
     text = DOC.read_text()
     assert steady_state.summary_table() in text and steady_state.markdown_table() in text
+    assert steady_state.vl_markdown_table() in text
 
 
 # ---------------------------------------------------------------- lookup
@@ -329,3 +332,99 @@ def test_bracket_and_explicit_sweeps_keep_the_oom_point(tmp_path, monkeypatch):
     assert m["batch_s64_b4_wall_ms"] > 0 and m["batch_s64_b2_wall_ms"] > 0
     assert not steady_state.halves_on_oom({})
     assert steady_state.fallback_sizes(16) == [8, 4, 2, 1] and steady_state.fallback_sizes(1) == []
+
+
+# ---------------------------------------------------------------- vl_batch (d1-3B)
+
+VL = [e for e in TABLE if e.knob == "vl_batch"]
+
+
+@pytest.mark.parametrize("e", VL, ids=lambda e: f"{e.gpu}-{e.arm}")
+def test_vl_entry_recomputes_from_its_record(e):
+    from s1.benchmarks import vl_batch  # noqa: PLC0415
+
+    (run,) = e.runs
+    rec = _load(run)
+    m = rec.results["vl_batch"]
+    assert str(rec.params["model"]) == e.model and gpu_key(str(rec.invariants["gpu"])) == e.gpu
+    sizes = [int(b) for b in rec.grid["vl_batch_sizes"]]
+    for px, b in e.at.items():
+        series = f"vl_batch_{e.arm}_p{px}_"
+        assert vl_batch.steady_state(m, series, sizes) == b == m[f"{series}bstar"]
+        assert (m[f"{series}bstar_busy"] == 1.0) == (e.status[px] == REACHED)
+        if e.status[px] == REACHED:  # the same rule as report_steady.steady
+            pts = {
+                s: {
+                    k.removeprefix(f"{series}b{s}_"): v
+                    for k, v in m.items()
+                    if k.startswith(f"{series}b{s}_")
+                }
+                for s in sizes
+            }
+            st = report_steady.steady(pts, px)
+            assert st is not None and st.b_star == b
+
+
+def _vl_spec(**params: Scalar) -> RunSpec:
+    grid: dict[str, list[Scalar]] = {"vl_batch_image_px": [384, 1024], "vl_batch_sizes": ["steady"]}
+    return RunSpec({"gpu": "auto"}, {"model": "d1-3b.eager", **params}, ["vl_batch"], grid)
+
+
+def test_resolve_vl_batch_per_arm_and_px():
+    out = resolve(_vl_spec(), "NVIDIA H100 80GB HBM3")
+    p = out.params
+    assert p["vl_batch_sizes_at"] == "image@384:64,image@1024:32,text@384:64,text@1024:4,none@0:64"
+    assert out.grid == {"vl_batch_sizes": [4, 32, 64]}
+    assert p["steady_status"] == (
+        "image@384:plateau,image@1024:plateau,text@384:reached,text@1024:reached,none@0:reached"
+    )
+    assert p["steady_runs"] == "20261120-141037-d11b3b27" and p["steady_source"] == "table"
+    s = dict(p)
+    assert steady_state.vl_sizes_for(s, "text", 1024, [1, 2]) == [4]
+    assert steady_state.vl_sizes_for(s, "none", 0, [1, 2]) == [64]
+    assert steady_state.vl_sizes_for({}, "text", 1024, [1, 2]) == [1, 2]
+    one = resolve(_vl_spec(vl_batch_arms="none"), "NVIDIA L4")
+    assert one.params["vl_batch_sizes_at"] == "none@0:32"
+
+
+def test_vl_batch_missing_px_or_gpu_fails():
+    grid: dict[str, list[Scalar]] = {"vl_batch_image_px": [512], "vl_batch_sizes": ["steady"]}
+    with pytest.raises(SteadyStateError, match="512 px"):
+        resolve(RunSpec({}, {"model": "d1-3b.eager"}, ["vl_batch"], grid), "NVIDIA L4")
+    with pytest.raises(SteadyStateError, match="no measured"):  # no formula for a vision tower
+        resolve(_vl_spec(steady_policy="table+formula"), "NVIDIA B200")
+
+
+def test_vl_batch_runs_the_steady_point_and_halves_on_oom(tmp_path, monkeypatch):
+    from s1.benchmarks import imajev, vl_batch  # noqa: PLC0415
+    from tests.test_multimodal import FakeVl, WordFit, record  # noqa: PLC0415
+
+    item = imajev.parse(record("boolean", True, track="visual", images=[{"path": "a", "sha256": "0"}]))
+    assert item is not None
+    srcs = [vl_batch.Source(item, "word " * 400) for _ in range(8)]
+    monkeypatch.setattr(imajev, "dataset_dir", lambda: tmp_path)
+    monkeypatch.setattr(vl_batch, "sources", lambda settings, root, size: srcs)
+    monkeypatch.setattr(vl_batch, "resized", lambda root, it, px: ["picture"])
+    monkeypatch.setattr(vl_batch, "FileTokenCounter", WordFit)
+    monkeypatch.setattr(vl_batch.batch_sweep, "trace_batches", lambda m, calls: None)
+
+    class OomAt4(FakeVl):
+        @override
+        def run_batch(self, p):
+            if p["n"] >= 4:
+                raise RuntimeError("CUDA out of memory")
+            return super().run_batch(p)
+
+    settings: Settings = {
+        "grid_vl_batch_image_px": "384",
+        "grid_vl_batch_sizes": "2,4",
+        "vl_batch_tokenizer_file": "tok.json",
+        "vl_batch_min_decisions": 4,
+        "vl_batch_min_batches": 1,
+        "vl_batch_sizes_at": "image@384:2,text@384:4,none@0:2",
+        "steady_bracket": False,
+    }
+    m = vl_batch.run(OomAt4(), settings)
+    assert "vl_batch_image_p384_b2_ms_per_decision" in m and "vl_batch_image_p384_b4_oom" not in m
+    assert m["vl_batch_text_p384_b4_oom"] == 1 and m["vl_batch_text_p384_steady_fallback"] == 2
+    assert "vl_batch_text_p384_b2_ms_per_decision" in m

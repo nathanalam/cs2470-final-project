@@ -41,6 +41,9 @@ of each arm (largest px) are compared with the engine's own one-request answers 
 difference is `vl_batch_check_max_diff` (bf16 kernels differ by batch shape, so expect ~1e-2, not 0).
 
 [grid] axes: vl_batch_image_px (e.g. [384, 768, 1024]) and vl_batch_sizes ([1, 2, 4, ..., 64]).
+`vl_batch_sizes = ["steady"]` (or `["steady-bracket"]`) runs only the measured steady-state batch per
+(arm, px) for this GPU (src/s1/steady_state.py, `vl_batch_sizes_at`), halving it if it runs out of memory
+(`vl_batch_<arm>_p<px>_steady_fallback`).
 Settings (all optional): vl_batch_arms "image,text,none", vl_batch_tokenizer_file (the model's tokenizer.json,
 to cut the filler; required for the text arm), vl_batch_pool (rows; default the largest B), vl_batch_seed 0,
 vl_batch_min_decisions 32, vl_batch_min_batches 4, vl_batch_trace 2 (batches traced per point),
@@ -64,6 +67,7 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 
 from .. import env, flops
+from .. import steady_state as steady
 from ..record import Metrics
 from ..registry import Settings, benchmark, get_bool, get_int, get_str, note
 from . import batch_sweep, imajev, jeval, roofline
@@ -368,7 +372,8 @@ def run(model: object, settings: Settings) -> Metrics:
     series = [(a, px) for a in arms if a != "none" for px in pxs] + ([("none", 0)] if "none" in arms else [])
     for arm, px in series:
         reqs = requests_for(arm, px or max(pxs), srcs)
-        for size in sizes:
+
+        def measure(size: int, arm: str = arm, px: int = px, reqs: list[Request] = reqs) -> bool:
             prefix = f"vl_batch_{arm}_p{px}_b{size}_"
             n = max(
                 get_int(settings, "vl_batch_min_batches", 4),
@@ -385,13 +390,15 @@ def run(model: object, settings: Settings) -> Metrics:
                 out[f"{prefix}oom"] = 1.0
                 note(f"{prefix}oom", f"{type(e).__name__}: {e}"[:200])
                 print(f"vl_batch: {arm} px={px} B={size} out of memory", flush=True)
-                continue
-            out |= point(prefix, timed, size, trace, min(traced_n, len(plan)))
-            out |= {
-                f"{prefix}prep_ms": prep_ms,
-                f"{prefix}peak_mb": peak,
-                f"{prefix}peak_mb_per_decision": peak / size,
-            }
+                return False
+            out.update(point(prefix, timed, size, trace, min(traced_n, len(plan))))
+            out.update(
+                {
+                    f"{prefix}prep_ms": prep_ms,
+                    f"{prefix}peak_mb": peak,
+                    f"{prefix}peak_mb_per_decision": peak / size,
+                }
+            )
             print(
                 f"vl_batch: {arm} px={px} B={size} {out[f'{prefix}ms_per_decision']:.2f} ms/decision, "
                 f"{out[f'{prefix}tflops']:.1f} TFLOP/s, "
@@ -399,7 +406,15 @@ def run(model: object, settings: Settings) -> Metrics:
                 f"vision {out[f'{prefix}vision_share']:.2f}, peak {peak:.0f} MB",
                 flush=True,
             )
-        out |= bstar(out, f"vl_batch_{arm}_p{px}_", sizes)
+            return True
+
+        for size in steady.vl_sizes_for(settings, arm, px, sizes):
+            if measure(size) or not steady.vl_halves_on_oom(settings):
+                continue
+            ran = next((b for b in steady.fallback_sizes(size) if measure(b)), 0)  # as in `batch`
+            out[f"vl_batch_{arm}_p{px}_steady_fallback"] = float(ran)
+            note(f"vl_batch_{arm}_p{px}_steady_fallback", f"B={size} out of memory; ran B={ran or 'none'}")
+        out.update(bstar(out, f"vl_batch_{arm}_p{px}_", sizes))
     return headline(out, max(pxs)) | out
 
 

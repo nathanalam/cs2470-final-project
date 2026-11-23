@@ -42,6 +42,9 @@ POLICIES = ("table", "table+formula")
 SIZE_AXIS, LENGTH_AXIS = "batch_sizes", "batch_state_tokens"  # the `batch` benchmark's [grid] axes
 CONCURRENCY = "jeval_concurrency"
 SIZES_AT = "batch_sizes_at"  # resolved per-length batch: "128:32,1024:16"
+VL_SIZE_AXIS, VL_PX_AXIS = "vl_batch_sizes", "vl_batch_image_px"  # the `vl_batch` benchmark's [grid] axes
+VL_SIZES_AT = "vl_batch_sizes_at"  # resolved per (arm, px): "image@384:16,text@384:16,none@0:32"
+VL_ARMS = ("image", "text", "none")
 QUESTION_TOKENS = 270  # JEVal question + options on top of the reference state length (records: ~263-277)
 REF_ACTIVE = 8e9  # the model size T[gpu] is quoted for
 MB_PER_TOKEN = 0.3  # transient activation memory per token, conservative (L4 OOM evidence: <= ~0.25-0.3)
@@ -59,7 +62,7 @@ VARIANT_DEFAULTS: dict[str, Scalar] = {  # what a run uses when it does not set 
     "semif_experts_implementation": "",
 }
 
-Knob = Literal["batch", "concurrency"]
+Knob = Literal["batch", "concurrency", "vl_batch"]
 Status = Literal["reached", "plateau", "predicted"]
 REACHED, PLATEAU, PREDICTED = "reached", "plateau", "predicted"
 
@@ -82,6 +85,7 @@ class Entry:
     knob: Knob = "batch"
     gpus: int = 1  # tensor-parallel width (vLLM)
     note: str = ""
+    arm: str = ""  # vl_batch only: "image", "text" or "none"; `at` is then keyed by image px (0 for none)
 
 
 @dataclass(frozen=True)
@@ -191,6 +195,18 @@ openjev   H200       8  20261119-222601-cb08832a,20261119-223601-41b4cce3,202611
 openjev   B200       8  20261119-222602-58b3adbb,20261119-223618-6c6bc83f,20261119-223912-33ef5899,20261119-224205-4acfddf6,20261119-224458-a001d3cf,20261119-224749-e9aa1791
 """  # noqa: E501
 
+# d1-3B on the `vl_batch` benchmark (docs/multimodal.md): batch per arm and image size (px; 0 = the row
+# alone, no picture, ~60 tokens). vl_batch's fallback when no batch reaches 95% busy is the fastest (P here).
+_VL = """
+# model       gpu   arm    px:b,...                  status  run
+d1-3b.eager   L4    image  384:16,768:8,1024:1      R       20261120-141226-e1dd7b35
+d1-3b.eager   L4    text   384:16,768:8,1024:1      R       20261120-141226-e1dd7b35
+d1-3b.eager   L4    none   0:32                     R       20261120-141226-e1dd7b35
+d1-3b.eager   H100  image  384:64,768:64,1024:32    P       20261120-141037-d11b3b27
+d1-3b.eager   H100  text   384:64,768:32,1024:4     R       20261120-141037-d11b3b27
+d1-3b.eager   H100  none   0:64                     R       20261120-141037-d11b3b27
+"""
+
 NOTES = {  # (model, gpu) -> what a reader of a plateau entry should know
     ("lfm2-8b-a1b.zeroshot", "L4"): "max kernel_busy 0.94",
     ("lfm2-8b-a1b.zeroshot", "A100-SXM4"): "max kernel_busy 0.93 / 0.91; no grouped_mm on sm80",
@@ -227,8 +243,19 @@ def _concurrency_entry(row: list[str]) -> Entry:
     return Entry(m, g, {0: int(c)}, {0: REACHED}, tuple(runs.split(",")), knob="concurrency")
 
 
+def _vl_entry(row: list[str]) -> Entry:
+    m, g, arm, pts, st, run = row
+    at = {int(px): int(b) for px, _, b in (p.partition(":") for p in pts.split(","))}
+    note = "kernel_busy 0.87-0.91 at every batch: host-side image prep" if st == "P" else ""
+    return Entry(m, g, at, dict.fromkeys(at, _STATUS[st]), (run,), knob="vl_batch", arm=arm, note=note)
+
+
 def _table() -> tuple[Entry, ...]:
-    return (*map(_batch_entry, _rows(_BATCH)), *map(_concurrency_entry, _rows(_CONCURRENCY)))
+    return (
+        *map(_batch_entry, _rows(_BATCH)),
+        *map(_concurrency_entry, _rows(_CONCURRENCY)),
+        *map(_vl_entry, _rows(_VL)),
+    )
 
 
 TABLE: tuple[Entry, ...] = _table()
@@ -242,13 +269,16 @@ def _matches(e: Entry, settings: Mapping[str, Scalar]) -> bool:
     return all(k not in settings or str(settings[k]) == str(v) for k, v in e.variant.items())
 
 
-def lookup(model: str, gpu: str, settings: Mapping[str, Scalar], *, knob: Knob = "batch") -> Entry | None:
+def lookup(
+    model: str, gpu: str, settings: Mapping[str, Scalar], *, knob: Knob = "batch", arm: str = ""
+) -> Entry | None:
     """The table entry for this model on this GPU (canonical key) whose setup the run's settings allow:
     the one with the most lengths reached, then the first listed. None when there is none."""
     gpus = int(settings.get("tensor_parallel_size", 1)) if knob == "concurrency" else 1
     hits = [
         e for e in TABLE
-        if e.model == model and e.gpu == gpu and e.knob == knob and e.gpus == gpus and _matches(e, settings)
+        if e.model == model and e.gpu == gpu and e.knob == knob and e.arm == arm and e.gpus == gpus
+        and _matches(e, settings)
     ]  # fmt: skip
     if not hits:
         return None
@@ -314,20 +344,22 @@ class Resolution:
         grid.update(self.grid)
 
 
+def sentinel(grid: Mapping[str, Sequence[Scalar]], axis: str) -> str | None:
+    """The "steady" / "steady-bracket" request on a [grid] size axis, or None (errors when mixed)."""
+    sizes = list(grid.get(axis, []))
+    if not any(v in SENTINELS for v in sizes):
+        return None
+    if len(sizes) != 1:
+        raise SteadyStateError(f'[grid] {axis} = {sizes}: use ["steady"] alone, not mixed with sizes')
+    return str(sizes[0])
+
+
 def requested(params: Mapping[str, Scalar], grid: Mapping[str, Sequence[Scalar]]) -> tuple[str | None, bool]:
     """(the batch sentinel or None, whether jeval_concurrency is "steady"); errors on a malformed request."""
-    sizes = list(grid.get(SIZE_AXIS, []))
-    batch: str | None = None
-    if any(v in SENTINELS for v in sizes):
-        if len(sizes) != 1:
-            raise SteadyStateError(
-                f'[grid] {SIZE_AXIS} = {sizes}: use ["steady"] alone, not mixed with sizes'
-            )
-        batch = str(sizes[0])
     conc = params.get(CONCURRENCY)
     if isinstance(conc, str) and conc != STEADY:
         raise SteadyStateError(f'{CONCURRENCY} must be an integer or "steady", got {conc!r}')
-    return batch, conc == STEADY
+    return sentinel(grid, SIZE_AXIS), conc == STEADY
 
 
 def _spec_of(model: str) -> tuple[str | None, dict[str, Scalar]]:
@@ -401,7 +433,7 @@ def _concurrency(r: _Run) -> None:
         r.sources.add("formula")
 
 
-def _batch(r: _Run, sentinel: str, lengths: Sequence[int]) -> bool:
+def _batch(r: _Run, mode: str, lengths: Sequence[int]) -> bool:
     """Resolve the batch per length into r.out; False when the formula is needed but the model is not
     loaded yet."""
     why = next((v for p, v in NO_BATCH.items() if r.model.startswith(p)), None)
@@ -430,11 +462,37 @@ def _batch(r: _Run, sentinel: str, lengths: Sequence[int]) -> bool:
         for k, v in e.variant.items():  # run the setup the entry was measured under
             if k not in r.settings and v != VARIANT_DEFAULTS.get(k):
                 r.out.params[k] = v
-    sizes = sorted({s for b in at.values() for s in (bracket(b) if sentinel == BRACKET else [b])})
+    sizes = sorted({s for b in at.values() for s in (bracket(b) if mode == BRACKET else [b])})
     r.out.grid[SIZE_AXIS] = list(sizes)
     r.out.params[SIZES_AT] = format_sizes_at(at)
-    r.out.params["steady_bracket"] = sentinel == BRACKET
+    r.out.params["steady_bracket"] = mode == BRACKET
     return True
+
+
+def _vl(r: _Run, mode: str, grid: Mapping[str, Sequence[Scalar]]) -> None:
+    """Resolve `vl_batch_sizes` per (arm, image px) into r.out. Table only: the formula does not model a
+    vision tower, so a missing (arm, px) always raises."""
+    pxs = [int(v) for v in grid.get(VL_PX_AXIS, [])]
+    if not pxs:
+        raise SteadyStateError(f'[grid] {VL_SIZE_AXIS} = ["steady"] needs [grid] {VL_PX_AXIS}')
+    arms = [
+        a.strip() for a in str(r.settings.get("vl_batch_arms", ",".join(VL_ARMS))).split(",") if a.strip()
+    ]
+    at: dict[str, int] = {}
+    for arm in arms:
+        e = lookup(r.model, r.gpu, r.settings, knob="vl_batch", arm=arm)
+        for px in [0] if arm == "none" else pxs:
+            if e is None or px not in e.at:
+                raise _missing(f"vl_batch {arm} @ {px} px batch", r.model, r.gpu, r.settings)
+            at[f"{arm}@{px}"] = e.at[px]
+            r.statuses[len(r.statuses)] = e.status[px]
+            if e.runs[0] not in r.runs:
+                r.runs += e.runs
+    r.sources.add("table")
+    sizes = sorted({s for b in at.values() for s in (bracket(b) if mode == BRACKET else [b])})
+    r.out.grid[VL_SIZE_AXIS] = list(sizes)
+    r.out.params[VL_SIZES_AT] = ",".join(f"{k}:{b}" for k, b in at.items())
+    r.out.params["steady_bracket"] = mode == BRACKET
 
 
 def resolve(spec: RunSpec, detected_gpu: str, model_obj: object | None = None) -> Resolution:
@@ -443,8 +501,9 @@ def resolve(spec: RunSpec, detected_gpu: str, model_obj: object | None = None) -
     Without `model_obj` (before the model loads) only the table is used: a pair it lacks raises under the
     default policy and is left pending under "table+formula". With `model_obj` (after loading) pending
     knobs get the formula. The table always wins where it has an entry."""
-    sentinel, conc = requested(spec.params, spec.grid)
-    if sentinel is None and not conc:
+    batch, conc = requested(spec.params, spec.grid)
+    vl = sentinel(spec.grid, VL_SIZE_AXIS)
+    if batch is None and not conc and vl is None:
         return Resolution()
     model = str(spec.params["model"])
     backend, spec_settings = _spec_of(model)
@@ -455,16 +514,45 @@ def resolve(spec: RunSpec, detected_gpu: str, model_obj: object | None = None) -
     r = _Run(model, backend, spec_settings, settings, policy, gpu, model_obj, out)
     if conc:
         _concurrency(r)
-    if sentinel is not None and not _batch(r, sentinel, [int(v) for v in spec.grid.get(LENGTH_AXIS, [])]):
+    if vl is not None:
+        _vl(r, vl, spec.grid)
+    if batch is not None and not _batch(r, batch, [int(v) for v in spec.grid.get(LENGTH_AXIS, [])]):
         return Resolution(pending=True)  # the formula needs the loaded model; the runner resolves again
     out.params |= {
-        "steady_requested": sentinel or STEADY,
+        "steady_requested": batch or vl or STEADY,
         "steady_source": next(iter(r.sources)) if len(r.sources) == 1 else "table+formula",
-        "steady_status": ",".join(f"{n}:{st}" for n, st in sorted(r.statuses.items())),
+        "steady_status": _status_text(r, vl is not None),
         "steady_runs": ",".join(r.runs),
         "steady_gpu": gpu,
     }
     return out
+
+
+def _status_text(r: _Run, vl: bool) -> str:
+    if vl:  # per (arm, px), in the order of vl_batch_sizes_at
+        keys = str(r.out.params[VL_SIZES_AT]).split(",")
+        return ",".join(
+            f"{k.partition(':')[0]}:{st}" for k, st in zip(keys, r.statuses.values(), strict=True)
+        )
+    return ",".join(f"{n}:{st}" for n, st in sorted(r.statuses.items()))
+
+
+def vl_sizes_for(settings: Mapping[str, Scalar], arm: str, px: int, grid_sizes: Sequence[int]) -> list[int]:
+    """The batch sizes `vl_batch` runs for one (arm, px): the steady pick (or its bracket) when the runner
+    set `vl_batch_sizes_at`, else every size of the grid."""
+    raw = settings.get(VL_SIZES_AT)
+    if not isinstance(raw, str) or not raw:
+        return list(grid_sizes)
+    at = {k: int(b) for k, _, b in (part.rpartition(":") for part in raw.split(","))}
+    b = at[f"{arm}@{px}"]
+    return bracket(b) if settings.get("steady_bracket") in (True, "true", "True", 1) else [b]
+
+
+def vl_halves_on_oom(settings: Mapping[str, Scalar]) -> bool:
+    raw = settings.get(VL_SIZES_AT)
+    return (
+        isinstance(raw, str) and bool(raw) and settings.get("steady_bracket") not in (True, "true", "True", 1)
+    )
 
 
 def sizes_for(settings: Mapping[str, Scalar], length: int, grid_sizes: Sequence[int]) -> list[int]:
@@ -528,6 +616,28 @@ def markdown_table() -> str:
 GPU_COLUMNS = ("L4", "A100-SXM4", "A100-PCIe", "H100", "H200", "B200")  # GPUs the table has entries for
 
 
+def _summary_cell(model: str, gpu: str) -> str:
+    knobs = {e.knob for e in TABLE if e.model == model}
+    if "vl_batch" in knobs:  # d1-3B: text rows alone / 1024 px image
+        none = lookup(model, gpu, {}, knob="vl_batch", arm="none")
+        image = lookup(model, gpu, {}, knob="vl_batch", arm="image")
+        if none is None or image is None or 1024 not in image.at:
+            return "-"
+        star = "" if image.status[1024] == REACHED else "*"
+        return f"text {none.at[0]} / 1024 px image {image.at[1024]}{star}"
+    knob: Knob = "concurrency" if "concurrency" in knobs else "batch"
+    e = lookup(model, gpu, {}, knob=knob)
+    if e is None:
+        return "-"
+    star = "" if set(e.status.values()) == {REACHED} else "*"
+    if knob == "concurrency":
+        return f"concurrency {e.at[0]}{star}"
+    prep = e.variant.get("batch_host_prep")
+    return f"{e.at[128]} / {e.at[1024]}{star}" + (
+        f" ({prep})" if prep in ("pretokenized", "overlapped") else ""
+    )
+
+
 def summary_table() -> str:
     """One row per model, one column per GPU: what a run with default settings gets (markdown).
     Batch cells read "B at 128 / B at 1024 tokens"; * marks a pick where 95% GPU-busy was not reached
@@ -535,21 +645,20 @@ def summary_table() -> str:
     models = list(dict.fromkeys(e.model for e in TABLE))
     rows = ["| Model | " + " | ".join(GPU_COLUMNS) + " |", "|---|" + "---|" * len(GPU_COLUMNS)]
     for model in models:
-        cells = []
-        for gpu in GPU_COLUMNS:
-            knob: Knob = (
-                "concurrency" if any(e.model == model and e.knob == "concurrency" for e in TABLE) else "batch"
-            )
-            e = lookup(model, gpu, {}, knob=knob)
-            if e is None:
-                cells.append("-")
-                continue
-            star = "" if set(e.status.values()) == {REACHED} else "*"
-            if knob == "concurrency":
-                cells.append(f"concurrency {e.at[0]}{star}")
-            else:
-                cell = f"{e.at[128]} / {e.at[1024]}" + star
-                prep = e.variant.get("batch_host_prep")
-                cells.append(cell + (f" ({prep})" if prep in ("pretokenized", "overlapped") else ""))
-        rows.append(f"| {model} | " + " | ".join(cells) + " |")
+        rows.append(f"| {model} | " + " | ".join(_summary_cell(model, g) for g in GPU_COLUMNS) + " |")
+    return "\n".join(rows)
+
+
+def vl_markdown_table() -> str:
+    """The `vl_batch` entries (d1-3B) as markdown: batch per arm and image size."""
+    cols = ("Model", "GPU", "Arm", "No picture", "384 px", "768 px", "1024 px", "Steady state reached?")
+    rows = ["| " + " | ".join(cols) + " | Source run |", "|" + "---|" * (len(cols) + 1)]
+    for e in TABLE:
+        if e.knob != "vl_batch":
+            continue
+        cells = [str(e.at[px]) if px in e.at else "" for px in (0, 384, 768, 1024)]
+        reached = "yes" if set(e.status.values()) == {REACHED} else "no (fastest batch)"
+        rows.append(
+            f"| {e.model} | {e.gpu} | {e.arm} | " + " | ".join(cells) + f" | {reached} | {e.runs[0]} |"
+        )
     return "\n".join(rows)
